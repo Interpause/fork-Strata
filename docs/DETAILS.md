@@ -1999,3 +1999,12 @@ The prompt path's half-output buffer `bo` reuses the embedding buffer `emb`, whi
 **Fused int8 prompt experts on gfx12 (RDNA4, R9700): on by default for IQ3_S and IQ3_XXS packs.** `STRATA_PF_FUSED=0` turns them off (back to the MMQ prompt kernels, the previous bits). R9700, 1 card: prompt 4K +15.7%, 16K +13..+17%, 32K +19..+20%, a 96K prompt +16% (answers identical text); first-token KL against the FP16 prompt path over 96 prompts is equal to MMQ within noise (IQ3_XXS 0.00613 against 0.00683, IQ3_S 0.00416 against 0.00372). Other quants and other GPUs are unchanged; `STRATA_PF_FUSED=1` still opts in every covered format.
 
 **gfx12 (Linux): a bare `--prefill auto` may take 16384-token chunks.** Explicit `--prefill N`, `auto:N` and `STRATA_PREFILL_AUTO_MAX` are untouched; `STRATA_GFX12_CHUNK=0` or `STRATA_GFX12_DEFAULTS=0` keeps 8192.
+
+`--conversation-cache-cold` (opt-in, Linux) marks the parked conversations and the retained K/V `MADV_COLD`: the
+pages are deactivated, so a machine under memory pressure swaps them out before hotter anonymous memory. It is a
+hint - nothing is freed, and the kernel may ignore it. Its caveat is the swap device: the parked bytes move to swap,
+not away, and a restore faults them back - fast on zram, slow on a disk swap. Swapping them out does raise
+`MemAvailable`, the figure the parking and restore floor reads, so on a machine that swaps the floor passes more
+readily; where the floor is a cgroup term, the swapped bytes are still charged and nothing moves. A conversation
+restored from the cache is marked `MADV_WILLNEED` first, so the restore does not fault it in one page at a time. A
+no-op off Linux, and with nothing parked.

@@ -8,6 +8,18 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+// The 5.4-era "demote" hint; a build header that predates it still gets the kernel's value.
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
+#ifndef MADV_WILLNEED
+#define MADV_WILLNEED 3
+#endif
+
 namespace strata::core {
 
 // Snapshot-owned host storage. Appending never relocates existing payloads;
@@ -118,6 +130,13 @@ public:
         return true;
     }
 
+    // The parked conversations are ordinary swappable anon, so under memory pressure the kernel should give them
+    // back before hotter memory.  MADV_COLD deactivates the pages (a demote hint: nothing is freed, and the kernel
+    // may ignore it); MADV_WILLNEED faults them back in and re-activates them, for a conversation about to be
+    // restored.  Linux only; a no-op elsewhere.
+    void mark_cold() const { mark_all(MADV_COLD); }
+    void mark_willneed() const { mark_all(MADV_WILLNEED); }
+
 private:
     using Segment = std::vector<uint8_t>;
     // A fresh capture allocates exactly its payload. Later appends reserve
@@ -131,6 +150,20 @@ private:
         if (extra > SIZE_MAX - n) return false;
         n += extra;
         return true;
+    }
+    // Only the pages wholly inside a segment are advised: madvise needs a page-aligned range.
+    static void mark_span(const void* p, size_t n, int advice) {
+#if defined(__linux__)
+        const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+        const uintptr_t start = ((uintptr_t) p + page - 1) & ~(page - 1);
+        const uintptr_t end = ((uintptr_t) p + n) & ~(page - 1);
+        if (end > start) (void) madvise(reinterpret_cast<void*>(start), end - start, advice);
+#else
+        (void) p; (void) n; (void) advice;
+#endif
+    }
+    void mark_all(int advice) const {
+        visit(0, size_, [advice](const uint8_t* p, size_t n, size_t) { mark_span(p, n, advice); return true; });
     }
     template<class Self, class Fn> static bool visit_impl(Self& self, size_t offset, size_t count, Fn fn) {
         if (offset > self.size_ || count > self.size_ - offset) return false;

@@ -622,6 +622,10 @@ struct Options {
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
+    /// --conversation-cache-cold (opt-in, Linux): MADV_COLD the parked conversations and the retained K/V, so a
+    /// machine under memory pressure swaps them out before hotter anon.  A hint: nothing is freed, and the kernel
+    /// may ignore it.
+    bool conversation_cache_cold = false;
     /// --serve: the disk tier of the parked conversations (conversation_disk.hpp): a conversation the RAM cache evicts
     /// is written to this folder instead of dropped, and read back when a request continues it.  Empty = off.
     std::string conversation_disk_dir;
@@ -789,6 +793,8 @@ void usage() {
                  "                       no time limit); QUIT writes the current and the parked ones there first\n"
                  "  --conversation-cache-min-tokens N  --serve: park only conversations of at least N tokens, so\n"
                  "                       short side requests do not take the slots a long one needs (default 0 = park any)\n"
+                 "  --conversation-cache-cold  --serve (opt-in, Linux): MADV_COLD the parked conversations and the\n"
+                 "                       retained K/V, so memory pressure swaps them out before hotter anon\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -2048,6 +2054,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--conversation-disk-dir") o.conversation_disk_dir = next("--conversation-disk-dir");
         else if (a == "--conversation-disk-persist") o.conversation_disk_persist = true;
+        else if (a == "--conversation-cache-cold") o.conversation_cache_cold = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -8010,6 +8017,7 @@ int main(int argc, char** argv) {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
+                if (stored && o.conversation_cache_cold) conversations.mark_cold();   // a reclaim candidate now
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -9031,7 +9039,7 @@ int main(int argc, char** argv) {
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                        "tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "conversation_cache_cold=%d tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -9043,6 +9051,7 @@ int main(int argc, char** argv) {
                         pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
+                        o.conversation_cache_cold ? 1 : 0,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
@@ -10365,7 +10374,11 @@ int main(int argc, char** argv) {
                     if (evicted && !incoming) parked = conversations.best(ids, req_imgs, want_cvec);   // indices moved
                 }
             }
-            if (!incoming && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            if (!incoming && parked.tokens > std::max(resume, slot_tokens)) {
+                incoming.emplace(conversations.take(parked.index));
+                // it was MADV_COLD: fault it back before the restore reads it (a hint; the read works either way)
+                if (o.conversation_cache_cold) incoming->mark_willneed();
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.

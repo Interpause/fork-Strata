@@ -52,6 +52,12 @@ struct ConversationKv {
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
     }
+    // Reclaim hints over this layer's buffers (see ConversationBuffer): the parked K/V pages are the bulk of a
+    // parked conversation, and they are ordinary swappable anon.
+    void mark_cold() const { k.mark_cold(); v.mark_cold(); k_scale.mark_cold(); v_scale.mark_cold(); pooled.mark_cold(); }
+    void mark_willneed() const {
+        k.mark_willneed(); v.mark_willneed(); k_scale.mark_willneed(); v_scale.mark_willneed(); pooled.mark_willneed();
+    }
 };
 
 struct ConversationKvReuse {
@@ -171,6 +177,16 @@ struct SavedConversation {
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
         return n;
+    }
+
+    /// Reclaim hints over the image's K/V buffers (its bulk), every stage included; see ConversationBuffer.
+    void mark_cold() const {
+        for (const auto& layer : kv) layer.mark_cold();
+        for (const auto& stage : stage_images) stage.mark_cold();
+    }
+    void mark_willneed() const {
+        for (const auto& layer : kv) layer.mark_willneed();
+        for (const auto& stage : stage_images) stage.mark_willneed();
     }
 };
 
@@ -303,6 +319,16 @@ public:
         bytes_ = 0;
         reuse_ = {};
         return n;
+    }
+
+    /// --conversation-cache-cold: MADV_COLD every parked conversation and the retained K/V, so a machine under
+    /// memory pressure swaps them out before hotter anon (Linux; a hint, nothing is freed).  take()'s caller warms
+    /// the one it restores with mark_willneed().
+    void mark_cold() const {
+        for (const auto& e : entries_) e.mark_cold();
+        for (const auto& layer : reuse_.kv) layer.mark_cold();
+        for (const auto& stage : reuse_.stages)
+            for (const auto& layer : stage.kv) layer.mark_cold();
     }
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
