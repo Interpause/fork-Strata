@@ -371,6 +371,20 @@ class ToolLoop(unittest.TestCase):
         self.assertTrue(mcp[-1].get("skipped"))
         self.assertEqual(self.chunks(text)[-1]["choices"][0]["finish_reason"], "stop")
 
+    def test_parallel_tool_calls(self):
+        """The calls of one round run at the same time: two 1.5 s sleeps take about 1.5 s, not about 3 s."""
+        call = ("<tool_call>\n<function=fake__sleep>\n<parameter=seconds>\n1.5\n</parameter>\n</function>\n"
+                "</tool_call>")
+        self.start("</think>\n\n" + call + call, "</think>\n\ndone")
+        t0 = time.monotonic()
+        code, text = self.post({"strata_mcp": True})
+        elapsed = time.monotonic() - t0
+        self.assertEqual(code, 200, text)
+        mcp = [c["strata_mcp"] for c in self.chunks(text) if "strata_mcp" in c]
+        self.assertEqual(sum(m["event"] == "call" for m in mcp), 2)
+        self.assertEqual(sum(m["event"] == "result" for m in mcp), 2)
+        self.assertLess(elapsed, 2.8)                                # parallel (~1.5 s), not serial (~3 s)
+
     def test_stop_during_a_tool(self):
         """Closing the connection while a slow tool runs stops the tool (notifications/cancelled) and the loop."""
         self.start(call_script("fake__sleep", seconds=8), "</think>\n\nnever")
