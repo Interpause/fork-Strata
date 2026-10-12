@@ -6942,9 +6942,10 @@ def main() -> int:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    # the repo's chat template (the one these sources are tested against) wins; the model's own template
+    # (exported with its tokenizer) is the fallback for a pack that ships one
+    repo_tpl = ROOT / "serve/chat_template.jinja"
+    svc = Service(engine, tok, ChatTemplate(repo_tpl if repo_tpl.exists() else tpath / "chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
