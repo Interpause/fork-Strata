@@ -660,7 +660,9 @@ function answerHtml(m) {
   });
   return html + markdown(m.text.slice(pos));
 }
-// a tool event from the stream (the `strata_mcp` field of a chunk)
+// a tool event from the stream (the `strata_mcp` field of a chunk).  A new block records `at` and `rat`: how much
+// text and how much thinking the answer had when the call was written.  Those are the boundary between this round
+// and the next, which assistantMessages uses to give every round back its own thinking and its own text.
 function onTool(m, x) {
   if (x.event === "limit") { m.limit = x.max_rounds; return; }
   m.tools = m.tools || [];
@@ -748,8 +750,14 @@ function apiMessages() {
   }
   return out;
 }
-// An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
-// their results (as the model read them), then the rest - so the next question can build on what the tools found.
+// An answer that used MCP tools goes back as the model wrote it: per round the thinking and the text before the
+// calls, the calls and their results (as the model read them), then the rest - so the next question can build on
+// what the tools found.
+// Every turn's thinking goes back with it, always: the chat template renders an earlier answer's reasoning_content
+// into the prompt again (serve/chat_template.jinja, `preserve_reasoning`; docs/DETAILS.md), so a model that saw its
+// own thinking keeps building on it instead of working it out a second time.  A turn with tool calls is several
+// rounds, each with its own thinking, and each round takes only its own share: `at` and `rat` (onTool) mark where
+// the text and the thinking stood when that round's call was written.
 function assistantMessages(m) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
   // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
@@ -757,21 +765,29 @@ function assistantMessages(m) {
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
   if (!ran.length) {
     const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    if (m.reasoning) msg.reasoning_content = m.reasoning;
     return [msg];
   }
   const out = [];
-  let pos = 0;
+  let pos = 0, think = 0;                    // where this round's text and this round's thinking start
   for (const r of [...new Set(ran.map((t) => t.round))]) {
     const calls = ran.filter((t) => t.round === r);
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
-              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
+    const rat = Math.min(Math.max(think, calls[0].rat || 0), m.reasoning.length);
+    const msg = {role: "assistant", content: m.text.slice(pos, at).trim(),
+                 tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))};
+    const reasoning = m.reasoning.slice(think, rat).trim();   // this round's thinking, not the whole turn's
+    if (reasoning) msg.reasoning_content = reasoning;
+    out.push(msg);
     for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
-    pos = at;
+    pos = at; think = rat;
   }
-  const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
+  const rest = m.text.slice(pos).trim(), tail = m.reasoning.slice(think).trim();   // thinking after the last call
+  if (rest || tail) {
+    const msg = {role: "assistant", content: rest};
+    if (tail) msg.reasoning_content = tail;
+    out.push(msg);
+  }
   return out;
 }
 
