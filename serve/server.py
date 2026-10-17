@@ -4746,7 +4746,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
-    could not reach the model before the client's)."""
+    could not reach the model before the client's). The calls of one round run in parallel (one thread each)."""
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
     messages = list(messages)
@@ -4783,12 +4783,14 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             break
         rounds += 1
         results = []
+        running = []
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
             yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
                           "tool": tool, "arguments": c.arguments, "round": rounds}
-            # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
-            # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
+            # Every call of this round runs at once, each on its own thread, while this generator keeps yielding
+            # heartbeats: they reach the client as keep-alives, which is how a client that went away (the web app's
+            # Stop) is noticed during a slow tool - and stopping stops all of this round's tools together.
             box = {}
 
             def work(c=c, box=box):
@@ -4798,14 +4800,16 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
-            try:
-                while worker.is_alive():
-                    worker.join(1.0)
-                    if worker.is_alive():
-                        yield "ping", None
-            except GeneratorExit:
-                cancel.set()                             # the client is gone: stop the tool too
-                raise
+            running.append((c, box, worker))
+        try:
+            while any(w.is_alive() for _, _, w in running):
+                for _, _, w in running:
+                    w.join(1.0)
+                yield "ping", None
+        except GeneratorExit:
+            cancel.set()                                 # the client is gone: stop the tools too
+            raise
+        for c, box, _ in running:
             if "r" not in box:
                 break
             r = box["r"]
@@ -6942,9 +6946,10 @@ def main() -> int:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    # the repo's chat template (the one these sources are tested against) wins; the model's own template
+    # (exported with its tokenizer) is the fallback for a pack that ships one
+    repo_tpl = ROOT / "serve/chat_template.jinja"
+    svc = Service(engine, tok, ChatTemplate(repo_tpl if repo_tpl.exists() else tpath / "chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
