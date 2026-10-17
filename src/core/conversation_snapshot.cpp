@@ -201,6 +201,28 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     return true;
 }
 
+bool conversation_kv_target(SessionKvTarget& out, const QsaState& st, const ModelGeometry& g,
+                            int64_t upto, bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvTarget t;
+    t.format = l.format; t.cells = l.cells; t.heads = g.n_head_kv; t.head_dim = g.head_dim;
+    t.page_size = l.page_size; t.pooled_rows = l.pooled_rows; t.idx_dim = g.idx_key_dim;
+    t.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < dst.size(); ++i)
+        if (t.sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    const auto sizes = t.sizes;
+    auto why = std::make_shared<std::string>();
+    t.write = [dst, sizes, why](size_t part, size_t offset, const void* src, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V write out of range"; return false; }
+        return transfer(static_cast<uint8_t*>(dst[part]) + offset, src, n, *why);
+    };
+    t.error = [why] { return *why; };
+    out = std::move(t);
+    return true;
+}
+
 namespace {
 // After the authoritative pools were rewritten: the VRAM slots of a streamed state still hold the outgoing
 // conversation, so resolve must refill them before any attention reads (shared by restore and direct copy).
@@ -219,6 +241,12 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
     return false;
 }
 } // namespace
+
+// The streamed restore's residency step (conversation_snapshot_restore_streamed): the same refresh the host copy's
+// restore does after its transfers, under the name the streaming callers use.
+bool conversation_kv_finish(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    return refresh_residency(st, g, upto, error);
+}
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error, bool queued) {

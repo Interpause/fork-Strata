@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -71,6 +72,12 @@ struct ConversationKv {
     ConversationBuffer k, v, k_scale, v_scale, pooled;
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
+    }
+    // Reclaim hints over this layer's buffers (see ConversationBuffer): the parked K/V pages are the bulk of a
+    // parked conversation, and they are ordinary swappable anon.
+    void mark_cold() const { k.mark_cold(); v.mark_cold(); k_scale.mark_cold(); v_scale.mark_cold(); pooled.mark_cold(); }
+    void mark_willneed() const {
+        k.mark_willneed(); v.mark_willneed(); k_scale.mark_willneed(); v_scale.mark_willneed(); pooled.mark_willneed();
     }
 };
 
@@ -193,6 +200,16 @@ struct SavedConversation {
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
         return n;
+    }
+
+    /// Reclaim hints over the image's K/V buffers (its bulk), every stage included; see ConversationBuffer.
+    void mark_cold() const {
+        for (const auto& layer : kv) layer.mark_cold();
+        for (const auto& stage : stage_images) stage.mark_cold();
+    }
+    void mark_willneed() const {
+        for (const auto& layer : kv) layer.mark_willneed();
+        for (const auto& stage : stage_images) stage.mark_willneed();
     }
 };
 
@@ -356,12 +373,17 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
             bytes_ -= entries_[i].bytes();
+            SavedConversation gone = std::move(entries_[i]);
             erase(i);
             ++evictions_;
+            if (on_evict_) on_evict_(std::move(gone));   // e.g. the disk tier (conversation_disk.hpp); else dropped here
             return true;
         }
         return false;
     }
+
+    /// Where an evicted conversation goes instead of being dropped (the disk tier); it owns the image from then on.
+    void set_on_evict(std::function<void(SavedConversation&&)> fn) { on_evict_ = std::move(fn); }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
@@ -372,6 +394,16 @@ public:
         bytes_ = 0;
         reuse_ = {};
         return n;
+    }
+
+    /// --conversation-cache-cold: MADV_COLD every parked conversation and the retained K/V, so a machine under
+    /// memory pressure swaps them out before hotter anon (Linux; a hint, nothing is freed).  A caller that takes one
+    /// back warms it with mark_willneed().
+    void mark_cold() const {
+        for (const auto& e : entries_) e.mark_cold();
+        for (const auto& layer : reuse_.kv) layer.mark_cold();
+        for (const auto& stage : reuse_.stages)
+            for (const auto& layer : stage.kv) layer.mark_cold();
     }
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
@@ -451,6 +483,7 @@ private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
+    std::function<void(SavedConversation&&)> on_evict_;
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
