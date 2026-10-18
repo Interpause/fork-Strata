@@ -4263,10 +4263,12 @@ class ForcedToolChoice(unittest.TestCase):
                     finish, calls, reasoning = self.call_of(code, b, stream)
                     self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
                     self.assertEqual(reasoning, CallingEngine.THOUGHT)
-                    first, second = self.engine.prompts
+                    first, second, *named = self.engine.prompts
                     opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
                     # where the thinking ended, after the blank line the template puts before a call
                     self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT + "</think>\n\n" + opening))
+                    # "required": the name's first token is chosen, then the rest of the opening is written
+                    self.assertEqual(named, [] if choice == self.NAMED else [second + self.tok.encode("search>\n")])
 
     def test_a_thinking_that_ends_right_after_a_quote_opens_the_call(self):
         # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
@@ -4285,7 +4287,7 @@ class ForcedToolChoice(unittest.TestCase):
                 code, b = self.openai(tool_choice="required", stream=stream)
                 finish, calls, reasoning = self.call_of(code, b, stream)
                 self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], thought))
-                first, second = self.engine.prompts
+                first, second, _ = self.engine.prompts
                 self.assertEqual(second, first + self.tok.encode(thought + "</think>\n\n<tool_call>\n<function="))
 
     def test_without_thinking_the_prompt_ends_with_the_opening(self):
@@ -4296,9 +4298,10 @@ class ForcedToolChoice(unittest.TestCase):
                     code, b = self.openai(tool_choice=choice, stream=stream, **self.NO_THINKING)
                     finish, calls, reasoning = self.call_of(code, b, stream)
                     self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], ""))
-                    self.assertEqual(len(self.engine.prompts), 1)
+                    self.assertEqual(len(self.engine.prompts), 1 if choice == self.NAMED else 2)
                     opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
                     self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>\n\n" + opening))
+                    self.assertTrue(self.tok.decode(self.engine.prompts[-1]).endswith("<function=search>\n"))
 
     def test_the_budget_wrap_up_opens_the_call(self):
         from serve.server import REASONING_WRAP_UP
@@ -4306,7 +4309,7 @@ class ForcedToolChoice(unittest.TestCase):
         finish, calls, reasoning = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
         self.assertEqual(reasoning, CallingEngine.THOUGHT[:20] + REASONING_WRAP_UP.split("</think>")[0])
-        first, second = self.engine.prompts
+        first, second, _ = self.engine.prompts
         extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n<function=", parse_special=True)
         self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT[:20]) + extra)
 
@@ -4368,6 +4371,136 @@ class ForcedToolChoice(unittest.TestCase):
                     self.assertEqual(stop, want)
                     offered = "search the web" in self.tok.decode(self.engine.prompts[0])
                     self.assertEqual(offered, choice["type"] != "none")
+
+
+class InventingEngine(MockEngine):
+    """After `<function=` it names a tool nobody offered (`call`, the real name inside its arguments), as Gyro-S did
+    with tool_choice "required" - unless the pass biases tokens (logit_bias, which `info` says it takes): then it
+    writes the next character of the name it `likes` if that is biased, else the first biased token.  Records every
+    pass as (prompt text, logit_bias, max_new)."""
+    THOUGHT = "Which tool? "
+    ANSWER = "The answer is 4."
+    ARGS = {"search": "<parameter=q>\n2+2\n</parameter>\n", "get_time": "<parameter=city>\nTokyo\n</parameter>\n"}
+    MADE_UP = "call>\n<parameter=tool>\nsearch\n</parameter>\n</function>\n</tool_call>"
+
+    def __init__(self, tok, likes, bias=True):
+        super().__init__(tok, "x", max_context=CTX)
+        self.info = {"logit_bias": 1} if bias else {}
+        self.likes, self.passes = likes, []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        prompt = self.tok.decode(ids)
+        bias = {int(t): b for t, b in ((sampling or {}).get("logit_bias") or {}).items()}
+        self.passes.append((prompt, bias, max_new))
+        call = prompt[prompt.rfind("<tool_call>"):] if "<tool_call>" in prompt else ""
+        name = call[call.find("<function=") + len("<function="):] if "<function=" in call else None
+        if name is not None and name.endswith(">\n"):          # the opening is written: the arguments
+            ids = self.tok.encode(self.ARGS.get(name[:-2], "") + "</function>\n</tool_call>")
+        elif name is not None:                                  # in the name
+            want = self.tok.encode(self.likes[len(name):]) if self.likes.startswith(name) else []
+            liked = [b for b in bias if bias[b] > 0]
+            ids = ([want[0]] if want and want[0] in liked else liked[:1]) if bias else self.tok.encode(self.MADE_UP)
+        elif prompt.endswith("</think>\n\n"):
+            ids = self.tok.encode(self.ANSWER)
+        else:
+            ids = self.tok.encode(self.THOUGHT + "</think>\n\n" + self.ANSWER)
+        for t in (ids + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class RequiredNamesAnOfferedTool(unittest.TestCase):
+    """tool_choice "required" / Anthropic "any" with several tools: the server writes the name, one token at a time
+    among those that go on with an offered tool's name (the engine's logit_bias), so the call always names one."""
+    TOOLS = ForcedToolChoice.TOOLS
+    NO_THINKING = ForcedToolChoice.NO_THINKING
+
+    def start(self, likes, bias=True):
+        self.tok = ByteTokenizer()
+        self.engine = InventingEngine(self.tok, likes, bias)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
+            "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode()
+        return json.loads(raw) if not body.get("stream") else raw
+
+    def openai(self, tools=None, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 400,
+                "tools": tools or self.TOOLS, "tool_choice": "required", **extra}
+        return ForcedToolChoice.call_of(self, 200, self.post("/v1/chat/completions", body), body.get("stream"))[:2]
+
+    def anthropic(self, **extra):
+        tools = [{"name": t["function"]["name"], "input_schema": t["function"]["parameters"]} for t in self.TOOLS]
+        body = {"model": "m", "max_tokens": 400, "tools": tools, "tool_choice": {"type": "any"},
+                "messages": [{"role": "user", "content": "2+2?"}], **extra}
+        b = self.post("/v1/messages", body)
+        if not body.get("stream"):
+            return b["stop_reason"], [(c["name"], c["input"]) for c in b["content"] if c["type"] == "tool_use"]
+        evs = [json.loads(line[6:]) for line in b.splitlines() if line.startswith("data: {")]
+        calls = [[e["content_block"]["name"], ""] for e in evs if e["type"] == "content_block_start"
+                 and e["content_block"]["type"] == "tool_use"]
+        for e in evs:
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "input_json_delta":
+                calls[-1][1] += e["delta"]["partial_json"]
+        stop = [e for e in evs if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
+        return stop, [(n, json.loads(a or "{}")) for n, a in calls]
+
+    def test_the_call_names_the_offered_tool_the_model_likes(self):
+        for likes, args in (("done", {}), ("search", {"q": "2+2"})):
+            self.start(likes)
+            for route in ("openai", "anthropic"):
+                for stream in (False, True):
+                    for extra in ({}, self.NO_THINKING):
+                        with self.subTest(likes=likes, route=route, stream=stream, thinking=not extra):
+                            self.engine.passes = []
+                            if route == "openai":
+                                self.assertEqual(self.openai(stream=stream, **extra), ("tool_calls", [(likes, args)]))
+                            else:
+                                kw = {"thinking": {"type": "disabled"}} if extra else {}
+                                self.assertEqual(self.anthropic(stream=stream, **kw), ("tool_use", [(likes, args)]))
+                            # one pass picks the name's first token, among the offered names' first tokens only
+                            naming = [(b, m) for p, b, m in self.engine.passes if p.endswith("<function=")]
+                            self.assertEqual(naming, [({ord("s"): 100.0, ord("d"): 100.0}, 1)])
+                            self.assertTrue(self.engine.passes[-1][0].endswith(f"<function={likes}>\n"))
+
+    def test_the_names_shared_start_is_written_and_the_rest_chosen(self):
+        self.start("get_weather")
+        tools = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": {}}}}
+                 for n in ("get_time", "get_weather", "send")]
+        self.assertEqual(self.openai(tools=tools, **self.NO_THINKING), ("tool_calls", [("get_weather", {})]))
+        naming = [(p[p.rfind("=") + 1:], sorted(b)) for p, b, _ in self.engine.passes if b]
+        self.assertEqual(naming, [("", [ord("g"), ord("s")]), ("get_", [ord("t"), ord("w")])])
+
+    def test_a_clients_logit_bias_stays(self):
+        self.start("search")
+        self.assertEqual(self.openai(logit_bias={"65": 5}, **self.NO_THINKING),
+                         ("tool_calls", [("search", {"q": "2+2"})]))
+        self.assertEqual([b for _, b, _ in self.engine.passes], [{65: 5.0, ord("s"): 100.0, ord("d"): 100.0},
+                                                                  {65: 5.0}])
+
+    def test_an_engine_without_logit_bias_still_names_an_offered_tool(self):
+        # it writes `call`: the closest offered start (none is close: the first tool's) takes its place
+        self.start("done", bias=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.openai(**self.NO_THINKING), ("tool_calls", [("search", {"q": "2+2"})]))
+        self.assertIn("the closest offered name is written", out.getvalue())
+        self.assertFalse(any(b for _, b, _ in self.engine.passes))
+
+    def test_common_opening(self):
+        from serve.server import common_opening
+        self.assertEqual(common_opening([[1, 2, 3], [1, 2, 4], [1, 5]]), ([1], [[2, 3], [2, 4], [5]]))
+        self.assertEqual(common_opening([[1, 2], [1, 2]]), ([1, 2], None))       # the same opening twice
+        self.assertEqual(common_opening([[7, 8]]), ([7, 8], None))
+        self.assertEqual(common_opening([]), ([], None))
 
 
 class StatusHandover(unittest.TestCase):

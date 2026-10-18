@@ -50,6 +50,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -2552,6 +2553,13 @@ int main(int argc, char **argv) try {
         const strata::core::ModelGeometry g0;
         if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        // APR (prism.hadamard): the SYCL port has no activation rotation.  Refuse a pack that carries folded
+        // experts here, before anything is loaded, rather than run it on unrotated activations.
+        if (strata::kernels::cpu::hadamard_spec().any()) {
+            std::fprintf(stderr, "strata generate: this build (SYCL) cannot rotate expert activations; a pack "
+                                 "with Hadamard-folded experts needs the CUDA or HIP build\n");
             return 1;
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before

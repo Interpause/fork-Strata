@@ -57,9 +57,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+from serve.frontend import (FORCE_ANY, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
+                            anthropic_to_messages, forced_call, images_of, literal_tags, mark_think_literals,
+                            openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -159,6 +159,9 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 # low-effort instruction in place of the xhigh one.  Both off by default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
+# tool_choice "required" / "any" with several tools: the bias on the tokens that go on with an offered tool's name
+# while the server picks it (Service.call_opening); every other token stays where it was, so none can win
+NAME_BIAS = 100.0
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
@@ -3105,6 +3108,17 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+
+def common_opening(openings: list[list[int]]) -> tuple[list[int], list[list[int]] | None]:
+    """Token sequences (each tool's call opening) -> (the ids they all go on with, what is left of each after them).
+    None in place of the rest: one opening is complete, nothing is left to choose."""
+    common = []
+    while openings and all(openings) and len({o[0] for o in openings}) == 1:
+        common.append(openings[0][0])
+        openings = [o[1:] for o in openings]
+    return common, (openings if openings and all(openings) else None)
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -3905,6 +3919,34 @@ class Service:
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
             self.tok.encode(prompt, parse_special=True)
 
+    def call_opening(self, force, tools) -> tuple[list[int], list[list[int]] | None]:
+        """`force` (forced_call) -> (the ids that open the call, the openings still to choose from or None).  A
+        named call is written whole.  FORCE_ANY ("required" / "any" with several tools): each offered tool's
+        whole opening `<tool_call>\n<function=NAME>\n` is tokenized as the model would write it; their common start
+        opens the call, and Service.run writes the rest one token at a time, choosing only among the tokens that go
+        on with one of these openings - so the call can only name an offered tool.  Before, the model wrote the name
+        itself after `<function=` and often made one up (`call`, with the real name inside its arguments)."""
+        if force != FORCE_ANY:
+            return self.tok.encode(force, parse_special=True), None
+        names = dict.fromkeys(t["name"] for t in tools or [] if isinstance(t, dict) and isinstance(t.get("name"), str))
+        return common_opening([self.tok.encode(f"{force}{name}>\n", parse_special=True) for name in names])
+
+    def can_bias(self) -> bool:
+        """The engine takes a request's logit_bias (see logit_bias.validate_request)."""
+        info = getattr(self.engine, "info", None) or {}
+        return info.get("logit_bias") == 1 and not getattr(self.engine, "batch", 0)
+
+    def closest_token(self, t, allowed) -> int:
+        """The token of `allowed` (in the tools' order) whose text starts most like token `t`'s: what a name is
+        continued with when the engine wrote a token none of the offered names go on with (an engine without
+        logit_bias, see Service.run)."""
+        said = self.tok.decode([t]).strip().lower()
+
+        def shared(a):
+            text = self.tok.decode([a]).strip().lower()
+            return next((k for k, (x, y) in enumerate(zip(text, said)) if x != y), min(len(text), len(said)))
+        return max(allowed, key=shared)
+
     @contextlib.contextmanager
     def _turn(self, cancel=None):
         """The engine's single turn (self.fifo) for an image encode.  #1999: a client that leaves while this request
@@ -3965,7 +4007,7 @@ class Service:
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
+            ids = ids + self.call_opening(force, tools)[0]
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -4242,8 +4284,10 @@ class Service:
                 out.append(ev)
             return out
         opening = []                                    # without thinking the prompt ends with the forced opening:
-        if force and not thinking:                      # the parser reads it as if the model had written it
-            opening, force = parser.feed(force), None
+        naming = None                                   # the parser reads it as if the model had written it
+        if force and not thinking:                      # (naming: the offered names' openings still to choose from)
+            first, naming = self.call_opening(force, tools)
+            opening, force = [ev for t in first for ev in parser.feed(detok.push(t))], None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
@@ -4339,8 +4383,15 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        pass_new, pass_sampling, allowed, chosen = max_new - n, sampling, None, None
+                        if naming is not None:      # one token, of those that go on with an offered tool's name
+                            allowed, pass_new = list(dict.fromkeys(o[0] for o in naming)), 1
+                            if self.can_bias():
+                                pass_sampling = {**(sampling or {}), "logit_bias": {
+                                    **bias_api.normalize((sampling or {}).get("logit_bias")),
+                                    **dict.fromkeys(allowed, NAME_BIAS)}}
+                        gen = self.engine.generate(prompt, pass_new, pass_sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, pass_new, pass_sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -4361,6 +4412,10 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
+                                if allowed is not None and t not in allowed:
+                                    print("[strata] tool_choice: the engine began a name no offered tool has (it "
+                                          "cannot bias tokens): the closest offered name is written", flush=True)
+                                    t = self.closest_token(t, allowed)
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
@@ -4420,6 +4475,9 @@ class Service:
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
                                         break
+                                if allowed is not None:
+                                    chosen = t
+                                    break
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -4510,6 +4568,21 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if chosen is not None and not cancel.is_set():
+                            # the name goes on with the chosen token: what all the openings left share is written
+                            # as it is, up to the next choice or the end of the opening (`>` and the newline)
+                            extra, naming = common_opening([o[1:] for o in naming if o[0] == chosen])
+                            if max_new - n - len(extra) < 1:
+                                break                   # no room for the call's arguments: "length"
+                            for t in extra:
+                                n += 1
+                                raw_ids.append(t)
+                                evs = cut(parser.feed(detok.push(t)))
+                                self._note(n, evs, st, rate)
+                                for ev in evs:
+                                    yield "event", ev
+                            prompt = prompt + seg + extra
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -4519,11 +4592,13 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = REASONING_WRAP_UP
                         else:
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
-                        force = None
+                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n"))))
                         extra = self.tok.encode(text, parse_special=True)
+                        if force:
+                            first, naming = self.call_opening(force, tools)
+                            extra, force = extra + first, None
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
                         if wrap:

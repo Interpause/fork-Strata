@@ -758,10 +758,14 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
+FORCE_ANY = CALL_START + "\n<function="       # forced_call for "required" / "any" with several tools
+
+
 def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
+    "required" / Anthropic "any": any of the tools (FORCE_ANY: the server then writes the offered name the model
+    is likeliest to write, see Service.call_opening); a named function: that one.  A value it cannot honour (an
     unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
     not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
     kind, name = tool_choice_of(tool_choice)
@@ -771,7 +775,7 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return CALL_START + "\n<function="
+        return FORCE_ANY
     if kind == "named" and name in names:
         return CALL_START + f"\n<function={name}>\n"
     print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "

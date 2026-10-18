@@ -10,6 +10,8 @@
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -19,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -111,12 +114,24 @@ bool q8k_avx1(int type) {
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself (hadamard.hpp)
+        thread_local std::vector<float> tmp;
+        tmp.assign(x, x + f.n_embd);
+        hadamard_rotate(tmp.data(), (int) f.n_embd, f.had_block, f.gu_signs);
+        x = tmp.data();
+    }
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
     if (q8k_avx1(f.gu_act)) { q8k_quant_avx1(x, dst, f.n_embd); return; }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.had_d) {
+        thread_local std::vector<float> tmp;
+        tmp.assign(h, h + f.n_ff);
+        hadamard_rotate(tmp.data(), (int) f.n_ff, f.had_block, f.d_signs);
+        h = tmp.data();
+    }
     if (q8k_avx2(f.d_act)) { q8k_quant_avx2(h, dst, f.n_ff); return; }
     if (q8k_avx1(f.d_act)) { q8k_quant_avx1(h, dst, f.n_ff); return; }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
@@ -190,6 +205,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+    // The trellis types (TQ2_T / TQK6 / TQK7 / TQP5-7): Strata's own kernels (tq_cpu.hpp), for every group size - they decode
+    // a block once for all the tokens and give each token the same bits whatever the group (no #152 rule needed).
+    if (tq_supported(f.gu_type) && tq_kernels_enabled()) {
+        tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
@@ -257,6 +278,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
+    if (tq_supported(f.d_type) && tq_kernels_enabled()) {   // the trellis types, as in native_gu_rows
+        tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

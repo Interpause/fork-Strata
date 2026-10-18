@@ -164,8 +164,8 @@ def ms_meta(repo: str, path: str):
 
 
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
-LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
-LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
+LLAMA_CPP_COMMIT = "9aa51ce4fdd3435a91531ffe16a17414ccc6dc6f"   # agentionai-group/llama.cpp: its ggml has the Gyro trellis types (TQ2_T / TQK6 / TQK7, TQP5 / TQP6 / TQP7)
+LLAMA_CPP_ZIP = f"https://gitlab.com/agentionai-group/llama.cpp/-/archive/{LLAMA_CPP_COMMIT}/llama.cpp-{LLAMA_CPP_COMMIT}.zip"
 
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
@@ -1992,7 +1992,14 @@ def check_shards(shards):
 
 
 def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
+    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git.
+    STRATA_GGML_DIR names a checkout to use instead (no download, no pin check)."""
+    named = os.environ.get("STRATA_GGML_DIR", "").strip()
+    if named:
+        p = Path(named).expanduser().resolve()
+        if not (p / "ggml" / "CMakeLists.txt").exists() or not (p / "gguf-py").is_dir():
+            raise SystemExit(f"STRATA_GGML_DIR={named} is not a llama.cpp checkout")
+        return p
     llama = ROOT / "third_party" / "llama.cpp"
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
