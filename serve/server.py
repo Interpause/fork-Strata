@@ -150,9 +150,6 @@ REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
-REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -3128,7 +3125,6 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
-        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -4288,7 +4284,7 @@ class Service:
             first, naming = self.call_opening(force, tools)
             opening, force = [ev for t in first for ev in parser.feed(detok.push(t))], None
         tail = ""                                       # the last characters written (the newlines before a call)
-        answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        answered = False                                # content or a call came out
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
@@ -4545,28 +4541,6 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
-                                and not answered and not wrap and not opens and parser.state == "reasoning"
-                                and parser.buf != THINK_END         # #537: not after a held </think>, the end
-                                and (stops is None or stops.hit is None) and not cancel.is_set()):
-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
-                            close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
-                            if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
-                                for t in extra:
-                                    n += 1
-                                    raw_ids.append(t)
-                                    thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
-                                    self._note(n, evs, st, rate)
-                                    for ev in evs:
-                                        yield "event", ev
-                                prompt = prompt + seg + extra
-                                finish = "length"
-                                continue
                         if chosen is not None and not cancel.is_set():
                             # the name goes on with the chosen token: what all the openings left share is written
                             # as it is, up to the next choice or the end of the opening (`>` and the newline)
@@ -7033,7 +7007,6 @@ def main() -> int:
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
     svc.answer_room = cfg.get("answer_room") is not False
-    svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
