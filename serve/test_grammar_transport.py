@@ -1,0 +1,169 @@
+"""The transport: one `grammar=<path>` key on the engine line, one file that does not outlive its request.
+
+    python -m unittest serve.test_grammar_transport -v
+
+Host-only and no pack: the request is driven through `Service.run` with the mock engine, the same way the server
+tests do.  The pool is disabled here (there is no pack vocabulary), which is exactly the state a machine without
+`tools/build_llguidance.sh` is in: the file and the key still travel, nothing is constrained (D-020).
+"""
+import json
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from serve.frontend import FORCE_ANY, ChatTemplate  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+CTX = 4096
+
+
+class Recorder(MockEngine):
+    """Records what the server sent, and reads the grammar file while the engine would still need it."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.calls = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        path = sampling.get("strata_grammar")
+        self.calls.append({"sampling": dict(sampling), "path": path,
+                           "existed": bool(path) and Path(path).exists(),
+                           "text": Path(path).read_text(encoding="utf-8") if path else None})
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+def service(pack_dir=None):
+    tok = ByteTokenizer()
+    engine = Recorder(tok, "</think>\n\nHello.", max_context=CTX)
+    svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), pack_dir=pack_dir)
+    if svc.grammar_pool is not None:
+        svc.grammar_pool.log = lambda message: None     # the pool saying it is off is not this test's subject
+    return svc, engine, tok
+
+
+def run(svc, tok, thinking=False, tools=None, force=None, sampling=None):
+    ids = svc.prepare([{"role": "user", "content": "hi"}], tools, {"enable_thinking": thinking},
+                      req=sampling if sampling is not None else {}, force=force)[0]
+    cancel = threading.Event()
+    return list(svc.run(ids, thinking, tools, 8, dict(sampling or {}), cancel, force=force))
+
+
+class Key(unittest.TestCase):
+    def test_a_grammar_is_one_key_before_the_ids(self):
+        self.assertEqual(StrataEngine.sampling_keys({"strata_grammar": "/dev/shm/g/ab12.gr"}),
+                         " grammar=/dev/shm/g/ab12.gr")
+
+    def test_no_grammar_is_no_key(self):
+        for sampling in ({}, {"strata_grammar": None}, {"strata_grammar": ""}, {"strata_grammar": 7}):
+            with self.subTest(sampling=sampling):
+                self.assertEqual(StrataEngine.sampling_keys(sampling), "")
+
+    def test_a_path_with_a_space_is_not_sent(self):
+        # A space ends a key on this line: sending it would turn the rest of the path into the ids.
+        self.assertEqual(StrataEngine.sampling_keys({"strata_grammar": "/a b/c.gr"}), "")
+
+    def test_the_key_sits_beside_the_other_keys(self):
+        keys = StrataEngine.sampling_keys({"temperature": 0.5, "strata_grammar": "/x/y.gr"})
+        self.assertEqual(keys, " temperature=0.5 grammar=/x/y.gr")
+
+
+class Request(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.pack = Path(self.dir.name)
+        (self.pack / "vocab.json").write_text("{}", encoding="utf-8")   # a pack-shaped directory, not a real pack
+        self.svc, self.engine, self.tok = service(self.pack)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_the_engine_gets_one_file_that_is_the_spliced_grammar(self):
+        run(self.svc, self.tok)
+        self.assertEqual(len(self.engine.calls), 1)
+        call = self.engine.calls[0]
+        self.assertTrue(call["existed"], "the file must exist while the engine runs")
+        self.assertEqual(call["path"], str(Path(call["path"])))
+        self.assertTrue(call["path"].endswith(".gr"))
+        self.assertIn("start: entry_answer_plain", call["text"])
+        self.assertEqual(self.svc.pipeline.stats()["misses"], 1)
+
+    def test_the_file_is_named_for_its_own_bytes(self):
+        run(self.svc, self.tok)
+        call = self.engine.calls[0]
+        grammar = self.svc.pipeline.for_request(self.svc.tok.encode("x<think>\n\n</think>\n\n"))
+        self.assertEqual(Path(call["path"]).stem, grammar.id)
+
+    def test_the_file_is_gone_after_the_request(self):
+        run(self.svc, self.tok)
+        self.assertFalse(Path(self.engine.calls[0]["path"]).exists())
+
+    def test_the_file_is_gone_when_the_request_fails(self):
+        svc, engine, tok = service(self.pack)
+        ids = svc.prepare([{"role": "user", "content": "hi"}], None, {"enable_thinking": False})[0]
+        stream = svc.run(ids, False, None, 8, {}, threading.Event())
+        next(stream)                                        # the request has started: the file exists
+        path = engine.calls[0]["path"]
+        self.assertTrue(Path(path).exists())
+        stream.close()                                      # the client walked away
+        self.assertFalse(Path(path).exists())
+
+    def test_two_request_shapes_are_two_files_and_one_splice_each(self):
+        run(self.svc, self.tok)
+        run(self.svc, self.tok, thinking=True)
+        paths = [call["path"] for call in self.engine.calls]
+        self.assertEqual(len(set(paths)), 2)
+        self.assertEqual(self.svc.pipeline.stats()["misses"], 2)
+        for call in self.engine.calls:
+            self.assertFalse(Path(call["path"]).exists())
+
+    def test_the_same_shape_twice_writes_the_file_twice_and_splices_once(self):
+        run(self.svc, self.tok)
+        run(self.svc, self.tok)
+        self.assertEqual(len(set(call["path"] for call in self.engine.calls)), 1)
+        self.assertEqual(self.svc.pipeline.stats(), {"hits": 1, "misses": 1, "shapes": 1,
+                                                     "max": self.svc.pipeline.max})
+
+    def test_a_required_call_drops_the_prose_only_branch(self):
+        tools = [{"name": "f", "parameters": {"type": "object", "properties": {}}}]   # as the frontend passes them
+        run(self.svc, self.tok, thinking=True, tools=tools, force=FORCE_ANY)
+        self.assertIn("start: entry_think_tools_required", self.engine.calls[0]["text"])
+
+    def test_a_call_the_prompt_already_opened_is_the_mid_call_entry(self):
+        # Without thinking the forced opening ends the prompt, so the reply starts inside the call.
+        tools = [{"name": "f", "parameters": {"type": "object", "properties": {}}}]   # as the frontend passes them
+        run(self.svc, self.tok, thinking=False, tools=tools, force=FORCE_ANY)
+        self.assertIn("start: entry_call_name", self.engine.calls[0]["text"])
+
+    def test_a_prompt_without_a_template_tail_sends_no_grammar(self):
+        # A completion-style prompt: the grammar has no entry for it, so nothing is sent and the reply is unchanged.
+        list(self.svc.run(self.tok.encode("plain prompt, no chat template"), False, None, 8, {},
+                          threading.Event()))
+        self.assertIsNone(self.engine.calls[0]["path"])
+        self.assertTrue(self.svc.grammar_notes)
+
+    def test_a_server_without_a_pack_carries_no_grammar(self):
+        svc, engine, tok = service(None)
+        self.assertIsNone(svc.pipeline)
+        run(svc, tok)
+        self.assertIsNone(engine.calls[0]["path"])
+
+    def test_the_json_entry_uses_the_requests_schema(self):
+        sampling = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "answer", "schema": {"type": "object", "properties": {"a": {"type": "string"}}}}}}
+        run(self.svc, self.tok, sampling=sampling)
+        text = self.engine.calls[0]["text"]
+        self.assertIn("start: entry_answer_json", text)
+        self.assertIn('"a"', text)
+
+    def test_a_broken_schema_sends_no_grammar(self):
+        sampling = {"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": []}}}
+        run(self.svc, self.tok, sampling=sampling)
+        self.assertIsNone(self.engine.calls[0]["path"])
+
+
+if __name__ == "__main__":
+    unittest.main()

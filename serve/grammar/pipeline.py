@@ -24,8 +24,10 @@ from serve.grammar import build as bg
 from serve.grammar import entries as be
 
 CACHE_MAX = 64
-# The tails are a few tokens; decoding more of the prompt than that is pointless and decodes less exactly.
-TAIL_TOKENS = 16
+# The tail is a handful of tokens, but a call's name and the two template tails together are longer than that, and
+# only the end of what is decoded is read: decoding a generous window costs microseconds and removes a class of
+# "fits in 16 tokens" bugs (a byte-level tokenizer needs one id per character).
+TAIL_TOKENS = 256
 
 
 @dataclass(frozen=True)

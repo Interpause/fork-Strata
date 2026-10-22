@@ -80,32 +80,34 @@ def _only_objects(node, root, refs=()):
     return isinstance(branches, list) and any(_only_objects(b, root, refs) for b in branches)
 
 
-def prepare_format(response_format, messages, with_tools=False):
+def format_schema(response_format):
+    """The JSON Schema a response_format asks the reply to match, or None.  Raises ValueError on a malformed one.
+
+    One place reads response_format's shapes, because two things depend on the answer: the directive added to the
+    prompt (prepare_format) and the grammar's JSON entry (serve/grammar/pipeline.py).
+    """
     if response_format is None:
-        return messages, None
+        return None
     if not isinstance(response_format, dict):
         raise ValueError("response_format must be an object")
     kind = response_format.get("type")
     if kind == "text":
-        return messages, None
+        return None
     if kind == "json_object":
-        schema = {"type": "object"}
-        modules = None                 # the standard library is enough for "one JSON object"
-    elif kind == "json_schema":
-        spec = response_format.get("json_schema")
-        if not isinstance(spec, dict) or not isinstance(spec.get("schema"), dict):
-            raise ValueError("response_format.json_schema needs a schema object")
-        if not isinstance(spec.get("name"), str) or not spec["name"]:
-            raise ValueError("response_format.json_schema needs a name")
-        if "strict" in spec and not isinstance(spec["strict"], bool):
-            raise ValueError("response_format.json_schema.strict must be boolean")
-        schema = spec["schema"]
-        if not _only_objects(schema, schema):
-            raise ValueError("response_format schema must accept only JSON objects at its root "
-                             "(type object, or anyOf/oneOf of object schemas)")
-        modules = jsonschema_modules()
-    else:
+        return {"type": "object"}     # the standard library is enough for "one JSON object"
+    if kind != "json_schema":
         raise ValueError("response_format.type must be text, json_object or json_schema")
+    spec = response_format.get("json_schema")
+    if not isinstance(spec, dict) or not isinstance(spec.get("schema"), dict):
+        raise ValueError("response_format.json_schema needs a schema object")
+    if not isinstance(spec.get("name"), str) or not spec["name"]:
+        raise ValueError("response_format.json_schema needs a name")
+    if "strict" in spec and not isinstance(spec["strict"], bool):
+        raise ValueError("response_format.json_schema.strict must be boolean")
+    schema = spec["schema"]
+    if not _only_objects(schema, schema):
+        raise ValueError("response_format schema must accept only JSON objects at its root "
+                         "(type object, or anyOf/oneOf of object schemas)")
 
     def check_refs(node):
         if isinstance(node, dict):
@@ -117,6 +119,14 @@ def prepare_format(response_format, messages, with_tools=False):
             for value in node:
                 check_refs(value)
     check_refs(schema)
+    return schema
+
+
+def prepare_format(response_format, messages, with_tools=False):
+    schema = format_schema(response_format)
+    if schema is None:
+        return messages, None
+    modules = None if response_format.get("type") == "json_object" else jsonschema_modules()
     if modules is None:
         validator = _ObjectOnly()
     else:

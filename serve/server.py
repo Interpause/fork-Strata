@@ -63,9 +63,12 @@ from serve.frontend import (FORCE_ANY, THINK_END, ChatTemplate, Event, OutputPar
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.grammar import guard  # noqa: E402
+from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
+from serve.grammar import pool as grammar_pool  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import format_schema  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -132,6 +135,38 @@ def write_temporary(path: Path, parts: list) -> None:
     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
         for part in parts:
             f.write(Path(part).read_bytes())
+
+
+def grammar_file(pack_dir: Path, name: str, text: str) -> Path:
+    """Where one request's grammar goes: `<dir>/<16-hex>.gr`, the same reasoning as combined_embeddings_path (in
+    /dev/shm when it has room, since the engine reads it back at once, otherwise next to the model).  The directory
+    carries the process id so two servers never share a name; the file's own name is the grammar's identity, which is
+    what the engine caches by (tmp/impl-plan/contracts/c1-grammar-transport.md)."""
+    directory = Path(pack_dir)
+    shm = Path("/dev/shm")
+    if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
+        try:
+            if shutil.disk_usage(shm).free > (16 << 20):
+                directory = shm
+        except OSError:
+            pass
+    directory = directory / f"strata-grammar-{os.getpid()}"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.gr"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def drop_grammar(path) -> None:
+    """Delete a request's grammar file and the directory once it is the last one, so nothing is left behind."""
+    if not path:
+        return
+    p = Path(path)
+    p.unlink(missing_ok=True)
+    try:
+        p.parent.rmdir()
+    except OSError:
+        pass
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -1226,6 +1261,12 @@ class StrataEngine:
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
                                                for k in ik):
             keys += " img_keys=" + ",".join(ik)
+        # The request's grammar: a file the server wrote (C1 in tmp/impl-plan/contracts).  The engine reads it at
+        # admission; one that does not know the key skips it and decodes unconstrained.  A path with a space cannot
+        # travel on this line (the key parser ends a token at a space), so it is not sent at all.
+        g = sampling.get("strata_grammar")
+        if isinstance(g, str) and g and " " not in g:
+            keys += " grammar=" + g
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")
@@ -3120,8 +3161,15 @@ def common_opening(openings: list[list[int]]) -> tuple[list[int], list[list[int]
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, pack_dir: Path | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        # The request's grammar (contracts C1/C2 in tmp/impl-plan/contracts): spliced once per shape, compiled once per
+        # text, cloned per request.  Only a pack's tokenizer can do it - a mock or byte tokenizer has no ids to
+        # constrain - so a server without one carries no grammar at all.
+        self.pack_dir = Path(pack_dir) if pack_dir is not None else None
+        self.pipeline = grammar_pipeline.Pipeline(tokenizer) if pack_dir is not None else None
+        self.grammar_pool = grammar_pool.Pool(pack_dir, tokenizer) if pack_dir is not None else None
+        self.grammar_notes: set[str] = set()          # a grammar problem is said once, not once per request
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -4176,6 +4224,43 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
+    def begin_grammar(self, ids, tools, force, sampling):
+        """-> (the file for the engine, this request's matcher).
+
+        The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
+        written to be read back at once and deleted in run()'s `finally`, and writing it this close to the engine call
+        is what keeps it from outliving the request.  `force` (a tool_choice that requires a call) drops the
+        prose-only branch; with thinking on it is the only thing that says so, since the prompt still ends at the
+        reasoning tail.
+
+        Nothing applies a mask yet, so every failure here leaves the request decoding unconstrained: it is said once
+        per kind of failure and the request goes on (D-020).
+        """
+        if self.pipeline is None:
+            return None, None
+        try:
+            grammar = self.pipeline.for_request(ids, tools=tools,
+                                               schema=format_schema((sampling or {}).get("response_format")),
+                                               required=force is not None)
+        except Exception as e:                  # noqa: BLE001 - a grammar never fails a request in this phase
+            self.grammar_note(f"{type(e).__name__}: {e}")
+            return None, None
+        matcher = self.grammar_pool.acquire(grammar.id, grammar.text)
+        try:
+            path = grammar_file(self.pack_dir, grammar.id, grammar.text)
+        except OSError as e:
+            self.grammar_pool.release(matcher)
+            self.grammar_note(f"cannot write the grammar file: {e}")
+            return None, None
+        return str(path), matcher
+
+    def grammar_note(self, why: str) -> None:
+        """Say a grammar problem once per kind: a prompt that is not from this template fails on every request."""
+        if why in self.grammar_notes or len(self.grammar_notes) >= 32:
+            return
+        self.grammar_notes.add(why)
+        print(f"[strata] grammar: {why}; this request decodes unconstrained", flush=True)
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -4295,6 +4380,9 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
+        gfile, gmatcher = self.begin_grammar(ids, tools, force, sampling)
+        if gfile:
+            sampling = {**(sampling or {}), "strata_grammar": gfile}
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
@@ -4684,6 +4772,10 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+            if gmatcher is not None:
+                self.grammar_pool.release(gmatcher)
+            if gfile:
+                drop_grammar(gfile)
         for ev in cut(parser.finish(finish)):
             yield "event", ev
         if parser.rescued or parser.refused:
@@ -7013,7 +7105,8 @@ def main() -> int:
     svc = Service(engine, tok, tpl,
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+                  fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True,
+                  pack_dir=tpath if (tpath / "vocab.json").exists() else None)   # a pack: it can carry a grammar
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
     svc.answer_room = cfg.get("answer_room") is not False
