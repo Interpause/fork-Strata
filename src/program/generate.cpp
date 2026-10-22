@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/grammar/llguidance.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -711,6 +712,10 @@ struct Options {
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
+    /// --grammar-tokenizer DIR: the pack's tokenizer directory, which a `grammar=<file>` request is compiled
+    /// against.  Empty = no grammar library was asked for, and a request that sends one is refused (an
+    /// unconstrained reply is not a fallback, see docs/DETAILS.md and tmp/impl-plan/contracts/c3-engine-step.md).
+    std::string grammar_tokenizer;
     int adapt_swaps = 96;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
@@ -2566,6 +2571,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
+        else if (a == "--grammar-tokenizer") o.grammar_tokenizer = next("--grammar-tokenizer");
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -10675,6 +10681,16 @@ int main(int argc, char** argv) {
                                  (long long) (later_reserve + 768 - sf_mib));
             }
         }
+        // Grammar-constrained decoding: the pack's tokenizer and llguidance are loaded once here, before READY,
+        // so a missing library or tokenizer is discovered before the first request instead of on one.  Without
+        // them the INFO line has no grammar=1 and a request that sends grammar=<file> is refused.
+        strata::grammar::Session grammar_session;
+        {
+            std::string gerr;
+            if (!o.grammar_tokenizer.empty() && !grammar_session.open(o.grammar_tokenizer, gerr))
+                std::fprintf(stderr, "strata serve: --grammar-tokenizer: %s\n", gerr.c_str());
+        }
+        const std::string grammar_flag = grammar_session.ready() ? " grammar=1" : "";
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -10701,7 +10717,8 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "conversation_cache_cold=%d tail_role_token=%lld vram_elastic=%d "
-                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine="
+                        STRATA_VERSION "%s\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -10722,7 +10739,8 @@ int main(int argc, char** argv) {
                         strata::prefill::Prefill::pipe_setting(),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "",
+                        grammar_flag.c_str());
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -11919,6 +11937,10 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;
             bool req_bias_present = false;
+            // grammar=<file>: the Lark text the server spliced for this request (contract C1 in
+            // tmp/impl-plan/contracts/).  The engine compiles its own matcher from it; a request that asks for a
+            // grammar the engine cannot compile is refused rather than decoded unconstrained.
+            std::string req_grammar;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
@@ -11953,6 +11975,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "grammar") req_grammar = tok.substr(eq + 1);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
@@ -11991,6 +12014,35 @@ int main(int argc, char** argv) {
                 !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
                 std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
                 continue;
+            }
+            strata::grammar::Match req_match;
+            if (!req_grammar.empty()) {
+                std::string gtext, gerr;
+                if (!grammar_session.ready()) {
+                    std::printf("ERR grammar: %s\n",
+                                grammar_session.failure().empty()
+                                    ? "--grammar-tokenizer was not given, so no grammar can be compiled"
+                                    : grammar_session.failure().c_str());
+                    continue;
+                }
+                if (std::FILE* gf = std::fopen(req_grammar.c_str(), "rb")) {
+                    char buf[8192];
+                    size_t got = 0;
+                    while ((got = std::fread(buf, 1, sizeof buf, gf)) > 0) gtext.append(buf, got);
+                    std::fclose(gf);
+                }
+                if (gtext.empty()) {
+                    std::printf("ERR grammar: %s cannot be read\n", req_grammar.c_str());
+                    continue;
+                }
+                req_match = grammar_session.compile(gtext, gerr);
+                if (!req_match.valid()) {
+                    // One line per reply is the protocol: the compiler's report is folded into it here.
+                    for (char& c : gerr)
+                        if (c == '\n' || c == '\r') c = ' ';
+                    std::printf("ERR grammar: %s\n", gerr.c_str());
+                    continue;
+                }
             }
             std::string emb_path;
             if (geni && endp != nullptr) {

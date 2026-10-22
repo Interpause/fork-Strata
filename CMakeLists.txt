@@ -731,7 +731,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec strata_grammar
+                        ${_strata_gpu_runtime_target})
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet
@@ -1336,14 +1337,17 @@ endif()
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
             src/spec/draft_source.cpp)
 target_include_directories(strata_spec PUBLIC include)
+# The grammar lane's engine side: the pack's vocabulary as llguidance wants it, and the
+# dlopen wrapper over its C API.  No CUDA: a masked step is host work between the logits
+# and the commit.
+add_library(strata_grammar STATIC src/grammar/llguidance.cpp src/grammar/vocabulary.cpp)
+target_include_directories(strata_grammar PUBLIC include)
+target_link_libraries(strata_grammar PUBLIC strata_artifact ${CMAKE_DL_LIBS})
 if(STRATA_BUILD_TESTS)
-  # The grammar lane's own checks: the pack's vocabulary as llguidance wants it, and
-  # the dlopen wrapper over its C API.  No GPU and no model - both halves skip, with a
-  # printed reason, when the pack or libllguidance is not on this machine.
-  add_executable(grammar_lib_test src/grammar/llguidance_test.cpp src/grammar/llguidance.cpp
-                 src/grammar/vocabulary.cpp)
-  target_include_directories(grammar_lib_test PRIVATE include)
-  target_link_libraries(grammar_lib_test PRIVATE strata_artifact ${CMAKE_DL_LIBS})
+  # No GPU and no model: both halves skip, with a printed reason, when the pack or
+  # libllguidance is not on this machine.
+  add_executable(grammar_lib_test src/grammar/llguidance_test.cpp)
+  target_link_libraries(grammar_lib_test PRIVATE strata_grammar)
   add_test(NAME grammar_lib_test COMMAND grammar_lib_test)
   add_executable(arch_defaults_test src/core/arch_defaults_test.cpp src/core/arch_defaults.cpp)
   target_include_directories(arch_defaults_test PRIVATE include)
