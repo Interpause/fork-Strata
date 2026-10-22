@@ -62,6 +62,7 @@ from serve.frontend import (FORCE_ANY, THINK_END, ChatTemplate, Event, OutputPar
                             openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve.grammar import guard  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -6928,6 +6929,10 @@ def main() -> int:
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
+        try:                                            # before the minutes of loading: a stale pack stops here
+            guard.check_ids(tok.encode)
+        except guard.GuardError as e:
+            raise SystemExit(f"[strata] {e}")
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
@@ -7000,7 +7005,12 @@ def main() -> int:
     # the repo's chat template (the one these sources are tested against) wins; the model's own template
     # (exported with its tokenizer) is the fallback for a pack that ships one
     repo_tpl = ROOT / "serve/chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(repo_tpl if repo_tpl.exists() else tpath / "chat_template.jinja"),
+    tpl = ChatTemplate(repo_tpl if repo_tpl.exists() else tpath / "chat_template.jinja")
+    try:                                                # the grammar encodes this template's own bytes
+        guard.check_template(tpl)
+    except guard.GuardError as e:
+        raise SystemExit(f"[strata] {e}")
+    svc = Service(engine, tok, tpl,
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
