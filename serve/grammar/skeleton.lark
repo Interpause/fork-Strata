@@ -1,0 +1,186 @@
+%llguidance {}
+
+// ============================================================================
+// skeleton.lark -- the reply structure of Strata's chat template
+// (serve/chat_template.jinja, template_version "qwen3.8-safe-v2") as an
+// llguidance (v1.9.1) Lark grammar for the gyro_l pack tokenizer.
+//
+// The template writes these bytes around the reply that is generated:
+//
+//   <|im_start|>assistant\n<think>\n           prompt tail, thinking ON
+//   <think>\n\n</think>\n\n                    prompt tail, thinking OFF
+//   ... reasoning ...\n</think>\n\n            reasoning +  </think> TOKEN + 2 NL
+//   ... content ...                            prose (may be empty)
+//   \n\n<tool_call>\n<function=NAME>\n         first call after non-empty prose
+//   <tool_call>\n<function=NAME>\n             first call after empty prose
+//   \n<tool_call>\n<function=NAME>\n           every later call
+//   <parameter=P>\nVALUE\n</parameter>\n       one per argument, any order
+//   </function>\n</tool_call>                  closes the call
+//   <|im_end|>\n                               turn end, NOTHING before it
+//
+// Token facts (the gyro_l pack's vocabulary, measured):
+//   <think>     248068 type 4      </think>     248069 type 4
+//   <tool_call> 248058 type 4      </tool_call> 248059 type 4
+//   <|im_end|>  248046 type 3 (EOS of the pack)
+//   "<function=", "<parameter=", "</parameter>", "</function>" are ORDINARY
+//   text (several BPE pieces each).
+//
+// Two different kinds of delimiter, and each needs a different technique:
+//
+//   * SPECIAL TOKENS (</think> ,  <tool_call> ,   </tool_call> ,   <|im_end|> ) are one
+//     token id and unreachable from a byte regex. A GREEDY text terminal may
+//     sit before them (THINK_BODY, TEXT, PROSE_BEFORE_TOOLS): the parser can
+//     end the lexeme at any accepting position and then take the special token.
+//     They must never be named inside a terminal (llguidance rejects that).
+//
+//   * ORDINARY-TEXT delimiters ("<parameter=", "\n</parameter>\n", etc.) must
+//     be spelled out in quoted strings/rules. The one place where arbitrary
+//     text is terminated by an ordinary-text delimiter is a raw parameter
+//     value; there raw_param_end is [lazy] so the lexeme stops at the first
+//     "\n</parameter>\n". It is safe because that minimum match is 14 bytes,
+//     so it can never match the empty string (the old draft's `head[lazy]:
+//     TEXT`, which could match "", panicked in
+//     lexer.rs:225 assert!(!state.has_lowest_match())).
+//
+// ============================================================================
+// 1. ENTRY POINT SELECTION
+// ============================================================================
+// llguidance always starts at the rule named `start`. The caller (serve/grammar/
+// build.py's select_entry) substitutes the single token `entry_select` on the next
+// line. That literal line appears EXACTLY ONCE in this file.
+start: entry_select
+
+// Default: thinking on, tools available (the common request shape).
+entry_select: entry_think_tools
+
+// ---------------------------------------------------------------------------
+// Standard turn entries. The prompt tail decides which one applies:
+//   "<think>\n"                      thinking on  -> entry_think_*
+//   "<think>\n\n</think>\n\n"        thinking off -> entry_answer_*
+// ---------------------------------------------------------------------------
+entry_think_plain: thinking answer_plain
+entry_think_tools: thinking answer_tools
+// tool_choice "required": the same turn with the prose-only branch removed,
+// so the reply must contain a call.  The allowed names are a property of the
+// tool fragment: when tool_choice names one function, the fragment is built
+// from that tool alone, so only that name can be generated.
+entry_think_tools_required: thinking answer_tools_required
+entry_think_json:  thinking answer_json
+
+entry_answer_plain: answer_plain
+entry_answer_tools: answer_tools
+entry_answer_tools_required: answer_tools_required
+entry_answer_json:  answer_json
+
+// ---------------------------------------------------------------------------
+// Mid-call entry: the prompt already ended with "  <tool_call> \n <function"
+// (tool_choice "required" with several tools). "=" and the name still have to
+// be generated. Per-tool entries entry_call_named_<slug> /
+// entry_call_name_<slug> are emitted by the FRAGMENT, not here.
+// ---------------------------------------------------------------------------
+entry_call_name: "=" tool_dispatch "</function>\n"   </tool_call> more_tool_calls   <|im_end|>
+
+// ============================================================================
+// 2. REPLY STRUCTURE
+// ============================================================================
+// Prompt ended at "  <think> \n ". The model writes reasoning text ending in a
+// newline, then the   </think> SPECIAL token, then exactly "\n\n".
+// THINK_BODY is GREEDY, not lazy: it allows multi-line reasoning (and lets the
+// model spell "  </think> " as ordinary BPE pieces), and the special token can be
+// taken after any newline. Minimum match is one newline, so it is never empty.
+thinking: THINK_BODY   </think> "\n\n"
+
+// Plain answer, no tools and no JSON schema: any prose (possibly empty) then
+// the end-of-turn TOKEN. ANSWER_TEXT is greedy;   <|im_end|> is a special token,
+// so the parser can end the lexeme wherever the token arrives.
+answer_plain: ANSWER_TEXT   <|im_end|>
+
+// Answer when tools are available. Three shapes, exactly the template's:
+//   1. plain prose, maybe empty, then end of turn;
+//   2. a call immediately at byte 0 (content was empty/whitespace: NO prefix);
+//   3. non-empty prose, then exactly "\n\n", then the call(s).
+// PROSE_BEFORE_TOOLS ends in "\n\n" and its last character before those two
+// newlines must not be a newline, so "\n\n" is exact: one or three newlines
+// are not accepted as the separator.
+answer_tools: ANSWER_TEXT  <|im_end|>
+            | tool_calls  <|im_end|>
+            | PROSE_BEFORE_TOOLS tool_calls  <|im_end|>
+
+// tool_choice "required": the two shapes that contain a call.  Dropping the
+// prose-only branch forbids ending the turn after prose alone; dropping the
+// empty-prose branch before  <|im_end|> forbids an empty answer.  The name set
+// is the tool fragment's, not this rule's.
+answer_tools_required: tool_calls  <|im_end|>
+                     | PROSE_BEFORE_TOOLS tool_calls  <|im_end|>
+
+// Answer when a response JSON schema is set: EXACTLY one value matching the
+// schema, then the end of the turn. json_response is replaced per request.
+//
+// There is deliberately NO `TEXT` prefix here.  Measured with this grammar: with
+// `TEXT json_response`, the greedy TEXT lexeme absorbs the JSON object itself, so
+// "[1, 2]" is accepted as prose, prose after an object is accepted, and the turn
+// cannot end after the first object.  The
+// template gives JSON mode no delimiter that could end prose before the
+// object, so the only deterministic encoding is the schema value alone.
+answer_json: json_response   <|im_end|>
+
+// One or more calls. Every call opens with the   <tool_call> SPECIAL token,
+// then "\n<function=", the name + parameters (the FRAGMENT's tool_dispatch),
+// then "</function>\n", then the   </tool_call> SPECIAL token.
+// Later calls are separated by EXACTLY one "\n" (no prose in between), and
+//   <|im_end|> follows the last   </tool_call> with nothing before it.
+tool_calls: single_tool_call more_tool_calls
+more_tool_calls: ( "\n" single_tool_call )*
+single_tool_call:   <tool_call> "\n<function=" tool_dispatch "</function>\n"   </tool_call>
+
+// ============================================================================
+// 3. TERMINALS
+// ============================================================================
+// Multi-line reasoning that ends in a newline, used before the   </think>
+// special token. GREEDY: minimum match is "\n" (1 byte), never empty.
+THINK_BODY: /(?s:.*)\n/
+
+// Non-empty prose that ends in exactly "\n\n", used before   <tool_call>.
+// It must START with a non-newline (so the two template newlines cannot be
+// followed by a third that is absorbed as prose) and its character before the
+// two newlines must also be a non-newline.  The separator is therefore exactly
+// two newlines.  This is stricter than a bare /(?s:.+)\n\n/, which accepts three.
+PROSE_BEFORE_TOOLS: /(?s:[^\n](.*[^\n])?)\n\n/
+
+// Answer text: empty, or text whose FIRST byte is not a newline.  The leading
+// non-newline is what makes the two newlines the template writes before
+// content (after   </think> or in the thinking-off prompt) exactly two: a third
+// newline cannot start the answer.  Greedy, never [lazy].
+ANSWER_TEXT: /(?s:[^\n].*)?/
+
+// One raw, UNQUOTED parameter value plus its closing "\n</parameter>\n".
+// [lazy] is correct and safe here ONLY because the minimum match is
+// "\n</parameter>\n" = 14 bytes: the terminal cannot match "", so the initial
+// lexer state can never have a lazy match (the v1 draft's failure).
+// The lazy match stops at the FIRST standalone "\n</parameter>\n" line; a
+// "</parameter>" that is not alone on its line, and any multi-line value, are
+// part of the value.
+raw_param_end[lazy]: /(?s:.*)\n<\/parameter>\n/
+
+// ============================================================================
+// 4. PER-REQUEST SPLICE POINTS
+// ============================================================================
+// serve/grammar/build.py replaces everything BETWEEN each marker pair (markers kept).
+// Nothing below is generated here: this file never names a client tool or a
+// client parameter.
+
+// >>> SPLICE_JSON_SCHEMA_BEGIN
+json_response: %json {"type": "object"}
+// <<< SPLICE_JSON_SCHEMA_END
+
+// The fragment supplies:
+//   tool_dispatch: call_<slug> | ...;
+//   call_<slug>: "NAME>\n" params_<slug>::0x0;
+//   params_<slug>::_ : "" %if is_ones([0:R]) | param_<slug>_i ...;
+//   param_<slug>_i: "<parameter=P>\n" VALUE-RULE;
+//   entry_call_named_<slug>: ...; entry_call_name_<slug>: ...;
+// With no tools it stays the never-matching placeholder below.
+// >>> SPLICE_TOOLS_BEGIN
+tool_dispatch: NEVER_MATCH
+NEVER_MATCH: /[^\x00-\xff]/
+// <<< SPLICE_TOOLS_END
