@@ -214,7 +214,7 @@ class Request(unittest.TestCase):
 
 
 class Routing(unittest.TestCase):
-    """TEMPORARY, and P4 deletes it with the routing (D-029).
+    """TEMPORARY(D-029) - P4 deletes this class with the routing.
 
     A request whose `grammar=` will actually travel decodes on the solo path even when the engine runs batch slots,
     because the engine refuses a `grammar=` on a batch admission: its batch windows sample through `sample_rows`,

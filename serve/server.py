@@ -1225,8 +1225,8 @@ class StrataEngine:
     def solo_only(self, sampling: dict) -> bool:
         """Whether this request must take the solo path even when the engine runs batch slots.
 
-        TEMPORARY, and P4 owns its removal (D-029).  A request whose `grammar=` will actually be sent cannot be
-        admitted to a batch slot: the engine refuses one there, because the batch windows sample through
+        TEMPORARY(D-029) - P4 deletes this method and its two call sites.  A request whose `grammar=` will actually
+        be sent cannot be admitted to a batch slot: the engine refuses one there, because the batch windows sample through
         `sample_rows`, which has no bias path, and admitting it anyway would decode unconstrained while the
         request says it is masked (D-027).  So the request takes the solo `GEN` path, serialised against the other
         solo work by the turn fifo, while the slots keep serving requests that carry no grammar.  Once P4 gives
@@ -2024,8 +2024,8 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
-        # A grammar request is solo even here (D-029, temporary until P4's per-slot mask): `generate_batched` admits
-        # onto a slot, and the engine refuses a `grammar=` on a batch admission.
+        # TEMPORARY(D-029), until P4's per-slot mask: `generate_batched` admits onto a slot, and the engine refuses
+        # a `grammar=` on a batch admission.
         if getattr(self, "batch", 0) and not self.solo_only(sampling):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -4446,7 +4446,7 @@ class Service:
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        # (D-029, temporary: a request carrying a grammar is one at a time even then, and decodes on the solo path)
+        # TEMPORARY(D-029): a request carrying a grammar is one at a time even then, and decodes on the solo path
         solo_only = getattr(self.engine, "solo_only", None)
         par = bool(getattr(self.engine, "batch", 0)) and not (solo_only and solo_only(sampling))
         st = {} if par else self.status
