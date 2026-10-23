@@ -11654,8 +11654,8 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 // A batch slot's windows sample through sample_rows, which has no bias path, so a grammar there could
-                // not be applied - and admitting it would decode unconstrained while the request says it is masked.
-                // Refused until P4 gives the batch path the mask (D-027).
+                // not be applied - and admitting it would decode unconstrained while the request says it is masked
+                // (D-027).  TEMPORARY(D-029): P4 gives the batch path the per-slot mask and this refusal goes.
                 if (line.find(" grammar=") != std::string::npos) {
                     std::printf("ERR grammar: a request with a grammar cannot run in a batch slot yet\n");
                     std::fflush(stdout);

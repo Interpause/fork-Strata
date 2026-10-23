@@ -1239,7 +1239,7 @@ class StrataEngine:
         """`sampling_keys` for this engine, with a request's grammar sent only to an engine that reported it can
         compile one (INFO `grammar=1`, engines with the C1 grammar work).  One that cannot refuses the whole
         request, so the key is dropped instead of killing it - the reply is then unconstrained, which is said
-        once; P3-C2 makes it an error rather than a fallback (D1)."""
+        once.  P7 makes a declared shape fail instead of decoding unconstrained (D-027)."""
         if sampling.get("strata_grammar") and not (self.info or {}).get("grammar"):
             sampling = {k: v for k, v in sampling.items() if k != "strata_grammar"}
             if not StrataEngine._no_grammar_said:
@@ -4286,8 +4286,8 @@ class Service:
         prose-only branch; with thinking on it is the only thing that says so, since the prompt still ends at the
         reasoning tail.
 
-        Nothing applies a mask yet, so every failure here leaves the request decoding unconstrained: it is said once
-        per kind of failure and the request goes on (D-020).
+        A failure here sends no grammar, so the request decodes unconstrained without ever declaring otherwise: it is
+        said once per kind of failure and the request goes on (D-020).
         """
         if self.pipeline is None:
             return None, None

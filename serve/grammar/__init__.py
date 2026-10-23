@@ -9,5 +9,7 @@
     pool.py                compiled prototypes by id, cloned for every request
     guard.py               the startup assertions that the grammar still matches the pack and the template
 
-Nothing here runs during a request yet: the engine attachment is a later phase.
+During a request: `pipeline` picks the entry rule and splices the text (it needs no library), `pool` clones a
+compiled prototype, and the server hands the engine the text as a file (`grammar=<path>`), which the engine
+compiles and masks every step with.  `matcher` is the only file that loads the library; `pool` is its only user.
 """
