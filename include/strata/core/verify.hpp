@@ -133,6 +133,20 @@ public:
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    /// Per-row vocabulary biases for the NEXT batch window, consumed by it: `bias` holds `S` rows of `n_vocab` floats,
+    /// row t being WINDOW row t (a compacted slot list - row t is not slot t), and `biased[t] != 0` marks the rows that
+    /// carry one.  Empty `bias` cancels.
+    ///
+    /// A biased row is drawn through the sampler EVEN WHEN IT IS GREEDY: the window's captured pick is a plain argmax,
+    /// which cannot see a bias, so this is a grammar's only way into a batch row (the single-request step re-draws the
+    /// same way).  Every other row is untouched - same struct, same skip, same argmax - which is what keeps an
+    /// unconstrained window byte-identical.
+    ///
+    /// One-shot: `sample_rows` clears it after the window, so a mask cannot reach the next window's rows by accident.
+    /// Uploaded on the final stage's device (the stage that owns the head), forwarded to `next_` first, exactly as
+    /// set_logit_bias does.  A row whose entries are all -inf must NOT be passed in: it makes the greedy kernel emit
+    /// token 0, so the caller stops that slot instead (`grammar::mask_to_bias` returns false for it).
+    bool set_row_bias(const std::vector<float>& bias, int S, const std::vector<uint8_t>& biased, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
@@ -449,6 +463,11 @@ private:
 #endif
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    // set_row_bias: S rows of n_vocab floats on the device, valid for the next window only (sample_rows consumes them)
+    float* row_bias_device_ = nullptr;
+    size_t row_bias_cap_ = 0;              ///< floats row_bias_device_ holds (a larger window neither shrinks nor misses)
+    int row_bias_rows_ = 0;                ///< rows the next window may take; 0 = no row bias at all
+    std::vector<uint8_t> row_bias_on_;      ///< per row, "this row is masked" (an unbiased row keeps the argmax)
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows

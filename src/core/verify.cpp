@@ -587,6 +587,7 @@ Verifier::~Verifier() {
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
+    if (row_bias_device_) cudaFree(row_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
@@ -629,6 +630,41 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     }
     logit_bias_host_ = bias;
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
+}
+
+bool Verifier::set_row_bias(const std::vector<float>& bias, int S, const std::vector<uint8_t>& biased, std::string& err) {
+    if (next_ && !next_->set_row_bias(bias, S, biased, err)) return false;
+    if (le_ < g_->n_layers) return true;   // the head is on the last stage; the earlier ones never draw a row
+    const OnDevice on_device(device_);
+    int on = 0;
+    if (!bias.empty()) {
+        if (S <= 0 || S > strata::kernels::kVerifyMaxT) { err = "row bias: window row count out of range"; return false; }
+        if (bias.size() != (size_t) S * (size_t) n_vocab_) { err = "row bias vocabulary size mismatch"; return false; }
+        if ((int) biased.size() != S) { err = "row bias flag count mismatch"; return false; }
+        for (int t = 0; t < S; ++t) on += biased[(size_t) t] != 0;
+    }
+    if (on == 0) {   // no masked row in this window: nothing is uploaded and every row keeps the graph's argmax
+        row_bias_on_.clear();
+        row_bias_rows_ = 0;
+        return true;
+    }
+    const size_t bytes = bias.size() * sizeof(float);
+    if (row_bias_cap_ < bias.size()) {   // grow only: a 4-slot window after an 8-row one reuses the buffer
+        if (row_bias_device_) cudaFree(row_bias_device_);
+        row_bias_device_ = nullptr;
+        row_bias_cap_ = 0;
+        if (cudaMalloc((void**) &row_bias_device_, bytes) != cudaSuccess) {
+            row_bias_device_ = nullptr;
+            err = "cannot allocate the row biases"; return false;
+        }
+        row_bias_cap_ = bias.size();
+    }
+    if (cudaMemcpy(row_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = "cannot upload the row biases"; return false;
+    }
+    row_bias_on_ = biased;
+    row_bias_rows_ = S;
     return true;
 }
 
@@ -3717,15 +3753,25 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
 
 bool Verifier::sample_rows(int S, std::string& err) {
     bool any = false;
+    const int biased = std::min(S, row_bias_rows_);   // set_row_bias's rows; the window is what it was set for
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        // A masked row of a batch window is drawn here even when it is greedy: the window's captured graph picks a
+        // plain argmax and cannot see a bias, so the sampler is the row's only way to the mask (a greedy draw in the
+        // sampler applies the bias through sampler_greedy_kernel, the same path a single masked request takes).  A
+        // greedy row with no mask is still left to the graph's pick, as it always was: no bias, no re-draw.
+        const float* row_bias = t < biased && row_bias_on_[(size_t) t] != 0 && row_bias_device_ != nullptr
+                                    ? row_bias_device_ + (size_t) t * (size_t) n_vocab_ : nullptr;
+        if ((sp.greedy || sp.temperature <= 0.0f) && row_bias == nullptr) continue;
+        if (row_bias != nullptr) sp.logit_bias = row_bias;   // the mask's row already carries the request's own bias
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         sp.penalty_last_n = 0;
         strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
                                        m_out_ + t, cs_);
         any = true;
     }
+    row_bias_rows_ = 0;   // one window only: a mask must never reach another window's rows by accident
+    row_bias_on_.clear();
     if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 }
