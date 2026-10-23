@@ -2,9 +2,10 @@
 
     python -m unittest serve.test_grammar_transport -v
 
-Host-only and no pack: the request is driven through `Service.run` with the mock engine, the same way the server
-tests do.  The pool is disabled here (there is no pack vocabulary), which is exactly the state a machine without
-`tools/build_llguidance.sh` is in: the file and the key still travel, nothing is constrained (D-020).
+Host-only: the request is driven through `Service.run` with the mock engine, the same way the server tests do.  The
+server compiles nothing, so what these tests are about is the file alone - written, held, adopted, removed - and they
+need no `tools/build_llguidance.sh`, which is also the state a machine without it is in: the file and the key still
+travel, nothing is constrained (D-020).
 """
 import contextlib
 import io
@@ -43,8 +44,6 @@ def service(pack_dir=None):
     tok = ByteTokenizer()
     engine = Recorder(tok, "</think>\n\nHello.", max_context=CTX)
     svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), pack_dir=pack_dir)
-    if svc.grammar_pool is not None:
-        svc.grammar_pool.log = lambda message: None     # the pool saying it is off is not this test's subject
     return svc, engine, tok
 
 

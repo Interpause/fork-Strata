@@ -1,14 +1,15 @@
 """One request's grammar: the prompt's own tail decides the entry, the request decides the rest.
 
-This is the layer between a request and the matcher pool.  It answers three questions and caches the answer to the
-expensive one:
+This is the layer between a request and the text the engine compiles.  It answers three questions and caches the
+answer to the expensive one:
 
     the entry rule     from the bytes the prompt ends with (`entries.resolve_entry`, never a `thinking` flag)
     the text           the skeleton with the request's tools and schema spliced in, `start:` pointed at the entry
     the identity       the first 16 hex of the SHA-256 of that text, which is also the grammar file's basename
 
-Two requests with the same entry, tools and schema produce the same text, so they share one splice and one compiled
-prototype.  The cache is keyed by shape, not by text, because the text is what a miss computes.
+Two requests with the same entry, tools and schema produce the same text, so they share one splice and one file on
+disk (the name is the text's first 16 hex).  The cache is keyed by shape, not by text, because the text is what a miss
+computes.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ TAIL_TOKENS = 256
 
 @dataclass(frozen=True)
 class Grammar:
-    """What one request decodes with.  `id` is the name of the file the engine reads and the pool's key."""
+    """What one request decodes with.  `id` is the 16-hex basename of the file the engine reads."""
 
     entry: str
     text: str

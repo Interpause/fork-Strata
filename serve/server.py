@@ -64,7 +64,6 @@ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.grammar import guard  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
-from serve.grammar import pool as grammar_pool  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -3246,12 +3245,12 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, pack_dir: Path | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        # The request's grammar (contracts C1/C2 in tmp/impl-plan/contracts): spliced once per shape, compiled once per
-        # text, cloned per request.  Only a pack's tokenizer can do it - a mock or byte tokenizer has no ids to
-        # constrain - so a server without one carries no grammar at all.
+        # The request's grammar (contracts C1/C2 in tmp/impl-plan/contracts): spliced once per shape and handed to
+        # the engine as a file, which is the only thing that compiles it - so nothing is cached on this side, and a
+        # cache would be a second place where a grammar's identity is decided (D-038).  Only a pack's tokenizer can
+        # do it - a mock or byte tokenizer has no ids to constrain - so a server without one carries no grammar.
         self.pack_dir = Path(pack_dir) if pack_dir is not None else None
         self.pipeline = grammar_pipeline.Pipeline(tokenizer) if pack_dir is not None else None
-        self.grammar_pool = grammar_pool.Pool(pack_dir, tokenizer) if pack_dir is not None else None
         self.grammar_notes: set[str] = set()          # a grammar problem is said once, not once per request
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -4308,7 +4307,7 @@ class Service:
             Path(path).unlink(missing_ok=True)
 
     def begin_grammar(self, ids, tools, force, sampling):
-        """-> (the file for the engine, this request's matcher).
+        """-> the file the engine reads, or None.
 
         The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
         written to be read back at once and deleted in run()'s `finally`, and writing it this close to the engine call
@@ -4316,26 +4315,27 @@ class Service:
         prose-only branch; with thinking on it is the only thing that says so, since the prompt still ends at the
         reasoning tail.
 
+        Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
+        all there is to return (D-038).
+
         A failure here sends no grammar, so the request decodes unconstrained without ever declaring otherwise: it is
         said once per kind of failure and the request goes on (D-020).
         """
         if self.pipeline is None:
-            return None, None
+            return None
         try:
             grammar = self.pipeline.for_request(ids, tools=tools,
                                                schema=format_schema((sampling or {}).get("response_format")),
                                                required=force is not None)
         except Exception as e:                  # noqa: BLE001 - a grammar never fails a request in this phase
             self.grammar_note(f"{type(e).__name__}: {e}")
-            return None, None
-        matcher = self.grammar_pool.acquire(grammar.id, grammar.text)
+            return None
         try:
             path = hold_grammar_file(self.pack_dir, grammar.id, grammar.text)   # write and hold, as one step
         except (OSError, ValueError) as e:
-            self.grammar_pool.release(matcher)
             self.grammar_note(f"cannot write the grammar file: {e}")
-            return None, None
-        return str(path), matcher
+            return None
+        return str(path)
 
     def grammar_note(self, why: str) -> None:
         """Say a grammar problem once per kind: a prompt that is not from this template fails on every request."""
@@ -4463,7 +4463,7 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
-        gfile, gmatcher = self.begin_grammar(ids, tools, force, sampling)
+        gfile = self.begin_grammar(ids, tools, force, sampling)
         if gfile:
             sampling = {**(sampling or {}), "strata_grammar": gfile}
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
@@ -4857,8 +4857,6 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-            if gmatcher is not None:
-                self.grammar_pool.release(gmatcher)
             if gfile:
                 drop_grammar(gfile)
         for ev in cut(parser.finish(finish)):
