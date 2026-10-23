@@ -213,5 +213,37 @@ class Request(unittest.TestCase):
         self.assertIsNone(self.engine.calls[0]["path"])
 
 
+class Routing(unittest.TestCase):
+    """TEMPORARY, and P4 deletes it with the routing (D-029).
+
+    A request whose `grammar=` will actually travel decodes on the solo path even when the engine runs batch slots,
+    because the engine refuses a `grammar=` on a batch admission: its batch windows sample through `sample_rows`,
+    which has no bias path.  P4 gives the batch path the per-slot mask, and then a grammar request runs in a slot
+    like any other and these tests go away - `solo_only` returning False everywhere is the same assertion as the
+    routing being gone."""
+
+    @staticmethod
+    def engine(batch, info):
+        eng = object.__new__(StrataEngine)               # solo_only reads batch and info only
+        eng.batch, eng.info = batch, info
+        return eng
+
+    def test_a_grammar_request_is_solo_on_a_batching_engine(self):
+        self.assertTrue(self.engine(3, {"grammar": 1}).solo_only({"strata_grammar": "/dev/shm/g/ab12.gr"}))
+
+    def test_a_plain_request_keeps_its_slot(self):
+        eng = self.engine(3, {"grammar": 1})
+        for sampling in ({}, None, {"temperature": 0.5}, {"strata_grammar": ""}):
+            with self.subTest(sampling=sampling):
+                self.assertFalse(eng.solo_only(sampling))
+
+    def test_an_engine_that_cannot_compile_one_keeps_its_slots(self):
+        # keys() drops the key for such an engine, so nothing has to be serialised on its behalf.
+        self.assertFalse(self.engine(3, {}).solo_only({"strata_grammar": "/dev/shm/g/ab12.gr"}))
+
+    def test_an_engine_without_slots_is_unaffected(self):
+        self.assertTrue(self.engine(0, {"grammar": 1}).solo_only({"strata_grammar": "/dev/shm/g/ab12.gr"}))
+
+
 if __name__ == "__main__":
     unittest.main()

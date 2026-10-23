@@ -1222,6 +1222,19 @@ class StrataEngine:
 
     _no_grammar_said = False             # the one line about an engine that cannot compile a grammar
 
+    def solo_only(self, sampling: dict) -> bool:
+        """Whether this request must take the solo path even when the engine runs batch slots.
+
+        TEMPORARY, and P4 owns its removal (D-029).  A request whose `grammar=` will actually be sent cannot be
+        admitted to a batch slot: the engine refuses one there, because the batch windows sample through
+        `sample_rows`, which has no bias path, and admitting it anyway would decode unconstrained while the
+        request says it is masked (D-027).  So the request takes the solo `GEN` path, serialised against the other
+        solo work by the turn fifo, while the slots keep serving requests that carry no grammar.  Once P4 gives
+        the batch path the per-slot mask, this method and its two call sites in `Service.run` and `generate` go
+        away and a grammar request runs in a slot like any other.
+        """
+        return bool((self.info or {}).get("grammar")) and bool((sampling or {}).get("strata_grammar"))
+
     def keys(self, sampling: dict) -> str:
         """`sampling_keys` for this engine, with a request's grammar sent only to an engine that reported it can
         compile one (INFO `grammar=1`, engines with the C1 grammar work).  One that cannot refuses the whole
@@ -2011,7 +2024,9 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
-        if getattr(self, "batch", 0):
+        # A grammar request is solo even here (D-029, temporary until P4's per-slot mask): `generate_batched` admits
+        # onto a slot, and the engine refuses a `grammar=` on a batch admission.
+        if getattr(self, "batch", 0) and not self.solo_only(sampling):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
@@ -4431,7 +4446,9 @@ class Service:
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        par = bool(getattr(self.engine, "batch", 0))
+        # (D-029, temporary: a request carrying a grammar is one at a time even then, and decodes on the solo path)
+        solo_only = getattr(self.engine, "solo_only", None)
+        par = bool(getattr(self.engine, "batch", 0)) and not (solo_only and solo_only(sampling))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
@@ -4439,7 +4456,7 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
-            if not getattr(self.engine, "batch", 0):
+            if not par:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
