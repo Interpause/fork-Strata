@@ -195,8 +195,8 @@ def hold_grammar(path) -> None:
 def drop_grammar(path) -> None:
     """Release a request's hold on its grammar file, deleting it - and the directory, once it is the last one - when
     no request still holds it.  Two requests with the same prompt tail (or the same schema) are sent the same file,
-    and one of them finishing must not remove what the other has yet to read (D-029 made that reachable: the
-    serialised request is admitted after the first one finished).
+    and one of them finishing must not remove what the other has yet to read - they run at the same time, so either
+    may finish first.
 
     The unlink happens under the same lock as hold_grammar_file, and a path nobody holds is left alone: deleting it
     would remove a file another request is between writing and holding."""
@@ -1252,15 +1252,15 @@ class StrataEngine:
     def solo_only(self, sampling: dict) -> bool:
         """Whether this request must take the solo path even when the engine runs batch slots.
 
-        TEMPORARY(D-029) - P4 deletes this method and its two call sites.  A request whose `grammar=` will actually
-        be sent cannot be admitted to a batch slot: the engine refuses one there, because the batch windows sample through
-        `sample_rows`, which has no bias path, and admitting it anyway would decode unconstrained while the
-        request says it is masked (D-027).  So the request takes the solo `GEN` path, serialised against the other
-        solo work by the turn fifo, while the slots keep serving requests that carry no grammar.  Once P4 gives
-        the batch path the per-slot mask, this method and its two call sites in `Service.run` and `generate` go
-        away and a grammar request runs in a slot like any other.
+        A grammar request runs in a slot like any other: the engine masks each row of its batch windows (INFO
+        `gbatch=1`, which it reports when its slots run serial windows).  The exception is an engine whose slots are
+        pipelined in groups (`--batch-groups` on a layer split): a group launches its commit graph with the window, so
+        every row is kept and a row that must draw nothing cannot stop.  Such an engine reports no `gbatch`, and a
+        grammar request keeps the solo `GEN` path, serialised against the other solo work by the turn fifo, rather
+        than decoding unconstrained while the request says it is masked (D-027).
         """
-        return bool((self.info or {}).get("grammar")) and bool((sampling or {}).get("strata_grammar"))
+        return (bool((self.info or {}).get("grammar")) and bool((sampling or {}).get("strata_grammar"))
+                and not (self.info or {}).get("gbatch"))
 
     def keys(self, sampling: dict) -> str:
         """`sampling_keys` for this engine, with a request's grammar sent only to an engine that reported it can
@@ -2053,8 +2053,7 @@ class StrataEngine:
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
-        # TEMPORARY(D-029), until P4's per-slot mask: `generate_batched` admits onto a slot, and the engine refuses
-        # a `grammar=` on a batch admission.
+        # `generate_batched` admits onto a slot, which can carry a grammar unless the engine's slots are pipelined.
         if getattr(self, "batch", 0) and not self.solo_only(sampling):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -4475,7 +4474,7 @@ class Service:
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        # TEMPORARY(D-029): a request carrying a grammar is one at a time even then, and decodes on the solo path
+        # (a grammar request is one at a time instead when the engine's slots are pipelined: see solo_only)
         solo_only = getattr(self.engine, "solo_only", None)
         par = bool(getattr(self.engine, "batch", 0)) and not (solo_only and solo_only(sampling))
         st = {} if par else self.status

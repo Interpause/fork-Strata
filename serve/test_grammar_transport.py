@@ -134,8 +134,7 @@ class Request(unittest.TestCase):
 
     def test_a_shared_grammar_file_outlives_the_first_request_that_drops_it(self):
         # Two requests with the same prompt tail are sent the same file (its name is the grammar's identity), so the
-        # first one to finish must not delete what the second has yet to read - the serialised request of D-029 is
-        # admitted exactly then.
+        # first one to finish must not delete what the second has yet to read - both run at once, each in its slot.
         path = grammar_file(self.pack, "ab12", "start: entry_answer_plain")
         hold_grammar(path)
         hold_grammar(path)
@@ -251,13 +250,12 @@ class Request(unittest.TestCase):
 
 
 class Routing(unittest.TestCase):
-    """TEMPORARY(D-029) - P4 deletes this class with the routing.
+    """Which requests a batching engine keeps off its slots.
 
-    A request whose `grammar=` will actually travel decodes on the solo path even when the engine runs batch slots,
-    because the engine refuses a `grammar=` on a batch admission: its batch windows sample through `sample_rows`,
-    which has no bias path.  P4 gives the batch path the per-slot mask, and then a grammar request runs in a slot
-    like any other and these tests go away - `solo_only` returning False everywhere is the same assertion as the
-    routing being gone."""
+    A request whose `grammar=` will actually travel runs in a slot when the engine masks each row of its batch
+    windows (`INFO` then carries `gbatch=1`).  An engine with no such claim - one whose slots are pipelined in
+    groups, where every launched row is kept and a row that must draw nothing cannot stop - keeps the request on the
+    solo path, because a slot would decode it unconstrained while the request says it is masked (D-027)."""
 
     @staticmethod
     def engine(batch, info):
@@ -265,8 +263,12 @@ class Routing(unittest.TestCase):
         eng.batch, eng.info = batch, info
         return eng
 
-    def test_a_grammar_request_is_solo_on_a_batching_engine(self):
+    def test_a_grammar_request_is_solo_when_the_engine_cannot_mask(self):
         self.assertTrue(self.engine(3, {"grammar": 1}).solo_only({"strata_grammar": "/dev/shm/g/ab12.gr"}))
+
+    def test_a_grammar_request_keeps_its_slot_when_the_engine_can_mask(self):
+        self.assertFalse(self.engine(3, {"grammar": 1, "gbatch": 1})
+                         .solo_only({"strata_grammar": "/dev/shm/g/ab12.gr"}))
 
     def test_a_plain_request_keeps_its_slot(self):
         eng = self.engine(3, {"grammar": 1})
