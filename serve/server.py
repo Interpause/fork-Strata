@@ -161,11 +161,33 @@ def grammar_file(pack_dir: Path, name: str, text: str) -> Path:
 
 
 _grammar_holds: dict = {}          # grammar file -> the requests that have not dropped it yet
-_grammar_holds_lock = threading.Lock()
+_grammar_holds_lock = threading.RLock()   # re-entrant: hold_grammar_file writes the file while holding it
+
+
+def hold_grammar_file(pack_dir: Path, name: str, text: str) -> Path:
+    """Write the grammar file if it is not there yet and take a hold on it, as ONE step.
+
+    Two steps were a race with a live 400 at the end of it: request P found the file of its shape already written (by
+    request Q), so `grammar_file` skipped the write; before P took its hold, Q finished, dropped the last hold and
+    deleted the file; P then sent the engine a path that no longer existed and the engine answered
+    `ERR grammar: <path> cannot be read`.  Anything between the existence check and the hold is that window, so the
+    check, the write and the hold happen under one lock, and `drop_grammar` deletes under the same lock: a path a
+    live holder was given always has its file on disk.
+    """
+    if not name:
+        raise ValueError("a grammar file needs a name")
+    with _grammar_holds_lock:
+        path = grammar_file(pack_dir, name, text)
+        key = str(path)
+        _grammar_holds[key] = _grammar_holds.get(key, 0) + 1
+        return path
 
 
 def hold_grammar(path) -> None:
-    """Take one hold on a grammar file, so the last request to drop it is the one that deletes it."""
+    """Take one hold on a grammar file, so the last request to drop it is the one that deletes it.
+
+    A single call is only right for a caller that already owns the file (a test); a request that may be adopting a
+    file another request wrote uses hold_grammar_file, which cannot be raced by a drop."""
     if path:
         with _grammar_holds_lock:
             _grammar_holds[str(path)] = _grammar_holds.get(str(path), 0) + 1
@@ -175,21 +197,27 @@ def drop_grammar(path) -> None:
     """Release a request's hold on its grammar file, deleting it - and the directory, once it is the last one - when
     no request still holds it.  Two requests with the same prompt tail (or the same schema) are sent the same file,
     and one of them finishing must not remove what the other has yet to read (D-029 made that reachable: the
-    serialised request is admitted after the first one finished)."""
+    serialised request is admitted after the first one finished).
+
+    The unlink happens under the same lock as hold_grammar_file, and a path nobody holds is left alone: deleting it
+    would remove a file another request is between writing and holding."""
     if not path:
         return
     p = Path(path)
     with _grammar_holds_lock:
-        left = _grammar_holds.get(str(p), 0) - 1
+        left = _grammar_holds.get(str(p))
+        if left is None:            # no hold of ours to release: the file is somebody else's, or already gone
+            return
+        left -= 1
         if left > 0:
             _grammar_holds[str(p)] = left
             return
         _grammar_holds.pop(str(p), None)
-    p.unlink(missing_ok=True)
-    try:
-        p.parent.rmdir()
-    except OSError:
-        pass
+        p.unlink(missing_ok=True)
+        try:
+            p.parent.rmdir()
+        except OSError:
+            pass
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -4302,12 +4330,11 @@ class Service:
             return None, None
         matcher = self.grammar_pool.acquire(grammar.id, grammar.text)
         try:
-            path = grammar_file(self.pack_dir, grammar.id, grammar.text)
-        except OSError as e:
+            path = hold_grammar_file(self.pack_dir, grammar.id, grammar.text)   # write and hold, as one step
+        except (OSError, ValueError) as e:
             self.grammar_pool.release(matcher)
             self.grammar_note(f"cannot write the grammar file: {e}")
             return None, None
-        hold_grammar(path)                                  # the file outlives this request if another holds it
         return str(path), matcher
 
     def grammar_note(self, why: str) -> None:

@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import FORCE_ANY, ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
-from serve.server import drop_grammar, grammar_file, hold_grammar  # noqa: E402
+from serve.server import drop_grammar, grammar_file, hold_grammar, hold_grammar_file  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -144,6 +144,44 @@ class Request(unittest.TestCase):
         self.assertTrue(path.exists(), "the second holder still needs it")
         drop_grammar(path)
         self.assertFalse(path.exists(), "the last holder deletes it")
+
+    def test_a_drop_with_no_hold_leaves_the_file_alone(self):
+        # The engine's `fopen` reads the file later than the server writes it.  A drop that holds nothing must
+        # therefore not delete: the file may be the one a request adopted a moment ago and has not sent yet (the live
+        # `ERR grammar: <path> cannot be read` that reached a client as a 400).
+        path = hold_grammar_file(self.pack, "ab12", "start: entry_answer_plain")
+        for _ in range(3):
+            drop_grammar(path)                   # one hold, three drops
+        self.assertFalse(path.exists(), "the one hold it had was released")
+        drop_grammar(path)                       # nobody holds it any more: no hold of ours to release
+        again = grammar_file(self.pack, "ab12", "start: entry_answer_plain")
+        self.assertTrue(again.exists(), "writing a file nobody holds is not undone by a stale drop")
+        drop_grammar(again)                      # still nobody holds it: left alone, as it was written
+        self.assertTrue(again.exists())
+
+    def test_adopting_a_shared_file_cannot_race_the_drop_that_deletes_it(self):
+        # The window the fix closes: request P finds Q's file already written (so nothing is written), and Q's drop
+        # lands before P's hold.  Adopting is one step now, so a path a live holder was given always has its file -
+        # whichever thread gets there first.  The pair is run many times because the window is a few instructions
+        # wide, and every round must hold.
+        text = "start: entry_answer_plain"
+        missing = []
+        for _ in range(200):
+            first = hold_grammar_file(self.pack, "ab12", text)      # Q holds the shape already
+
+            def other():                                            # Q finishes while P is adopting
+                drop_grammar(first)
+
+            t = threading.Thread(target=other)
+            t.start()
+            adopted = hold_grammar_file(self.pack, "ab12", text)    # P adopts the same shape
+            t.join(5)
+            if not adopted.exists():
+                missing.append(str(adopted))
+            self.assertTrue(adopted.exists(), "Q's drop must not take the file P was given")
+            drop_grammar(adopted)                                   # P's own drop is what removes it
+            self.assertFalse(adopted.exists())
+        self.assertEqual(missing, [], "a file a live holder was given was missing")
 
     def test_the_file_is_gone_after_the_request(self):
         run(self.svc, self.tok)
