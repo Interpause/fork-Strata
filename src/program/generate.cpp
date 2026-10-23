@@ -1,5 +1,6 @@
 #include "strata/core/logit_bias.hpp"
 #include "strata/grammar/llguidance.hpp"
+#include "strata/grammar/mask_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -14734,15 +14735,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR grammar: %s\n", req_match.error().c_str());
                     return false;
                 }
-                gbias = req_bias.empty() ? std::vector<float>((size_t) n_vocab, 0.0f) : req_bias;
-                bool any = false;
-                for (int64_t v = 0; v < n_vocab; ++v) {
-                    if (v < (int64_t) words * 32 && ((bits[(size_t) (v >> 5)] >> (v & 31)) & 1u) != 0) { any = true; continue; }
-                    gbias[(size_t) v] = -std::numeric_limits<float>::infinity();
-                }
-                for (const int32_t b : gbanned)
-                    if (b >= 0 && b < n_vocab) gbias[(size_t) b] = -std::numeric_limits<float>::infinity();
-                gstop = !any;
+                gbias.resize((size_t) n_vocab);
+                gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, gbanned, gbias.data(), n_vocab);
                 // a fully masked row is not a sampler input: every logit at -inf makes the greedy kernel emit token 0
                 return gstop || ver.set_logit_bias(gbias, err);
             };
