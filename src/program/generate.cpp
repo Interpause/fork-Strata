@@ -2576,6 +2576,8 @@ int main(int argc, char** argv) {
         else if (a == "--grammar-tokenizer") {
             o.grammar_tokenizer = next("--grammar-tokenizer");
             // The grammar is the default path, so a run turns it off by name: `off`, `none` or `-`.
+            // TEMPORARY(D-030): P7 deletes this spelling with the rest of the escape hatches - the grammar is
+            // compulsory, so a run that cannot load one must fail rather than serve unconstrained.
             if (o.grammar_tokenizer == "off" || o.grammar_tokenizer == "none" || o.grammar_tokenizer == "-") {
                 o.grammar_tokenizer.clear();
                 o.grammar_off = true;
@@ -10697,6 +10699,8 @@ int main(int argc, char** argv) {
         // (a native model) leaves the grammar off, and the INFO line then has no grammar=1, which is what tells
         // the server not to send it a `grammar=<file>` (an unconstrained reply is not a fallback, see
         // docs/DETAILS.md and tmp/impl-plan/contracts/c3-engine-step.md).
+        // TEMPORARY(D-030): serving on with no grammar is the last unconstrained path; P7 makes a pack without a
+        // tokenizer fatal before READY instead, naming both remedies.
         strata::grammar::Session grammar_session;
         std::string grammar_dir = o.grammar_tokenizer;
         if (grammar_dir.empty() && !o.grammar_off && !o.pack.empty()) {

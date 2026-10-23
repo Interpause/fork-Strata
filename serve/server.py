@@ -1240,6 +1240,8 @@ class StrataEngine:
         compile one (INFO `grammar=1`, engines with the C1 grammar work).  One that cannot refuses the whole
         request, so the key is dropped instead of killing it - the reply is then unconstrained, which is said
         once.  P7 makes a declared shape fail instead of decoding unconstrained (D-027)."""
+        # TEMPORARY(D-030): dropping the key and saying so is the unconstrained reply; P7 turns the same
+        # condition into an error for every chat-shaped request, because the grammar is compulsory.
         if sampling.get("strata_grammar") and not (self.info or {}).get("grammar"):
             sampling = {k: v for k, v in sampling.items() if k != "strata_grammar"}
             if not StrataEngine._no_grammar_said:
