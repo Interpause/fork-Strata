@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import FORCE_ANY, ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
+from serve.server import drop_grammar, grammar_file, hold_grammar  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -132,6 +133,18 @@ class Request(unittest.TestCase):
         grammar = self.svc.pipeline.for_request(self.svc.tok.encode("x<think>\n\n</think>\n\n"))
         self.assertEqual(Path(call["path"]).stem, grammar.id)
 
+    def test_a_shared_grammar_file_outlives_the_first_request_that_drops_it(self):
+        # Two requests with the same prompt tail are sent the same file (its name is the grammar's identity), so the
+        # first one to finish must not delete what the second has yet to read - the serialised request of D-029 is
+        # admitted exactly then.
+        path = grammar_file(self.pack, "ab12", "start: entry_answer_plain")
+        hold_grammar(path)
+        hold_grammar(path)
+        drop_grammar(path)
+        self.assertTrue(path.exists(), "the second holder still needs it")
+        drop_grammar(path)
+        self.assertFalse(path.exists(), "the last holder deletes it")
+
     def test_the_file_is_gone_after_the_request(self):
         run(self.svc, self.tok)
         self.assertFalse(Path(self.engine.calls[0]["path"]).exists())
@@ -155,7 +168,7 @@ class Request(unittest.TestCase):
         for call in self.engine.calls:
             self.assertFalse(Path(call["path"]).exists())
 
-    def test_the_same_shape_twice_writes_the_file_twice_and_splices_once(self):
+    def test_the_same_shape_twice_is_one_file_and_one_splice(self):
         run(self.svc, self.tok)
         run(self.svc, self.tok)
         self.assertEqual(len(set(call["path"] for call in self.engine.calls)), 1)

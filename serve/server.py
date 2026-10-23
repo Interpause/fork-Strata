@@ -153,15 +153,38 @@ def grammar_file(pack_dir: Path, name: str, text: str) -> Path:
     directory = directory / f"strata-grammar-{os.getpid()}"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{name}.gr"
-    path.write_text(text, encoding="utf-8")
+    # The name is the text's hash, so a file that is already there holds exactly these bytes: writing again would
+    # only truncate a file another request's engine may be reading (two requests with the same tail share one file).
+    if not path.exists():
+        path.write_text(text, encoding="utf-8")
     return path
 
 
+_grammar_holds: dict = {}          # grammar file -> the requests that have not dropped it yet
+_grammar_holds_lock = threading.Lock()
+
+
+def hold_grammar(path) -> None:
+    """Take one hold on a grammar file, so the last request to drop it is the one that deletes it."""
+    if path:
+        with _grammar_holds_lock:
+            _grammar_holds[str(path)] = _grammar_holds.get(str(path), 0) + 1
+
+
 def drop_grammar(path) -> None:
-    """Delete a request's grammar file and the directory once it is the last one, so nothing is left behind."""
+    """Release a request's hold on its grammar file, deleting it - and the directory, once it is the last one - when
+    no request still holds it.  Two requests with the same prompt tail (or the same schema) are sent the same file,
+    and one of them finishing must not remove what the other has yet to read (D-029 made that reachable: the
+    serialised request is admitted after the first one finished)."""
     if not path:
         return
     p = Path(path)
+    with _grammar_holds_lock:
+        left = _grammar_holds.get(str(p), 0) - 1
+        if left > 0:
+            _grammar_holds[str(p)] = left
+            return
+        _grammar_holds.pop(str(p), None)
     p.unlink(missing_ok=True)
     try:
         p.parent.rmdir()
@@ -4267,6 +4290,7 @@ class Service:
             self.grammar_pool.release(matcher)
             self.grammar_note(f"cannot write the grammar file: {e}")
             return None, None
+        hold_grammar(path)                                  # the file outlives this request if another holds it
         return str(path), matcher
 
     def grammar_note(self, why: str) -> None:
