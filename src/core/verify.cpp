@@ -633,24 +633,27 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     return true;
 }
 
-bool Verifier::set_row_bias(const std::vector<float>& bias, int S, const std::vector<uint8_t>& biased, std::string& err) {
+bool Verifier::set_row_bias(const float* bias, int S, const uint8_t* biased, std::string& err) {
     if (next_ && !next_->set_row_bias(bias, S, biased, err)) return false;
     if (le_ < g_->n_layers) return true;   // the head is on the last stage; the earlier ones never draw a row
     const OnDevice on_device(device_);
-    int on = 0;
-    if (!bias.empty()) {
-        if (S <= 0 || S > strata::kernels::kVerifyMaxT) { err = "row bias: window row count out of range"; return false; }
-        if (bias.size() != (size_t) S * (size_t) n_vocab_) { err = "row bias vocabulary size mismatch"; return false; }
-        if ((int) biased.size() != S) { err = "row bias flag count mismatch"; return false; }
-        for (int t = 0; t < S; ++t) on += biased[(size_t) t] != 0;
+    if (bias == nullptr || S <= 0) {   // no mask in this window at all
+        row_bias_on_.clear();
+        row_bias_rows_ = 0;
+        return true;
     }
+    if (biased == nullptr) { err = "row bias without its per-row flags"; return false; }
+    if (S > strata::kernels::kVerifyMaxT) { err = "row bias: window row count out of range"; return false; }
+    int on = 0;
+    for (int t = 0; t < S; ++t) on += biased[t] != 0;
     if (on == 0) {   // no masked row in this window: nothing is uploaded and every row keeps the graph's argmax
         row_bias_on_.clear();
         row_bias_rows_ = 0;
         return true;
     }
-    const size_t bytes = bias.size() * sizeof(float);
-    if (row_bias_cap_ < bias.size()) {   // grow only: a 4-slot window after an 8-row one reuses the buffer
+    const size_t rows = (size_t) S * (size_t) n_vocab_;
+    const size_t bytes = rows * sizeof(float);
+    if (row_bias_cap_ < rows) {   // grow only: a 4-slot window after an 8-row one reuses the buffer
         if (row_bias_device_) cudaFree(row_bias_device_);
         row_bias_device_ = nullptr;
         row_bias_cap_ = 0;
@@ -658,12 +661,12 @@ bool Verifier::set_row_bias(const std::vector<float>& bias, int S, const std::ve
             row_bias_device_ = nullptr;
             err = "cannot allocate the row biases"; return false;
         }
-        row_bias_cap_ = bias.size();
+        row_bias_cap_ = rows;
     }
-    if (cudaMemcpy(row_bias_device_, bias.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (cudaMemcpy(row_bias_device_, bias, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         err = "cannot upload the row biases"; return false;
     }
-    row_bias_on_ = biased;
+    row_bias_on_.assign(biased, biased + S);
     row_bias_rows_ = S;
     return true;
 }

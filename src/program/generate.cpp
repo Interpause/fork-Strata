@@ -10716,7 +10716,12 @@ int main(int argc, char** argv) {
             if (!grammar_dir.empty() && !grammar_session.open(grammar_dir, gerr))
                 std::fprintf(stderr, "strata serve: grammar tokenizer %s: %s\n", grammar_dir.c_str(), gerr.c_str());
         }
-        const std::string grammar_flag = grammar_session.ready() ? " grammar=1" : "";
+        // A batch slot can carry a grammar mask only in the serial windows (`piped_groups` is the pipelined path): a
+        // group's commit graph keeps every row it launches, so a row that must draw nothing could not stop (see the
+        // BGEN admission, which is where such a request is refused).  `gbatch=1` is what tells the server that a
+        // grammar request may take a slot.
+        const bool gram_batch = o.batch > 0 && !piped_groups && grammar_session.ready();
+        const std::string grammar_flag = grammar_session.ready() ? (gram_batch ? " grammar=1 gbatch=1" : " grammar=1") : "";
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -10993,6 +10998,10 @@ int main(int argc, char** argv) {
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
+            // the request's grammar, advanced by every token the slot commits (a `grammar=<file>` admission, P4):
+            // its rows are drawn from the mask this state holds, and it is dropped when the slot ends.  Invalid for
+            // a request with no grammar, which is the case every batch window before P4 ran.
+            strata::grammar::Match match;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -11185,6 +11194,25 @@ int main(int argc, char** argv) {
             return true;
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+        // A masked batch row's bias, one dense row per window row: `mask_to_bias` is the same conversion the
+        // single-request step uses, so the two paths cannot compose a mask differently.  The buffers are the widest
+        // window's worth and are never resized (a resize would zero 8 MB on every window; the rows a window does not
+        // use are marked not-biased and never read).
+        std::vector<float> rbias;
+        std::vector<uint8_t> ron(strata::kernels::kVerifyMaxT, 0);
+        const std::vector<float> no_base;     // a batch admission refuses `logit_bias` (continuous batching): empty
+        const std::vector<int32_t> no_bans;
+        auto row_mask = [&](strata::grammar::Match& m, size_t row, int64_t nv, std::string& e) -> int {
+            // 1 = the row carries a bias, 0 = nothing is legal here (the slot must stop without a draw),
+            // -1 = the mask failed (`e` says why)
+            uint32_t words = 0;
+            const uint32_t* bits = m.mask(words);
+            if (bits == nullptr || words == 0) { e = m.error(); return -1; }
+            if (!strata::grammar::mask_to_bias(bits, words, no_base, no_bans, rbias.data() + row * (size_t) nv, nv))
+                return 0;
+            ron[row] = 1;
+            return 1;
+        };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
@@ -11193,28 +11221,75 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            bool draft_ok[strata::kernels::kVerifyMaxT] = {};   // row 1's draft is a legal token here
             static size_t next_slot = 0;
+            const int64_t nv = ver.vocab();
+            if (rbias.size() < (size_t) strata::kernels::kVerifyMaxT * (size_t) nv)
+                rbias.assign((size_t) strata::kernels::kVerifyMaxT * (size_t) nv, 0.0f);
+            std::fill(ron.begin(), ron.end(), (uint8_t) 0);
+            bool any_mask = false;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
-                if (bs[(size_t) b].active) {
-                    first[A] = S;
-                    active[A++] = b;
-                    rows[S] = b;
-                    tok[S] = bs[(size_t) b].x;
-                    pos[S] = bs[(size_t) b].p;
-                    ++S;
-                    if (batch_mtp) {
-                        rows[S] = b;
-                        if (!bs[(size_t) b].draft_ready) {
-                            err = "batch MTP: a live slot has no draft";
-                            return false;
-                        }
-                        tok[S] = bs[(size_t) b].draft[0];
-                        pos[S] = bs[(size_t) b].p + 1;
-                        ++S;
+                if (!bs[(size_t) b].active) continue;
+                const int a = A;
+                // A slot with a grammar draws its rows from the matcher's mask.  Row 0 is the state advanced by the
+                // token this window feeds (`x`, which the admission's own step already consumed).
+                if (bs[(size_t) b].match.valid()) {
+                    const int m0 = row_mask(bs[(size_t) b].match, (size_t) S, nv, err);
+                    if (m0 < 0) {
+                        std::printf("ERR grammar: %s\n", err.c_str());
+                        return false;
                     }
+                    if (m0 == 0) {
+                        // Nothing is legal here, so this row must not be sampled at all: an all -inf row makes the
+                        // greedy kernel emit token 0, a real token (P3's failure 1).  The reply ends, as it does on
+                        // the single-request path.
+                        BSlot& sl = bs[(size_t) b];
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                        std::printf("BDONE %d %lld stop %.1f\n", b, (long long) sl.produced, ms);
+                        sl.active = false;
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // nothing was drawn: its state is whole
+                        sl.match = strata::grammar::Match{};
+                        continue;
+                    }
+                    any_mask = true;
+                }
+                first[A] = S;
+                active[A++] = b;
+                rows[S] = b;
+                tok[S] = bs[(size_t) b].x;
+                pos[S] = bs[(size_t) b].p;
+                ++S;
+                if (batch_mtp) {
+                    rows[S] = b;
+                    if (!bs[(size_t) b].draft_ready) {
+                        err = "batch MTP: a live slot has no draft";
+                        return false;
+                    }
+                    tok[S] = bs[(size_t) b].draft[0];
+                    pos[S] = bs[(size_t) b].p + 1;
+                    // Row 1 is the state advanced by the draft, because a draft row only counts when the target
+                    // itself picked that token (`outb[0] == tok[1]`): `draft[0]` is then the token row 0 emitted.
+                    // A draft the grammar refuses is not an error - the drafter is unconstrained (P4-b biases it) -
+                    // it just cannot be kept, so the row only needs a mask when the draft is legal.
+                    draft_ok[a] = true;
+                    if (bs[(size_t) b].match.valid()) {
+                        strata::grammar::Match d = bs[(size_t) b].match.clone();
+                        if (!d.consume((uint32_t) bs[(size_t) b].draft[0])) {
+                            draft_ok[a] = false;
+                        } else {
+                            const int m1 = row_mask(d, (size_t) S, nv, err);
+                            if (m1 < 0) {
+                                std::printf("ERR grammar: %s\n", err.c_str());
+                                return false;
+                            }
+                            draft_ok[a] = m1 != 0;
+                            any_mask = any_mask || m1 > 0;
+                        }
+                    }
+                    ++S;
                 }
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
@@ -11251,6 +11326,14 @@ int main(int argc, char** argv) {
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
             const Clock::time_point w0 = Clock::now();
+            // This window's masks, one dense row per masked row.  A masked row is drawn through the sampler even
+            // when it is greedy, because the window's captured pick is a plain argmax that cannot see a bias; every
+            // other row keeps that pick.  Cancelled explicitly when no row is masked, so a mask never outlives the
+            // window it was built for.
+            if (!ver.set_row_bias(any_mask ? rbias.data() : nullptr, S, ron.data(), err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
@@ -11275,7 +11358,7 @@ int main(int argc, char** argv) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
-                keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
+                keep[b] = batch_mtp && draft_ok[a] && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
@@ -11305,15 +11388,32 @@ int main(int argc, char** argv) {
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
+                    sl.match = strata::grammar::Match{};
                     nan_flush = true;
                     continue;
                 }
                 for (int j = 0; j < keep[b]; ++j) {
                     const int32_t y = outb[first[t] + j];
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    // A committed token advances the slot's grammar, so the next window's mask is the state after it.
+                    // EOS is never handed to the matcher: it ends the sequence, and a stopped matcher refuses every
+                    // token, its own EOS included - the single-request step's rule.
+                    if (sl.match.valid() && !eos && !sl.match.consume((uint32_t) y)) {
+                        // The mask allowed this id, so the library disagrees with its own mask.  A batch row cannot be
+                        // re-drawn, so the single-request step's retry (ban the id, draw the step again) has no
+                        // equivalent here: the slot ends and the token is not emitted.
+                        std::fprintf(stderr, "strata batch: slot %d's grammar refused token %d (%s): the slot ends\n",
+                                     b, (int) y, sl.match.error().c_str());
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                        std::printf("BDONE %d %lld stop %.1f\n", b, (long long) sl.produced, ms);
+                        sl.active = false;
+                        sl.cached = false;   // its sessions took the row this token came from
+                        sl.match = strata::grammar::Match{};
+                        break;
+                    }
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
-                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
@@ -11321,6 +11421,7 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.match = strata::grammar::Match{};   // the slot is free: nothing keeps its grammar
                         break;
                     }
                     sl.x = y;
@@ -11658,11 +11759,13 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
-                // A batch slot's windows sample through sample_rows, which has no bias path, so a grammar there could
-                // not be applied - and admitting it would decode unconstrained while the request says it is masked
-                // (D-027).  TEMPORARY(D-029): P4 gives the batch path the per-slot mask and this refusal goes.
-                if (line.find(" grammar=") != std::string::npos) {
-                    std::printf("ERR grammar: a request with a grammar cannot run in a batch slot yet\n");
+                // The serial windows mask each row (INFO gbatch=1).  A pipelined slot group cannot: it launches its
+                // commit graph with the window, so every row is kept and a row that must draw nothing has no way to
+                // stop.  The server keeps such a request on the solo path; this is what says so if one arrives anyway,
+                // because decoding it unconstrained while the request says it is masked is the one failure this
+                // mechanism exists to prevent.
+                if (piped && line.find(" grammar=") != std::string::npos) {
+                    std::printf("ERR grammar: a pipelined slot group cannot mask a row\n");
                     std::fflush(stdout);
                     continue;
                 }
@@ -15223,6 +15326,9 @@ int main(int argc, char** argv) {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+                    // The request compiled this grammar for its own first token (the solo `GEN 1` step), which that
+                    // step has already consumed: the state is exactly "after `sl.x`", which is what row 0 needs.
+                    sl.match = std::move(req_match);
                     if (batch_mtp) {
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
                                                                         sl.p - 1, sl.draft.data(), err)) {

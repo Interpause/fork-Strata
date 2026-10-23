@@ -135,7 +135,8 @@ public:
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     /// Per-row vocabulary biases for the NEXT batch window, consumed by it: `bias` holds `S` rows of `n_vocab` floats,
     /// row t being WINDOW row t (a compacted slot list - row t is not slot t), and `biased[t] != 0` marks the rows that
-    /// carry one.  Empty `bias` cancels.
+    /// carry one.  A null `bias` (or `S <= 0`) cancels.  Only the rows marked in `biased` are read, so the caller keeps
+    /// one buffer of the widest window (`kVerifyMaxT` rows) and passes `S` rows of it - no per-window copy.
     ///
     /// A biased row is drawn through the sampler EVEN WHEN IT IS GREEDY: the window's captured pick is a plain argmax,
     /// which cannot see a bias, so this is a grammar's only way into a batch row (the single-request step re-draws the
@@ -146,7 +147,7 @@ public:
     /// Uploaded on the final stage's device (the stage that owns the head), forwarded to `next_` first, exactly as
     /// set_logit_bias does.  A row whose entries are all -inf must NOT be passed in: it makes the greedy kernel emit
     /// token 0, so the caller stops that slot instead (`grammar::mask_to_bias` returns false for it).
-    bool set_row_bias(const std::vector<float>& bias, int S, const std::vector<uint8_t>& biased, std::string& err);
+    bool set_row_bias(const float* bias, int S, const uint8_t* biased, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
