@@ -1111,6 +1111,24 @@ class UnfinishedToolCall(unittest.TestCase):
                         self.assertEqual(len(calls), 1)
                         self.assertEqual(json.loads(streamed), {"path": "notes.txt", "content": content})
 
+    def test_a_closed_wrapper_does_not_close_the_call(self):
+        """The wrapper `</tool_call>` arrived but the call body never reached `</function>`: the streamed arguments
+        must not be closed for it.  The parser appended the missing `}` here, so a client read a complete
+        empty-arguments call (`{}`) the model never wrote (D-13: a cut reply never carries a partial tool call)."""
+        from serve.frontend import OutputParser
+        schema = [{"name": "write", "parameters": {"properties": self.PROPS}}]
+        text = "<tool_call>\n<function=write></tool_call>"     # the wrapper closes; `</function>` never arrives
+        for step in (1, 7, 10_000):
+            with self.subTest(step=step):
+                p = OutputParser(thinking=False, tools=schema, stream_tools=True)
+                evs = []
+                for i in range(0, len(text), step):
+                    evs += p.feed(text[i:i + step])
+                evs += p.finish()
+                streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+                with self.assertRaises(json.JSONDecodeError, msg=streamed):
+                    json.loads(streamed)
+
     def answers(self, script, max_tokens=500):
         """(finish reason, the call's arguments) from OpenAI and Anthropic, whole and streamed, for the model's `script`."""
         tok = ByteTokenizer()

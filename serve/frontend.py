@@ -1033,21 +1033,6 @@ class OutputParser:
             else:
                 return out
 
-    def _close_scan(self) -> list[Event]:
-        """A streamed call that ended without a clean </function>: close its JSON so clients can still parse it."""
-        out = []
-        if self.scall is None or self.ss == "done":
-            return out
-        tail = ""
-        if self.ss == "str":
-            tail += '"'
-        elif self.ss == "raw":
-            tail += json.dumps(self.buf[self.sp:].strip("\n"))
-        tail += "}"
-        out.append(Event("tool_args", tail, call=self.scall))
-        self.ss = "done"
-        return out
-
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
         best = 0
@@ -1211,7 +1196,6 @@ class OutputParser:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
                         out += self._scan()
-                        out += self._close_scan()
                         self.buf = whole
                     else:
                         out += self._scan()
