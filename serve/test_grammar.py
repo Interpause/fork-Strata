@@ -119,7 +119,7 @@ class Splices(unittest.TestCase):
         self.assertNotIn("NEVER_MATCH", out)
 
     def test_no_tools_keeps_the_never_matching_placeholder(self):
-        self.assertIn(compile_tools_fragment([]), bg.build())
+        self.assertIn(compile_tools_fragment([]).text, bg.build())
 
     def test_a_schema_is_not_applied_when_tools_are_declared(self):
         # The template allows tool calls or one JSON object, never both, so tools win.
@@ -148,39 +148,39 @@ class Splices(unittest.TestCase):
 
 class Fragment(unittest.TestCase):
     def test_dispatch_offers_exactly_the_declared_names(self):
-        out = compile_tools_fragment([WEATHER, NO_ARGS])
+        out = compile_tools_fragment([WEATHER, NO_ARGS]).text
         self.assertEqual(out.split("\n\n", 1)[0],
                          "tool_dispatch: call_t0_get_weather\n             | call_t1_list_files")
 
     def test_a_required_parameter_guards_the_exit(self):
-        out = compile_tools_fragment([WEATHER])
+        out = compile_tools_fragment([WEATHER]).text
         # one required of two parameters: the exit is guarded by bit 0 only
         self.assertIn('params_t0_get_weather::_ : "" %if is_ones([0:1])', out)
         self.assertIn("param_t0_get_weather_0", out)
         self.assertIn("param_t0_get_weather_1", out)
 
     def test_a_string_parameter_is_raw_and_an_enum_is_spelled_out(self):
-        out = compile_tools_fragment([WEATHER])
+        out = compile_tools_fragment([WEATHER]).text
         self.assertIn('"<parameter=city>\\n" raw_param_end', out)
         self.assertIn('"<parameter=unit>\\n" ("celsius" | "fahrenheit")', out)
 
     def test_a_multi_line_raw_value_is_not_restricted_to_one_line(self):
         # raw_param_end is the skeleton's lazy terminal; nothing here narrows it.
-        self.assertIn("raw_param_end", compile_tools_fragment([WEATHER]))
-        self.assertNotIn("[^\\n]", compile_tools_fragment([WEATHER]))
+        self.assertIn("raw_param_end", compile_tools_fragment([WEATHER]).text)
+        self.assertNotIn("[^\\n]", compile_tools_fragment([WEATHER]).text)
 
     def test_a_tool_without_parameters_exits_immediately(self):   # noqa: D401
-        self.assertIn('params_t0_list_files: ""', compile_tools_fragment([NO_ARGS]))
+        self.assertIn('params_t0_list_files: ""', compile_tools_fragment([NO_ARGS]).text)
 
     def test_a_non_string_parameter_is_json(self):
         tool = {"type": "function", "function": {"name": "count", "parameters": {
             "type": "object", "properties": {"n": {"type": "integer", "minimum": 1}}}}}
-        self.assertIn('"<parameter=n>\\n" %json {"type": "integer", "minimum": 1}', compile_tools_fragment([tool]))
+        self.assertIn('"<parameter=n>\\n" %json {"type": "integer", "minimum": 1}', compile_tools_fragment([tool]).text)
 
     def test_a_string_union_keeps_the_raw_branch(self):
         tool = {"type": "function", "function": {"name": "maybe", "parameters": {
             "type": "object", "properties": {"v": {"type": ["string", "integer"]}}}}}
-        out = compile_tools_fragment([tool])
+        out = compile_tools_fragment([tool]).text
         self.assertIn("raw_param_end |", out)
         self.assertIn('%json {"type": "integer"}', out)
 
@@ -188,14 +188,14 @@ class Fragment(unittest.TestCase):
         tool = {"type": "function", "function": {"name": "ref", "parameters": {
             "type": "object", "$defs": {"City": {"type": "string", "enum": ["Oslo"]}},
             "properties": {"city": {"$ref": "#/$defs/City"}}}}}
-        self.assertIn('("Oslo")', compile_tools_fragment([tool]))
+        self.assertIn('("Oslo")', compile_tools_fragment([tool]).text)
 
     def test_two_names_differing_in_punctuation_get_different_slugs(self):
         self.assertNotEqual(slugify("a.b", 0), slugify("a-b", 1))
         self.assertEqual(slugify("a.b", 3), "t3_a_b")
 
     def test_the_fragment_names_no_tool_of_its_own(self):
-        out = compile_tools_fragment([WEATHER])
+        out = compile_tools_fragment([WEATHER]).text
         self.assertNotIn("example_function", out)
 
 

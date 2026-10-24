@@ -65,7 +65,7 @@ def build(tools: list[dict[str, Any]] | None = None, schema: dict[str, Any] | No
     from .tools_fragment import compile_tools_fragment
 
     text = skeleton()
-    text = _splice(text, TOOLS_BEGIN, TOOLS_END, compile_tools_fragment(tools or []))
+    text = _splice(text, TOOLS_BEGIN, TOOLS_END, compile_tools_fragment(tools or []).text)
     if tools:
         schema = None             # tool calls or one JSON object, never both: the tools win
     rule = DEFAULT_JSON_RULE if schema is None else "json_response: %json " + json.dumps(schema)

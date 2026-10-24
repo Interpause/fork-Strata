@@ -14,13 +14,60 @@ so a call cannot leave the parameter list with a required argument missing.  `bi
 satisfied by R optional parameters while a required one is missing.
 
 Nothing here reads a tool name or a parameter name from anywhere but the request; `skeleton.lark` names none.
+
+The result is a `Fragment`: the text, and `Labels` naming every literal it wrote.  Both come from the same loop, so
+the decoder (`serve/grammar/decode.py`) cannot be describing a different grammar from the one the engine compiles.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any
+
+# The two ordinary-text delimiters a parameter block is built from.  `decode.py` imports them, so the decoder and the
+# builder cannot disagree about where a value starts and ends.
+PARAM_CLOSE = "\n</parameter>\n"
+CALL_END = "</function>\n"
+
+
+def param_open_text(name: str) -> str:
+    """The bytes the template writes before a value, e.g. `<parameter=city>\\n`."""
+    return f"<parameter={name}>\n"
+
+
+@dataclass(frozen=True)
+class ToolLabel:
+    """One tool's name literal, as the fragment wrote it (`"NAME>\\n"`), and what it means."""
+
+    literal: str
+    name: str
+    slug: str
+
+
+@dataclass(frozen=True)
+class ParamLabel:
+    """One parameter's opening literal (`"<parameter=NAME>\\n"`) and the parameter's name."""
+
+    literal: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Labels:
+    """The structure a fragment wrote: which literals are a tool name, which open a parameter."""
+
+    tools: tuple[ToolLabel, ...] = ()
+    params: tuple[ParamLabel, ...] = ()
+
+
+@dataclass(frozen=True)
+class Fragment:
+    """The grammar text that replaces the SPLICE_TOOLS block, and the labels describing it."""
+
+    text: str
+    labels: Labels = field(default_factory=Labels)
 
 # With no tools declared, `tool_dispatch` must be reachable but unable to match anything.  A regex that cannot
 # match a byte string in the pack's vocabulary is the cheapest way to say so; picking a `\x00`-`\xff` negation
@@ -48,8 +95,8 @@ def _json_schema(schema: dict[str, Any]) -> str:
 def compile_param_value_rule(rule_name: str, param_name: str, prop_schema: dict[str, Any],
                              root_defs: dict[str, Any]) -> str:
     """One property's JSON Schema -> the rule for its `<parameter=NAME>` block."""
-    prefix = lark_escape(f"<parameter={param_name}>\n")
-    close_tag = lark_escape("\n</parameter>\n")
+    prefix = lark_escape(param_open_text(param_name))
+    close_tag = lark_escape(PARAM_CLOSE)
 
     # A `$ref` to a string definition is inlined; anything else is handed to %json, which resolves refs itself.
     target = prop_schema
@@ -87,18 +134,20 @@ def compile_param_value_rule(rule_name: str, param_name: str, prop_schema: dict[
     return f"{rule_name}: {prefix} %json {_json_schema(embedded)} {close_tag}"
 
 
-def compile_tools_fragment(tools: list[dict[str, Any]]) -> str:
-    """The request's tools -> the text that replaces `skeleton.lark`'s SPLICE_TOOLS block.
+def compile_tools_fragment(tools: list[dict[str, Any]]) -> Fragment:
+    """The request's tools -> the fragment that replaces `skeleton.lark`'s SPLICE_TOOLS block.
 
     Per tool and in request order: a `tool_dispatch` alternative, `call_<slug>`, `params_<slug>`, one
     `param_<slug>_<i>` per parameter, and the two mid-call entries `entry_call_named_<slug>` (the prompt already
     wrote `=NAME>`) and `entry_call_name_<slug>` (the name is still to be written).
     """
     if not tools:
-        return NO_TOOLS
+        return Fragment(NO_TOOLS)
 
     dispatch: list[str] = []
     blocks: list[str] = []
+    tool_labels: list[ToolLabel] = []
+    param_labels: list[ParamLabel] = []
     for idx, tool in enumerate(tools):
         fn = tool.get("function", tool)
         name = fn["name"]
@@ -117,6 +166,8 @@ def compile_tools_fragment(tools: list[dict[str, Any]]) -> str:
         lines = [f"// --- Tool: {name} ---"]
         head = lark_escape(f"{name}>\n")
         head_eq = lark_escape(f"={name}>\n")
+        tool_labels.append(ToolLabel(literal=f"{name}>\n", name=name, slug=slug))
+        param_labels += [ParamLabel(literal=param_open_text(key), name=key) for key in order]
 
         if n_all == 0:
             lines.append(f"call_{slug}: {head} params_{slug}")
@@ -141,9 +192,10 @@ def compile_tools_fragment(tools: list[dict[str, Any]]) -> str:
             lines.append(f"params_{slug}::_ : " + "\n    | ".join(branches))
             params_ref = f"params_{slug}::0x0"
 
-        tail = ' "</function>\\n" </tool_call> more_tool_calls <|im_end|>'
+        tail = f" {lark_escape(CALL_END)} </tool_call> more_tool_calls <|im_end|>"
         lines.append(f"entry_call_named_{slug}: {params_ref}{tail}")
         lines.append(f"entry_call_name_{slug}: {head_eq} {params_ref}{tail}")
         blocks.append("\n".join(lines))
 
-    return "tool_dispatch: " + "\n             | ".join(dispatch) + "\n\n" + "\n\n".join(blocks)
+    text = "tool_dispatch: " + "\n             | ".join(dispatch) + "\n\n" + "\n\n".join(blocks)
+    return Fragment(text, Labels(tools=tuple(tool_labels), params=tuple(param_labels)))

@@ -172,6 +172,23 @@ class Masks(unittest.TestCase):
                 self.assertNotIn(self.v.special[name], m.mask()[0])
         m.close()
 
+    def test_no_non_eos_special_id_is_offered_mid_answer_text(self):
+        """D-042: the decoder may read an id as structure *because* prose cannot emit one.  Measured at the first
+        mask above; this is the same claim mid-string, on both halves of a delimiter, where the exploration measured
+        the mask widening again after `</` (`tmp/grammar-explore/STATE.md` §5.3)."""
+        special = {name: self.v.special[name] for name in
+                   ("<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|endoftext|>")}
+        for entry, kw in (("entry_answer_tools", {"tools": [WEATHER]}), ("entry_answer_plain", {})):
+            for prefix in ("hello", "the end</", "<", "</", "call <tool", "line\n"):
+                with self.subTest(entry=entry, prefix=prefix):
+                    m = self.open(entry, **kw)
+                    self.assertTrue(m.consume(self.v.ids(prefix)), prefix)
+                    allowed = m.mask()[0]
+                    for name, tid in special.items():
+                        self.assertNotIn(tid, allowed, f"{name} after {prefix!r}")
+                    self.assertIn(self.v.eos, allowed)      # the answer can still end: the probe is not vacuous
+                    m.close()
+
     def test_end_of_text_is_unreachable_so_a_turn_ends_only_at_the_end_token(self):
         m = self.open("entry_answer_plain")
         self.assertNotIn(self.v.special["<|endoftext|>"], m.mask()[0])
