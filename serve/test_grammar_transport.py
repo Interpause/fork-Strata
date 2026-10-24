@@ -111,7 +111,7 @@ class Capability(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.eng.keys({"strata_grammar": "/a.gr"})
             self.eng.keys({"strata_grammar": "/b.gr"})
-        self.assertEqual(out.getvalue().count("decodes unconstrained"), 1)
+        self.assertEqual(out.getvalue().count("decodes without a grammar"), 1)
         self.assertIn("no grammar=1", out.getvalue())
 
     def test_a_request_without_a_grammar_says_nothing(self):

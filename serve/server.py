@@ -1311,8 +1311,8 @@ class StrataEngine:
             sampling = {k: v for k, v in sampling.items() if k != "strata_grammar"}
             if not StrataEngine._no_grammar_said:
                 StrataEngine._no_grammar_said = True
-                print("[strata] the engine reported no grammar=1 in its INFO line (no tokenizer was loaded for "
-                      "it): this request decodes unconstrained", flush=True)
+                print("[strata] WARNING: the engine reported no grammar=1 in its INFO line (no tokenizer was "
+                      "loaded for it): this reply decodes without a grammar (P7 makes this an error)", flush=True)
         return self.sampling_keys(sampling)
 
     @staticmethod
@@ -4404,10 +4404,14 @@ class Service:
         Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
         all there is to return (D-038).
 
-        A failure here sends no grammar, so the request decodes unconstrained without ever declaring otherwise: it is
-        said once per kind of failure and the request goes on (D-020).
+        A request that cannot be constrained here - no pipeline, or an engine that reports no grammar - and one
+        whose grammar fails to build or write all send no grammar.  Each reason is said once and the request goes on
+        (D-020, D-050).
         """
         if not self.grammar_ready():
+            self.grammar_note("this server has no grammar pipeline (no pack tokenizer)"
+                              if self.pipeline is None else
+                              "the engine reported no grammar=1 in its INFO line")
             return None
         try:
             grammar = self.pipeline.for_request(ids, tools=tools,
@@ -4428,7 +4432,7 @@ class Service:
         if why in self.grammar_notes or len(self.grammar_notes) >= 32:
             return
         self.grammar_notes.add(why)
-        print(f"[strata] grammar: {why}; this request decodes unconstrained", flush=True)
+        print(f"[strata] WARNING: {why}; this reply decodes without a grammar (P7 makes this an error)", flush=True)
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
