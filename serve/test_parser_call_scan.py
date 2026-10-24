@@ -2,7 +2,6 @@
 import itertools
 import random
 import unittest
-from unittest.mock import patch
 
 from serve import frontend
 
@@ -41,20 +40,6 @@ class CallScanTests(unittest.TestCase):
                     self.assertEqual(events_without_ids(a.feed(delta)), events_without_ids(b.feed(delta)))
                     pos = end
                 self.assertEqual(events_without_ids(a.finish()), events_without_ids(b.finish()))
-
-    def test_no_structural_rescans_until_closer_and_reset_for_next_call(self):
-        parser = frontend.OutputParser(thinking=False)
-        with patch.object(frontend, "call_end", wraps=frontend.call_end) as walk:
-            for _ in range(2):
-                parser.feed("<tool_call><function=write><parameter=text>")
-                before = walk.call_count
-                for _ in range(100):
-                    parser.feed("abcdefgh")
-                self.assertEqual(walk.call_count, before)
-                for char in "</parameter></function></tool_call>":
-                    parser.feed(char)
-                self.assertEqual(walk.call_count, before + 1)
-                self.assertEqual(parser._call_end_checked, 0)
 
 
 if __name__ == "__main__":

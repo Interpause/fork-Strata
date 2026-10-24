@@ -938,26 +938,12 @@ class OutputParser:
         return out
 
     def _reset_scan(self):
-        self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
         self.sval_started = False
         self.sdeclared = {}
-
-    def _wrapped_call_end(self) -> int:
-        # Without a closing tag the structural walk cannot finish. Search only
-        # newly appended text plus enough overlap for a tag split across feeds.
-        # A literal closing tag inside a value needs structural disambiguation:
-        # once any candidate appears, keep the original full walk for this call.
-        if self._call_end_checked >= 0:
-            start = max(0, self._call_end_checked - len(CALL_END) + 1)
-            if self.buf.find(CALL_END, start) < 0:
-                self._call_end_checked = len(self.buf)
-                return -1
-            self._call_end_checked = -1
-        return call_end(self.buf)
 
     def _scan(self) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
@@ -1218,7 +1204,7 @@ class OutputParser:
                 self.state = "call"
             else:
                 drop = None
-                i = self._wrapped_call_end()
+                i = call_end(self.buf)
                 if i >= 0:
                     drop = len(CALL_END)
                 if self.stream_tools:
