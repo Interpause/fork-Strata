@@ -21,7 +21,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
+from serve.frontend import (FORCE_ANY, FORCE_ANY_HEAD, ChatTemplate, literal_tags, mark_think_literals,
+                            unmark_think_literals)  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
@@ -4289,6 +4290,70 @@ class InventingEngine(MockEngine):
             if cancel.is_set():
                 return
             yield t
+
+
+class ForcedOpening(unittest.TestCase):
+    """What the prompt ends with when `tool_choice` requires a call.
+
+    With a grammar the name is the grammar's to write (`entry_call_name` is `"=" tool_dispatch ...`, and the
+    dispatch offers only the declared tools), so the prompt stops at "<function" and the reply's own first token is
+    the entry's "=".  Without one the server has to keep an invented name out of the call itself, so it writes the
+    name one token at a time - and the prompt stops wherever the offered openings' tokens do, which can be inside a
+    name (`tmp/p5-c2/verify-a.out`: `<function=get` resolves to no entry, so `tool_choice: required` with
+    `get_weather` and `get_time` decoded unconstrained).
+    """
+    TOOLS = [{"name": "get_weather"}, {"name": "get_time"}]   # call_opening reads the name alone
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = MockEngine(self.tok, "ok", max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def info(self, **kw):
+        self.engine.info = kw                      # MockEngine carries none by default
+
+    def test_without_a_grammar_the_name_is_written_token_by_token(self):
+        self.assertFalse(self.svc.grammar_ready())
+        ids, naming = self.svc.forced_opening(FORCE_ANY, self.TOOLS)
+        # the byte tokenizer goes deeper than the pack's ("get" is one token there, so the live run stopped at
+        # "<function=get"); either way the prompt ends inside a name, which no entry resolves
+        self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function=get_")
+        self.assertIsNotNone(naming)
+
+    def test_with_a_grammar_the_prompt_stops_before_the_name(self):
+        self.svc.pipeline = object()               # what a pack's tokenizer builds in Service.__init__
+        self.info(grammar=1)
+        self.assertTrue(self.svc.grammar_ready())
+        ids, naming = self.svc.forced_opening(FORCE_ANY, self.TOOLS)
+        self.assertEqual(self.tok.decode(ids), FORCE_ANY_HEAD)
+        self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function")
+        self.assertIsNone(naming)                  # nothing left to choose: the grammar dispatches
+
+    def test_the_engine_must_take_a_grammar_too(self):
+        self.svc.pipeline = object()               # spliced, but the engine cannot compile it
+        self.info(grammar=0)
+        self.assertFalse(self.svc.grammar_ready())
+        ids, naming = self.svc.forced_opening(FORCE_ANY, self.TOOLS)
+        # the byte tokenizer goes deeper than the pack's ("get" is one token there, so the live run stopped at
+        # "<function=get"); either way the prompt ends inside a name, which no entry resolves
+        self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function=get_")
+        self.assertIsNotNone(naming)
+
+    def test_after_the_thinking_the_server_still_writes_the_name(self):
+        # D-044: the opening goes into the prompt mid-request, where the engine's matcher never sees it, so that
+        # pass can only close the thinking and the reply is read by the text parser - which needs the name here.
+        self.svc.pipeline = object()
+        self.info(grammar=1)
+        ids, naming = self.svc.forced_opening(FORCE_ANY, self.TOOLS, after_thinking=True)
+        self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function=get_")
+        self.assertIsNotNone(naming)
+
+    def test_a_named_choice_is_written_whole_either_way(self):
+        self.svc.pipeline = object()
+        self.info(grammar=1)
+        ids, naming = self.svc.forced_opening("<tool_call>\n<function=get_weather>\n", self.TOOLS)
+        self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function=get_weather>\n")
+        self.assertIsNone(naming)
 
 
 class RequiredNamesAnOfferedTool(unittest.TestCase):

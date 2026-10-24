@@ -57,7 +57,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (FORCE_ANY, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (FORCE_ANY, FORCE_ANY_HEAD, THINK_END, ChatTemplate, Event, OutputParser,
+                            StructureParser,  # noqa: E402
                             anthropic_to_messages, forced_call, images_of, literal_tags, mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -4056,6 +4057,37 @@ class Service:
         names = dict.fromkeys(t["name"] for t in tools or [] if isinstance(t, dict) and isinstance(t.get("name"), str))
         return common_opening([self.tok.encode(f"{force}{name}>\n", parse_special=True) for name in names])
 
+    def grammar_ready(self) -> bool:
+        """A grammar can be built for this request and the engine will compile it.
+
+        Both halves are needed: the pipeline splices the Lark and needs the pack's tokenizer, and the engine needs its
+        own tokenizer to constrain a decode (the `grammar=1` on its INFO line).  Less than both and the reply is read
+        by the text parser, so anything that changes what the prompt ends with asks this first.
+        """
+        info = getattr(self.engine, "info", None) or {}
+        return self.pipeline is not None and info.get("grammar") == 1
+
+    def forced_opening(self, force, tools, after_thinking=False) -> tuple[list[int], list[list[int]] | None]:
+        """`call_opening`, short of the name when a grammar writes it.
+
+        FORCE_ANY ("required" with several tools) used to stop the prompt at the longest token prefix the offered
+        openings share, and then write the rest of the name token by token.  With a grammar that is both redundant and
+        wrong: `entry_call_name` is `"=" tool_dispatch ...` and `tool_dispatch` offers only the declared tools, so the
+        name cannot come out undeclared - while the token prefix can stop inside a name (`<function=get`), a tail no
+        entry resolves, so the request quietly decoded unconstrained (`tmp/p5-c2/verify-a.out`).  So the prompt ends
+        at `<function` and the reply writes `=NAME>`, which is the entry's own first tokens.
+
+        Without a grammar the choosing stays: it is the only thing keeping an invented name out of the call there.
+
+        `after_thinking` is that same choosing for a call a budget or `tool_choice` writes once the thinking is over:
+        the opening goes into the prompt mid-request, where the engine's matcher never sees it, so the pass that
+        follows can only close the thinking (`tmp/p5-c2/FAIL-check3.txt`: `</function>\n</think>` where
+        `</tool_call>` belongs, and the text reader is the lenient one that reads past it - D-044).
+        """
+        if force == FORCE_ANY and not after_thinking and self.grammar_ready():
+            return self.tok.encode(FORCE_ANY_HEAD, parse_special=True), None
+        return self.call_opening(force, tools)
+
     def can_bias(self) -> bool:
         """The engine takes a request's logit_bias (see logit_bias.validate_request)."""
         info = getattr(self.engine, "info", None) or {}
@@ -4132,7 +4164,7 @@ class Service:
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.call_opening(force, tools)[0]
+            ids = ids + self.forced_opening(force, tools)[0]
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -4306,7 +4338,7 @@ class Service:
             Path(path).unlink(missing_ok=True)
 
     def begin_grammar(self, ids, tools, force, sampling):
-        """-> the file the engine reads, or None.
+        """-> (the file the engine reads, the entry rule it was built for), or None.
 
         The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
         written to be read back at once and deleted in run()'s `finally`, and writing it this close to the engine call
@@ -4320,7 +4352,7 @@ class Service:
         A failure here sends no grammar, so the request decodes unconstrained without ever declaring otherwise: it is
         said once per kind of failure and the request goes on (D-020).
         """
-        if self.pipeline is None:
+        if not self.grammar_ready():
             return None
         try:
             grammar = self.pipeline.for_request(ids, tools=tools,
@@ -4334,7 +4366,7 @@ class Service:
         except (OSError, ValueError) as e:
             self.grammar_note(f"cannot write the grammar file: {e}")
             return None
-        return str(path)
+        return str(path), grammar.entry
 
     def grammar_note(self, why: str) -> None:
         """Say a grammar problem once per kind: a prompt that is not from this template fails on every request."""
@@ -4446,11 +4478,12 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
-        opening = []                                    # without thinking the prompt ends with the forced opening:
+        forced = []                                     # without thinking the prompt ends with the forced opening:
         naming = None                                   # the parser reads it as if the model had written it
-        if force and not thinking:                      # (naming: the offered names' openings still to choose from)
-            first, naming = self.call_opening(force, tools)
-            opening, force = [ev for t in first for ev in parser.feed(detok.push(t))], None
+        opening: list[Event] = []                       # (naming: the offered names' openings still to choose from)
+        if force and not thinking:
+            forced, naming = self.forced_opening(force, tools)
+            force = None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered = False                                # content or a call came out
         nf_retried = False                              # #879: the request was sent again after non-finite logits
@@ -4462,9 +4495,30 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
-        gfile = self.begin_grammar(ids, tools, force, sampling)
+        grammar = self.begin_grammar(ids, tools, force, sampling)
+        gfile, gentry = grammar if grammar else (None, None)
         if gfile:
             sampling = {**(sampling or {}), "strata_grammar": gfile}
+        # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
+        # grammar instead of from the bytes.  Only when the engine really applied it - one without the capability
+        # strips the file and decodes unconstrained, and then there is no grammar to read (D-043).
+        # `force` is only still set here for a call written after the thinking, which that same comment excludes
+        # (D-044): there the reply carries the opening's stray `</think>`, and the text reader is the one that reads
+        # past it.
+        structured = bool(gfile) and bool((getattr(self.engine, "info", None) or {}).get("grammar")) \
+            and force is None
+        if structured:
+            parser = StructureParser(gentry, tools)
+            opening = parser.opening()
+            for t in forced:                            # prompt bytes, not output: the detokenizer still sees them
+                detok.push(t)
+        else:
+            opening = [ev for t in forced for ev in parser.feed(detok.push(t))]
+
+        def feed(t, piece):
+            """One generated token into whichever parser is reading: the grammar's needs the id, the text parser
+            only the bytes."""
+            return parser.feed(t, piece) if structured else parser.feed(piece)
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
@@ -4601,7 +4655,7 @@ class Service:
                                     break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
-                                evs = cut(parser.feed(piece))
+                                evs = cut(feed(t, piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -4723,7 +4777,7 @@ class Service:
                             for t in extra:
                                 n += 1
                                 raw_ids.append(t)
-                                evs = cut(parser.feed(detok.push(t)))
+                                evs = cut(feed(t, detok.push(t)))
                                 self._note(n, evs, st, rate)
                                 for ev in evs:
                                     yield "event", ev
@@ -4743,7 +4797,7 @@ class Service:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n"))))
                         extra = self.tok.encode(text, parse_special=True)
                         if force:
-                            first, naming = self.call_opening(force, tools)
+                            first, naming = self.forced_opening(force, tools, after_thinking=True)
                             extra, force = extra + first, None
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
@@ -4754,7 +4808,7 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            evs = cut(feed(t, detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev

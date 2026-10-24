@@ -762,6 +762,8 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
 
 
 FORCE_ANY = CALL_START + "\n<function="       # forced_call for "required" / "any" with several tools
+FORCE_ANY_HEAD = CALL_START + "\n<function"   # where a grammar-written name starts: the entry's own "=" is
+                                              # the reply's first token (see Service.forced_opening)
 
 
 def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
@@ -1317,6 +1319,17 @@ class StructureParser:
         return self.decoder.buf
 
     # ---------------------------------------------------------------- input
+    def opening(self) -> list[Event]:
+        """The events for a call the *prompt* already opened.  Without thinking, `tool_choice` has the server write
+        the call's opening into the prompt, so those tokens are not output and never reach `feed`; the entry says
+        the reply starts inside that call, which is how this knows the call and its name.  [] for `entry_call_name`,
+        where the name is still to be written."""
+        if self.decoder.state != decode.PARAMS or not self.decoder.tool:
+            return []
+        out: list[Event] = []
+        self._open(self.decoder.tool, out)
+        return out
+
     def feed(self, token_id: int, text: str = "") -> list[Event]:
         """One token: its id decides whether it is a delimiter, its text is the payload otherwise."""
         return self._events(self.decoder.feed(token_id, text))
