@@ -28,6 +28,9 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve.grammar import decode
+from serve.grammar.tools_fragment import compile_tools_fragment
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -1264,3 +1267,141 @@ class OutputParser:
         self._reset_scan()
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
+
+
+class StructureParser:
+    """The API's events from the grammar's structure (D-042): the same events `OutputParser` reports, for a reply
+    whose structure the grammar decided.
+
+    Feed it a token at a time - its id and its text - and it yields reasoning, content, tool_start, tool_args and
+    tool_call exactly as the text parser does, because the servers' three APIs key on those.  What it does not do is
+    read structure out of the bytes: `serve/grammar/decode.py` says which token is a delimiter (from the fragment's
+    labels and the pack's special ids) and which is payload.  So a delimiter that is spelled, fenced or quoted is
+    prose here without a fence tracker, a value may contain a parameter tag unless it alone on its line (D5), and a
+    tool_args tail is never fabricated: a call either reached its closing token or it did not.
+
+    `entry` is the grammar entry the prompt's own tail selected (`serve/grammar/entries.py`), and `tools` are the
+    request's tools: the labels come from the same builder loop that wrote the grammar the engine is decoding with,
+    so this cannot describe a different grammar.
+
+    `stream_tools` is the server's setting: report a call while it is written (`tool_start`, then `tool_args`
+    pieces) instead of only at its end.  A reasoning block is never a call here - the grammar's THINK_BODY is a
+    text terminal and cannot emit a delimiter token - so rescued/refused stay 0 and pending is always empty, which
+    is what the server reads those for on the text parser.
+    """
+
+    def __init__(self, entry: str, tools: list[dict] | None = None, stream_tools: bool = True):
+        self.entry = entry
+        self.schemas = {t.get("name"): t for t in tools or []}
+        self.stream_tools = stream_tools
+        self.decoder = decode.Decoder(entry, compile_tools_fragment(list(tools or [])).labels)
+        self.scall: ToolCall | None = None       # the call being written (its tool_call reuses its id)
+        self.sparam: str | None = None           # the parameter whose key has been reported
+        self.sval: list[str] = []                # its value, for a type that is not streamed
+        self.sfirst = True
+        self.sdeclared: dict = {}
+        self.rescued = self.refused = 0
+        self.pending: list = []
+
+    # ---------------------------------------------------------------- what the server reads (as on OutputParser)
+    @property
+    def state(self) -> str:
+        """`reasoning` while the reply is still in the thinking block, `content` after it.  The thinking budget and
+        the two forced-opening checks key on that and on `buf`."""
+        return "reasoning" if self.decoder.state == decode.THINK else "content"
+
+    @property
+    def buf(self) -> str:
+        """The bytes no transition has consumed.  Empty means nothing is held back, which is what the budget's "a
+        clean point to close the thinking" wants; a partial parameter tag is the one case that is not."""
+        return self.decoder.buf
+
+    # ---------------------------------------------------------------- input
+    def feed(self, token_id: int, text: str = "") -> list[Event]:
+        """One token: its id decides whether it is a delimiter, its text is the payload otherwise."""
+        return self._events(self.decoder.feed(token_id, text))
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        """The end of the reply.  `reason` changes nothing: a reply cut short leaves its call unfinished exactly as
+        the grammar left it, and the events say so (#211).
+
+        The one call that is still whole is the one missing only its closing token: the body ended (`</function>`,
+        which the decoder consumed) and the wrapper did not arrive before the reply did.  Its arguments are complete
+        and unambiguous, so it is delivered as a call - what the text parser has always done with that shape.
+        """
+        out = self._events(self.decoder.finish())
+        if self.decoder.state == decode.CLOSE and self.scall is not None:
+            out += self._close_call(self.scall.name)
+        return out
+
+    # ---------------------------------------------------------------- steps -> events
+    def _events(self, steps) -> list[Event]:
+        out: list[Event] = []
+        for step in steps:
+            if step.kind in ("reasoning", "content"):
+                out.append(Event(step.kind, step.text))
+            elif step.kind == "call_open":
+                self._open(step.name, out)
+            elif step.kind == "param":
+                self._key(step.name, out)
+                if step.text:
+                    if self._streamed(step.name):
+                        out.append(Event("tool_args", json.dumps(step.text)[1:-1], call=self.scall))
+                    self.sval.append(step.text)
+            elif step.kind == "param_end":
+                self._key(step.name, out)
+                out += self._close_param(step.name)
+            elif step.kind == "call_end":
+                out += self._close_call(step.name)
+        return out
+
+    def _streamed(self, name: str) -> bool:
+        return self.stream_tools and self.sdeclared.get(name) == "string"
+
+    def _open(self, name: str, out: list[Event]) -> None:
+        self.scall = ToolCall(name=name, arguments={})
+        self.sparam, self.sval, self.sfirst = None, [], True
+        props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
+        self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+        if self.stream_tools:
+            out.append(Event("tool_start", call=self.scall))
+            out.append(Event("tool_args", "{", call=self.scall))
+
+    def _key(self, name: str, out: list[Event]) -> None:
+        """Report the parameter's name once, before its value - a value that arrived in no pieces has none."""
+        if self.sparam == name:
+            return
+        self.sparam = name
+        if self.stream_tools:
+            out.append(Event("tool_args", ("" if self.sfirst else ",") + json.dumps(name) + ":", call=self.scall))
+            self.sfirst = False
+            if self.sdeclared.get(name) == "string":
+                out.append(Event("tool_args", '"', call=self.scall))
+
+    def _close_param(self, name: str) -> list[Event]:
+        out: list[Event] = []
+        value = "".join(self.sval)
+        self.sval = []
+        if self.sdeclared.get(name) == "string":
+            parsed = value
+            if self.stream_tools:
+                out.append(Event("tool_args", '"', call=self.scall))
+        else:
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                parsed = value          # what `parse_tool_call` does with a value the schema did not promise
+            if self.stream_tools:
+                out.append(Event("tool_args", json.dumps(parsed, ensure_ascii=False), call=self.scall))
+        if self.scall is not None:
+            self.scall.arguments[name] = parsed
+        return out
+
+    def _close_call(self, name: str) -> list[Event]:
+        streamed = self.scall
+        closing = [Event("tool_args", "}", call=streamed)] if self.stream_tools and streamed is not None else []
+        arguments = dict(streamed.arguments) if streamed is not None else {}
+        call = ToolCall(name=name, arguments=arguments,
+                        id=streamed.id if streamed is not None else ToolCall(name, arguments).id)
+        self.scall = None
+        return closing + [Event("tool_call", call=call)]
