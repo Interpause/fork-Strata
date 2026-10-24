@@ -4348,6 +4348,16 @@ class ForcedOpening(unittest.TestCase):
         self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function=get_")
         self.assertIsNotNone(naming)
 
+    def test_a_named_choice_narrows_what_the_grammar_offers(self):
+        # OpenAI: a named `tool_choice` "forces the model to call that tool", and the grammar's `tool_dispatch` would
+        # otherwise offer every declared one.
+        self.assertEqual(self.svc.grammar_tools(FORCE_ANY, self.TOOLS), self.TOOLS)
+        named = "<tool_call>\n<function=get_time>\n"
+        self.assertEqual(self.svc.grammar_tools(named, self.TOOLS), [{"name": "get_time"}])
+        self.assertEqual(self.svc.grammar_tools(None, self.TOOLS), self.TOOLS)   # nothing forced: unchanged
+        # a name the request never declared cannot empty the fragment
+        self.assertEqual(self.svc.grammar_tools("<tool_call>\n<function=gone>\n", self.TOOLS), self.TOOLS)
+
     def test_a_named_choice_is_written_whole_either_way(self):
         self.svc.pipeline = object()
         self.info(grammar=1)

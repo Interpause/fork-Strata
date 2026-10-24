@@ -4088,6 +4088,21 @@ class Service:
             return self.tok.encode(FORCE_ANY_HEAD, parse_special=True), None
         return self.call_opening(force, tools)
 
+    def grammar_tools(self, force, tools):
+        """The tools the grammar offers: the one a named `tool_choice` forces, or all of them.
+
+        A grammar's `tool_dispatch` (behind `entry_call_name` and behind the answer of `entry_*_tools_required`)
+        offers every tool it was built with, so a named `tool_choice` has to narrow the fragment or it would accept
+        any declared tool - OpenAI's words for that form are "forces the model to call that tool".  `force` is
+        `frontend.forced_call`'s text: `FORCE_ANY` for "required", else that head plus `NAME>\n`.
+        """
+        if isinstance(force, str) and force and force != FORCE_ANY and force.startswith(FORCE_ANY):
+            wanted = force[len(FORCE_ANY):].removesuffix(">\n")
+            named = [t for t in tools or [] if isinstance(t, dict) and t.get("name") == wanted]
+            if named:
+                return named
+        return tools
+
     def can_bias(self) -> bool:
         """The engine takes a request's logit_bias (see logit_bias.validate_request)."""
         info = getattr(self.engine, "info", None) or {}
@@ -4495,20 +4510,17 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
-        grammar = self.begin_grammar(ids, tools, force, sampling)
+        gtools = self.grammar_tools(force, tools)   # before `force` is cleared below: it decides the fragment
+        grammar = self.begin_grammar(ids, gtools, force, sampling)
         gfile, gentry = grammar if grammar else (None, None)
         if gfile:
             sampling = {**(sampling or {}), "strata_grammar": gfile}
         # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
         # grammar instead of from the bytes.  Only when the engine really applied it - one without the capability
         # strips the file and decodes unconstrained, and then there is no grammar to read (D-043).
-        # `force` is only still set here for a call written after the thinking, which that same comment excludes
-        # (D-044): there the reply carries the opening's stray `</think>`, and the text reader is the one that reads
-        # past it.
-        structured = bool(gfile) and bool((getattr(self.engine, "info", None) or {}).get("grammar")) \
-            and force is None
+        structured = bool(gfile) and bool((getattr(self.engine, "info", None) or {}).get("grammar"))
         if structured:
-            parser = StructureParser(gentry, tools)
+            parser = StructureParser(gentry, gtools)
             opening = parser.opening()
             for t in forced:                            # prompt bytes, not output: the detokenizer still sees them
                 detok.push(t)
@@ -4639,7 +4651,8 @@ class Service:
                                           "cannot bias tokens): the closest offered name is written", flush=True)
                                     t = self.closest_token(t, allowed)
                                 if t in self.stop_ids:
-                                    if force and parser.state == "reasoning" and parser.buf == THINK_END:
+                                    if force and not structured and parser.state == "reasoning" \
+                                            and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
                                     finish = "stop"
@@ -4691,7 +4704,12 @@ class Service:
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
                                         break
-                                if force:
+                                if force and not structured:
+                                    # A grammar writes the reply whole (`answer_tools_required` is
+                                    # `tool_calls <|im_end|>`), so there is no opening for the prompt to carry and no
+                                    # pass boundary here: a second pass restarts the engine's matcher at the entry,
+                                    # which is `thinking` again, and `THINK_BODY` would take the rest of the reply as
+                                    # reasoning (D-044).
                                     if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
                                         force = None    # the model is writing a call of its own
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
@@ -4796,7 +4814,12 @@ class Service:
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n"))))
                         extra = self.tok.encode(text, parse_special=True)
-                        if force:
+                        if force and structured:
+                            # Only a budget break gets here (the content break above excludes a grammar): the call is
+                            # still the grammar's to write, so only the wrap-up is appended (D-044).
+                            force = None
+                            extra = extra if wrap else []
+                        elif force:
                             first, naming = self.forced_opening(force, tools, after_thinking=True)
                             extra, force = extra + first, None
                         if max_new - n - len(extra) < 1:
