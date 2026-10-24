@@ -1167,22 +1167,6 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
-                # A call is `<tool_call>` and then (after whitespace) `<function=`; the tag with anything else after
-                # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
-                # that ends the request.  Until its follower has arrived it is held, like a partial tag.
-                after = self.buf[i + len(CALL_START):].lstrip()
-                if after and not after.startswith(FUNC_START) and not FUNC_START.startswith(after):
-                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
-                    self.buf = self.buf[i + len(CALL_START):]
-                    continue
-                if not after.startswith(FUNC_START):
-                    j = i
-                    while j > 0 and self.buf[j - 1] == "\n":
-                        j -= 1
-                    if j > 0:
-                        out.append(Event("content", self._track(self.buf[:j])))
-                        self.buf = self.buf[j:]
-                    return out
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
@@ -1203,6 +1187,13 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + drop:]
+                if not body.lstrip().startswith(FUNC_START):
+                    # The tag the body came from was prose that names the format ("I'll use a <tool_call> block"),
+                    # which the walk now knows for a fact rather than guessing from what follows it: its own bytes
+                    # are content, and the scan resumes after them, because the tag it mentions may open the call.
+                    out.append(Event("content", self._track(CALL_START)))
+                    self.buf, self.state = body + CALL_END, "content"
+                    continue
                 out += self._finish_call(body)
 
     def finish(self, reason: str | None = None) -> list[Event]:
@@ -1222,8 +1213,9 @@ class OutputParser:
             return out
         if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
             self.buf, self.state = "", "content"
-        if self.buf:
-            # an unfinished call inside the reasoning (#804) is reasoning text, never a call
+        if self.buf or self.state == "call":
+            # an unfinished call inside the reasoning (#804) is reasoning text, never a call.  The call state with an
+            # empty buffer is a reply that ended on the tag itself: those bytes are still part of the reply.
             kind = {"reasoning": "reasoning", "rcall": "reasoning", "content": "content"}.get(self.state, "content")
             text = CALL_START + self.buf if self.state == "call" else self.buf
             out.append(Event(kind, text))
