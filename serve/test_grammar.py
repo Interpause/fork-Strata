@@ -227,6 +227,32 @@ class Entries(unittest.TestCase):
         tail = "user: hi\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
         self.assertEqual(be.resolve_entry(tail), "entry_think_plain")
 
+    def test_a_continuation_tail_starts_at_the_answer(self):
+        # D-045: the budget wrap-up puts text, </think> and the template's two newlines into the PROMPT, so the next
+        # pass begins at the answer.  Only the end bytes decide: what the model wrote before the token is irrelevant.
+        for tail in ("</think>\n\n",
+                     "I have thought about this long enough; time to give my answer.\n</think>\n\n"):
+            self.assertEqual(be.resolve_entry(tail), "entry_answer_plain")
+            self.assertEqual(be.resolve_entry(tail, tools=[WEATHER]), "entry_answer_tools")
+            self.assertEqual(be.resolve_entry(tail, tools=[WEATHER], required=True),
+                             "entry_answer_tools_required")
+            self.assertEqual(be.resolve_entry(tail, schema=SCHEMA), "entry_answer_json")
+        # THINKING_OFF_TAIL ends in the same bytes.  Both mean the answer, but the thinking-off branch must be checked
+        # first, or the continuation branch would be the one explaining a prompt this grammar already had an entry for.
+        self.assertTrue(be.THINKING_OFF_TAIL.endswith(be.CONTINUATION_TAIL))
+        self.assertEqual(be.resolve_entry("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+                         "entry_answer_plain")
+        # The thinking-on tail stops at <think> and one newline, so the continuation branch must not claim it.
+        self.assertEqual(be.resolve_entry("<|im_start|>assistant\n<think>\n"), "entry_think_plain")
+        self.assertEqual(be.resolve_entry("<|im_start|>assistant\n<think>\n", tools=[WEATHER]),
+                         "entry_think_tools")
+        # A prompt inside a call is checked before every thinking tail, and its last bytes are the name, not
+        # </think> and the template's newlines: neither branch can be reached from it.
+        call_tail = "<tool_call>\n<function=get_weather>\n"
+        self.assertFalse(call_tail.endswith(be.CONTINUATION_TAIL))
+        self.assertEqual(be.resolve_entry(call_tail, tools=[WEATHER, NO_ARGS]),
+                         "entry_call_named_t0_get_weather")
+
     def test_a_named_call_in_the_prompt(self):
         self.assertEqual(be.resolve_entry("<tool_call>\n<function=get_weather>\n", tools=[WEATHER, NO_ARGS]),
                          "entry_call_named_t0_get_weather")

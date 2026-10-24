@@ -4365,6 +4365,41 @@ class ForcedOpening(unittest.TestCase):
         self.assertEqual(self.tok.decode(ids), "<tool_call>\n<function=get_weather>\n")
         self.assertIsNone(naming)
 
+    def test_a_budget_continuation_decodes_with_an_answer_grammar(self):
+        """D-045: the wrap-up writes </think> and the template's two newlines into the PROMPT, and the engine's
+        matcher never sees prompt bytes - so the second pass must be sent a grammar of its own, built for the tail it
+        now has.  Both files are dropped when the request ends."""
+        calls = []
+
+        class Recording(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                path = (sampling or {}).get("strata_grammar")
+                calls.append({"sampling": dict(sampling or {}),
+                              "grammar": Path(path).read_text(encoding="utf-8") if path else None})
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        pack = Path("tmp/d045-tests/pack")
+        shutil.rmtree(pack.parent, ignore_errors=True)
+        pack.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, pack.parent, True)
+        engine = Recording(self.tok, "The answer is 4.", max_context=CTX)
+        engine.info = {"grammar": 1}                 # this engine compiles the file it is sent
+        svc = Service(engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), pack_dir=pack)
+        ids = self.tok.encode(svc.template.render([{"role": "user", "content": "2+2?"}]), parse_special=True)
+        # thinking on: the first pass's own tail, which is what the first grammar is built for
+        self.assertTrue(svc.pipeline.tail(ids).endswith("<think>\n"), svc.pipeline.tail(ids))
+        list(svc.run(ids, True, None, 200, {"reasoning_budget_tokens": 4}, threading.Event()))
+
+        self.assertEqual(len(calls), 2)              # thinking, then the continuation after the wrap-up
+        first = calls[0]["sampling"]["strata_grammar"]
+        second = calls[1]["sampling"]["strata_grammar"]
+        self.assertNotEqual(first, second)           # a grammar of its own, not the first pass's file
+        self.assertIn("start: entry_think_", calls[0]["grammar"])
+        self.assertIn("start: entry_answer_", calls[1]["grammar"])
+        for path in (first, second):                 # both holds were dropped: nothing outlives the request
+            self.assertFalse(Path(path).exists(), path)
+        self.assertEqual(list(Path(first).parent.glob("*.gr")), [])
+
 
 class RequiredNamesAnOfferedTool(unittest.TestCase):
     """tool_choice "required" / Anthropic "any" with several tools: the server writes the name, one token at a time

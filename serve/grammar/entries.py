@@ -4,6 +4,7 @@ The template has already written the state before the reply begins, so the tail 
 
     ...<|im_start|>assistant\\n<think>\\n                    thinking on, nothing written yet
     ...<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n     thinking off: the block is prompt text, not output
+    ...</think>\\n\\n                                       a continuation (the budget wrap-up): the answer
     ...<function=NAME>\\n                                   inside a call, the name already written
     ...<function                                          inside a call, the name still to write
 
@@ -24,6 +25,11 @@ from .tools_fragment import slugify
 
 THINKING_ON_TAIL = "<think>\n"
 THINKING_OFF_TAIL = "<think>\n\n</think>\n\n"
+# D-045: the server can continue a reply in a second pass (the thinking budget's wrap-up appends `REASONING_WRAP_UP` -
+# text, then the `</think>` token, then the template's two newlines - and continues).  Those are exactly `thinking`'s
+# own last two terminals, so the reply then stands where the thinking-off prompt leaves it: at the answer.  Passing
+# the first pass's grammar to that pass instead is D-045's measured failure (the answer reads as reasoning).
+CONTINUATION_TAIL = "</think>\n\n"
 
 _NAMED = re.compile(r"<function=([^>\n]+)>?\n?$", re.S)
 _UNNAMED = re.compile(r"<function=?$")
@@ -60,6 +66,10 @@ def resolve_entry(tail: str, tools: list[dict[str, Any]] | None = None,
         phase = "answer"          # the empty reasoning block is in the prompt: the reply starts at the answer
     elif tail.endswith(THINKING_ON_TAIL):
         phase = "think"
+    elif tail.endswith(CONTINUATION_TAIL):
+        # D-045: `THINKING_OFF_TAIL` ends in this too, so it is checked first; the thinking tail stops at `<think>` and
+        # a newline, so only a prompt the server continued past its own thinking can end here.
+        phase = "answer"
     else:
         raise UnresolvedTail("the prompt ends in no state the grammar has an entry for")
 

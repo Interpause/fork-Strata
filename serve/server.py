@@ -4510,9 +4510,11 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
+        forced_required = force is not None            # D-045: a continuation keeps the request's tool_choice
         gtools = self.grammar_tools(force, tools)   # before `force` is cleared below: it decides the fragment
         grammar = self.begin_grammar(ids, gtools, force, sampling)
         gfile, gentry = grammar if grammar else (None, None)
+        gfiles = [gfile] if gfile else []               # D-045: a continuation pass holds a grammar of its own
         if gfile:
             sampling = {**(sampling or {}), "strata_grammar": gfile}
         # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
@@ -4824,6 +4826,18 @@ class Service:
                             extra, force = extra + first, None
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
+                        if wrap and gfile:
+                            # D-045: the wrap-up writes `</think>` and the template's two newlines INTO the prompt, so
+                            # the next pass starts at the answer, and a grammar built for the first pass cannot be
+                            # there - a matcher never sees prompt bytes, so it restarts where the first pass began
+                            # and `THINK_BODY` reads the answer as reasoning.  The continuation gets the shape its
+                            # own tail names.  A grammar that cannot be built leaves the first file in place (the
+                            # behaviour before this) and `begin_grammar` has already said why.
+                            cont = self.begin_grammar(list(prompt) + seg + extra, gtools,
+                                                      FORCE_ANY if forced_required else None, sampling)
+                            if cont:
+                                gfiles.append(cont[0])
+                                sampling = {**sampling, "strata_grammar": cont[0]}
                         if wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
@@ -4933,8 +4947,8 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-            if gfile:
-                drop_grammar(gfile)
+            for g in gfiles:                            # D-045: the first pass's file, and a continuation's
+                drop_grammar(g)
         for ev in cut(parser.finish(finish)):
             yield "event", ev
         if parser.rescued or parser.refused:
