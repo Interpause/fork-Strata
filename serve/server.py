@@ -111,6 +111,9 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
 
 
+SHM_DIR = Path("/dev/shm")         # the tmpfs the temporary files go to when it has room
+
+
 def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
     deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
@@ -118,7 +121,7 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     to the drive).  Anywhere else, or when /dev/shm is too small (Docker's default is 64 MB), it stays in the encoder's
     own directory, as before."""
     name = f"req-{uuid.uuid4().hex[:12]}.sve"
-    shm = Path("/dev/shm")
+    shm = SHM_DIR
     if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
         try:
             if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
@@ -143,7 +146,7 @@ def grammar_file(pack_dir: Path, name: str, text: str) -> Path:
     carries the process id so two servers never share a name; the file's own name is the grammar's identity, which is
     what the engine caches by (tmp/impl-plan/contracts/c1-grammar-transport.md)."""
     directory = Path(pack_dir)
-    shm = Path("/dev/shm")
+    shm = SHM_DIR
     if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
         try:
             if shutil.disk_usage(shm).free > (16 << 20):
@@ -213,11 +216,45 @@ def drop_grammar(path) -> None:
             _grammar_holds[str(p)] = left
             return
         _grammar_holds.pop(str(p), None)
-        p.unlink(missing_ok=True)
-        try:
-            p.parent.rmdir()
+        try:                        # one file that will not go must not keep the next file's hold (see _run's finally)
+            p.unlink(missing_ok=True)
+            p.parent.rmdir()        # the pid directory goes with the last file in it
         except OSError:
             pass
+
+
+def sweep_grammar_dirs(pack_dir: Path) -> None:
+    """Remove the grammar directories of servers that are not running any more.
+
+    The directory carries the process id, so a server that died without its `finally` running - `kill -9`, a crash, a
+    machine that lost power - leaves its files behind, and nothing else ever looks at them again: in `/dev/shm` they
+    are memory, in the model's directory they are files nobody sweeps. A directory whose pid is still alive is left
+    alone, so a second server on the same pack directory keeps its own. Best effort: a directory that cannot be read
+    or removed is skipped, because a stale file is better than a server that will not start.
+    """
+    if os.name == "nt":             # os.kill(pid, 0) is not a liveness test on Windows (and the files are the model's)
+        return
+    roots = [Path(pack_dir)]
+    shm = SHM_DIR
+    if shm.is_dir():
+        roots.append(shm)
+    for root in roots:
+        try:
+            found = list(root.glob("strata-grammar-*"))
+        except OSError:
+            continue
+        for d in found:
+            pid = d.name[len("strata-grammar-"):]
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                continue            # alive, or not ours to ask about: leave it
+
+
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -3252,6 +3289,8 @@ class Service:
         # do it - a mock or byte tokenizer has no ids to constrain - so a server without one carries no grammar.
         self.pack_dir = Path(pack_dir) if pack_dir is not None else None
         self.pipeline = grammar_pipeline.Pipeline(tokenizer) if pack_dir is not None else None
+        if self.pack_dir is not None:
+            sweep_grammar_dirs(self.pack_dir)         # the pid directories of servers that are gone
         self.grammar_notes: set[str] = set()          # a grammar problem is said once, not once per request
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
@@ -4513,44 +4552,45 @@ class Service:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         forced_required = force is not None            # D-045: a continuation keeps the request's tool_choice
         gtools = self.grammar_tools(force, tools)   # before `force` is cleared below: it decides the fragment
-        grammar = self.begin_grammar(ids, gtools, force, sampling)
-        gfile, gentry = grammar if grammar else (None, None)
-        gfiles = [gfile] if gfile else []               # D-045: a continuation pass holds a grammar of its own
-        if gfile:
-            sampling = {**(sampling or {}), "strata_grammar": gfile}
-        # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
-        # grammar instead of from the bytes.  Only when the engine really applied it - one without the capability
-        # strips the file and decodes unconstrained, and then there is no grammar to read (D-043).
-        structured = bool(gfile) and bool((getattr(self.engine, "info", None) or {}).get("grammar"))
-        if structured:
-            parser = StructureParser(gentry, gtools)
-            opening = parser.opening()
-            for t in forced:                            # prompt bytes, not output: the detokenizer still sees them
-                detok.push(t)
-        else:
-            opening = [ev for t in forced for ev in parser.feed(detok.push(t))]
-
-        def feed(t, piece):
-            """One generated token into whichever parser is reading: the grammar's needs the id, the text parser
-            only the bytes."""
-            return parser.feed(t, piece) if structured else parser.feed(piece)
-        # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
-        # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
-        # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
-        # so the generated reasoning must not become this request's cached input (#615).
-        segments = []
-        trace = getattr(self.request_trace, "record", None)
-        waiting = time.perf_counter()
-        # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
-        # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        # (a grammar request is one at a time instead when the engine's slots are pipelined: see solo_only)
-        solo_only = getattr(self.engine, "solo_only", None)
-        par = bool(getattr(self.engine, "batch", 0)) and not (solo_only and solo_only(sampling))
-        st = {} if par else self.status
-        rate = collections.deque(maxlen=32) if par else self.rate
-        with self.status_lock:
-            self.status["queued"] += 1
+        gfiles = []                                     # the request's grammar files, dropped in the finally
         try:
+            grammar = self.begin_grammar(ids, gtools, force, sampling)
+            gfile, gentry = grammar if grammar else (None, None)
+            if gfile:
+                gfiles.append(gfile)                    # D-045: a continuation pass holds a grammar of its own
+                sampling = {**(sampling or {}), "strata_grammar": gfile}
+            # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
+            # grammar instead of from the bytes.  Only when the engine really applied it - one without the capability
+            # strips the file and decodes unconstrained, and then there is no grammar to read (D-043).
+            structured = bool(gfile) and bool((getattr(self.engine, "info", None) or {}).get("grammar"))
+            if structured:
+                parser = StructureParser(gentry, gtools)
+                opening = parser.opening()
+                for t in forced:                            # prompt bytes, not output: the detokenizer still sees them
+                    detok.push(t)
+            else:
+                opening = [ev for t in forced for ev in parser.feed(detok.push(t))]
+
+            def feed(t, piece):
+                """One generated token into whichever parser is reading: the grammar's needs the id, the text parser
+                only the bytes."""
+                return parser.feed(t, piece) if structured else parser.feed(piece)
+            # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
+            # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
+            # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
+            # so the generated reasoning must not become this request's cached input (#615).
+            segments = []
+            trace = getattr(self.request_trace, "record", None)
+            waiting = time.perf_counter()
+            # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
+            # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
+            # (a grammar request is one at a time instead when the engine's slots are pipelined: see solo_only)
+            solo_only = getattr(self.engine, "solo_only", None)
+            par = bool(getattr(self.engine, "batch", 0)) and not (solo_only and solo_only(sampling))
+            st = {} if par else self.status
+            rate = collections.deque(maxlen=32) if par else self.rate
+            with self.status_lock:
+                self.status["queued"] += 1
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
             if not par:
@@ -4947,9 +4987,12 @@ class Service:
                                 self.status.pop("tool", None)
         finally:
             if emb:
-                Path(emb).unlink(missing_ok=True)
+                try:
+                    Path(emb).unlink(missing_ok=True)
+                except OSError:
+                    pass
             for g in gfiles:                            # D-045: the first pass's file, and a continuation's
-                drop_grammar(g)
+                drop_grammar(g)                         # cannot raise, so both files are always released
         for ev in cut(parser.finish(finish)):
             yield "event", ev
         if parser.rescued or parser.refused:

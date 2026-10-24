@@ -11,16 +11,21 @@ import base64
 import contextlib
 import io
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import serve.server as server_module  # noqa: E402
 from serve.frontend import FORCE_ANY, ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
 from serve.server import drop_grammar, grammar_file, hold_grammar, hold_grammar_file  # noqa: E402
+from serve.server import sweep_grammar_dirs  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -294,6 +299,96 @@ class Routing(unittest.TestCase):
 
     def test_an_engine_without_slots_is_unaffected(self):
         self.assertTrue(self.engine(0, {"grammar": 1}).solo_only({"strata_grammar": "/dev/shm/g/ab12.gr"}))
+
+
+class Sweep(unittest.TestCase):
+    """A server that died without its `finally` leaves its directory behind, and the next server to start removes it
+    (D-046).  The pid is in the directory's name, so a live one is how a server that is still running is spared."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.pack = Path(self.dir.name)
+        self.shm = Path(self.dir.name) / "shm"
+        self.shm.mkdir()
+        patcher = unittest.mock.patch.object(server_module, "SHM_DIR", self.shm)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.dir.cleanup)
+
+    def dead_pid(self):
+        """A process id nothing is using: a child that has exited and been waited for."""
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def made(self, root, pid, name="ab12.gr"):
+        d = root / f"strata-grammar-{pid}"
+        d.mkdir(parents=True)
+        (d / name).write_text("start: entry_answer_plain", encoding="utf-8")
+        return d
+
+    def test_the_directory_of_a_server_that_is_gone_goes(self):
+        d = self.made(self.shm, self.dead_pid())
+        sweep_grammar_dirs(self.pack)
+        self.assertFalse(d.exists(), "a dead server's files would otherwise stay in memory until a reboot")
+
+    def test_a_server_that_is_running_keeps_its_directory(self):
+        live = self.made(self.shm, os.getpid())                 # this process is alive, like a server on its pack
+        dead = self.made(self.shm, self.dead_pid())
+        sweep_grammar_dirs(self.pack)
+        self.assertTrue(live.exists(), "another server's files are not ours to remove")
+        self.assertFalse(dead.exists())
+
+    def test_the_pack_directory_is_swept_too(self):
+        # Windows, and a Linux host whose /dev/shm has no room: the file is beside the model.
+        d = self.made(self.pack, self.dead_pid())
+        sweep_grammar_dirs(self.pack)
+        self.assertFalse(d.exists())
+
+    def test_a_name_that_is_not_a_pid_is_left_alone(self):
+        d = self.made(self.shm, "not-a-pid")
+        sweep_grammar_dirs(self.pack)
+        self.assertTrue(d.exists(), "only this server's own naming scheme is swept")
+
+
+class Cleanup(unittest.TestCase):
+    """The request's `finally` releases every hold whatever happened, so no file and no hold outlives it (D-046)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.pack = Path(self.dir.name)
+        (self.pack / "vocab.json").write_text("{}", encoding="utf-8")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_a_file_that_will_not_go_does_not_keep_the_next_one_held(self):
+        a = hold_grammar_file(self.pack, "ab12", "start: entry_answer_plain")
+        b = hold_grammar_file(self.pack, "cd34", "start: entry_answer_tools")
+        real = Path.unlink
+
+        def only_a_fails(path, *a_, **kw):
+            if path.name == "ab12.gr":
+                raise PermissionError("held open by something else")
+            return real(path, *a_, **kw)
+
+        with unittest.mock.patch.object(Path, "unlink", only_a_fails):
+            drop_grammar(a)
+            drop_grammar(b)                                      # the second drop still runs
+        self.assertFalse(b.exists(), "a failure on one file must not skip the next file's drop")
+        self.assertNotIn(str(a), server_module._grammar_holds, "a hold that could not be released is not kept")
+
+    def test_a_request_that_fails_before_it_starts_leaves_no_file(self):
+        # `begin_grammar` is inside the request's try, so a failure between writing the file and starting the first
+        # pass still drops it.  The structure reader is the first thing after the file that can throw.
+        svc, engine, tok = service(self.pack)
+        ids = svc.prepare([{"role": "user", "content": "hi"}], None, {"enable_thinking": False})[0]
+        before = set(self.pack.iterdir())
+        with unittest.mock.patch.object(server_module, "StructureParser", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                list(svc.run(ids, False, None, 8, {}, threading.Event()))
+        self.assertEqual(set(self.pack.iterdir()), before, "the file and its pid directory must both be gone")
+        self.assertEqual(server_module._grammar_holds, {}, "and its hold released")
 
 
 if __name__ == "__main__":
