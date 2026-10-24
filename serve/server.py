@@ -1343,11 +1343,12 @@ class StrataEngine:
                                                for k in ik):
             keys += " img_keys=" + ",".join(ik)
         # The request's grammar: a file the server wrote (C1 in tmp/impl-plan/contracts).  The engine reads it at
-        # admission; one that does not know the key skips it and decodes unconstrained.  A path with a space cannot
-        # travel on this line (the key parser ends a token at a space), so it is not sent at all.
+        # admission; one that does not know the key skips it and decodes unconstrained.  Base64, always: the key
+        # parser ends a token at a space, and a model directory with a space in its name (a Windows profile) would
+        # otherwise be dropped here and decode unconstrained with nothing said.
         g = sampling.get("strata_grammar")
-        if isinstance(g, str) and g and " " not in g:
-            keys += " grammar=" + g
+        if isinstance(g, str) and g:
+            keys += " grammar=" + base64.b64encode(g.encode("utf-8")).decode("ascii")
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")

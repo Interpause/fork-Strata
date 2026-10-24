@@ -7,6 +7,7 @@ server compiles nothing, so what these tests are about is the file alone - writt
 need no `tools/build_llguidance.sh`, which is also the state a machine without it is in: the file and the key still
 travel, nothing is constrained (D-020).
 """
+import base64
 import contextlib
 import io
 import json
@@ -40,9 +41,12 @@ class Recorder(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
-def service(pack_dir=None):
+def service(pack_dir=None, reply="</think>\n\nHello."):
     tok = ByteTokenizer()
-    engine = Recorder(tok, "</think>\n\nHello.", max_context=CTX)
+    engine = Recorder(tok, reply, max_context=CTX)
+    # The engine says it compiles a grammar: `begin_grammar` needs `INFO grammar=1` as well as a pipeline (7ee998b5,
+    # D-043), because a file it would strip is a file there is nothing to read the reply with.
+    engine.info = {"grammar": 1} if pack_dir is not None else {}
     svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), pack_dir=pack_dir)
     return svc, engine, tok
 
@@ -56,21 +60,26 @@ def run(svc, tok, thinking=False, tools=None, force=None, sampling=None):
 
 class Key(unittest.TestCase):
     def test_a_grammar_is_one_key_before_the_ids(self):
+        # Base64 always (D-047): the engine decodes it before opening the path.
+        want = base64.b64encode(b"/dev/shm/g/ab12.gr").decode("ascii")
         self.assertEqual(StrataEngine.sampling_keys({"strata_grammar": "/dev/shm/g/ab12.gr"}),
-                         " grammar=/dev/shm/g/ab12.gr")
+                         " grammar=" + want)
 
     def test_no_grammar_is_no_key(self):
         for sampling in ({}, {"strata_grammar": None}, {"strata_grammar": ""}, {"strata_grammar": 7}):
             with self.subTest(sampling=sampling):
                 self.assertEqual(StrataEngine.sampling_keys(sampling), "")
 
-    def test_a_path_with_a_space_is_not_sent(self):
-        # A space ends a key on this line: sending it would turn the rest of the path into the ids.
-        self.assertEqual(StrataEngine.sampling_keys({"strata_grammar": "/a b/c.gr"}), "")
+    def test_a_path_with_a_space_travels(self):
+        # A space ends a key on this line, so an unencoded path with one used to be dropped here and decode
+        # unconstrained with nothing said - every Windows profile under a name with a space (D-047).
+        keys = StrataEngine.sampling_keys({"strata_grammar": "/C:/Users/John Smith/a b.c.gr"})
+        self.assertEqual(keys, " grammar=" + base64.b64encode(b"/C:/Users/John Smith/a b.c.gr").decode("ascii"))
+        self.assertNotIn(" ", keys.strip())
 
     def test_the_key_sits_beside_the_other_keys(self):
         keys = StrataEngine.sampling_keys({"temperature": 0.5, "strata_grammar": "/x/y.gr"})
-        self.assertEqual(keys, " temperature=0.5 grammar=/x/y.gr")
+        self.assertEqual(keys, " temperature=0.5 grammar=" + base64.b64encode(b"/x/y.gr").decode("ascii"))
 
 
 class Capability(unittest.TestCase):
@@ -85,7 +94,8 @@ class Capability(unittest.TestCase):
 
     def test_an_engine_with_grammar_gets_the_key(self):
         self.eng.info = {"grammar": 1}
-        self.assertEqual(self.eng.keys({"strata_grammar": "/dev/shm/g/ab12.gr"}), " grammar=/dev/shm/g/ab12.gr")
+        want = base64.b64encode(b"/dev/shm/g/ab12.gr").decode("ascii")
+        self.assertEqual(self.eng.keys({"strata_grammar": "/dev/shm/g/ab12.gr"}), " grammar=" + want)
 
     def test_an_engine_without_it_gets_the_other_keys_and_no_grammar(self):
         keys = self.eng.keys({"temperature": 0.5, "strata_grammar": "/dev/shm/g/ab12.gr"})
@@ -219,8 +229,10 @@ class Request(unittest.TestCase):
     def test_a_call_the_prompt_already_opened_is_the_mid_call_entry(self):
         # Without thinking the forced opening ends the prompt, so the reply starts inside the call.
         tools = [{"name": "f", "parameters": {"type": "object", "properties": {}}}]   # as the frontend passes them
-        run(self.svc, self.tok, thinking=False, tools=tools, force=FORCE_ANY)
-        self.assertIn("start: entry_call_name", self.engine.calls[0]["text"])
+        # the entry has the "=" and the name still to write, so the reply is that call for the one parameterless tool
+        svc, engine, tok = service(self.pack, reply="=f>\n</function>\n</tool_call>")
+        run(svc, tok, thinking=False, tools=tools, force=FORCE_ANY)
+        self.assertIn("start: entry_call_name", engine.calls[0]["text"])
 
     def test_a_prompt_without_a_template_tail_sends_no_grammar(self):
         # A completion-style prompt: the grammar has no entry for it, so nothing is sent and the reply is unchanged.

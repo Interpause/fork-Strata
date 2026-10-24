@@ -1246,6 +1246,36 @@ static std::string ram_note(const std::optional<strata::core::HostMemoryReading>
     return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
 }
 
+// A request's grammar path travels base64-encoded (`grammar=`), because the key parser ends a token at a space and a
+// model directory can have one in its name (a Windows profile: "C:/Users/John Smith/...").  Always encoded, so there
+// is nothing to negotiate; a value that is not base64 decodes to nothing and the request is refused as unreadable.
+// Standard alphabet, padding optional.
+static std::string base64_decode(const std::string& in) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+' || c == '-') return 62;      // '-' too: urlsafe encoders are common
+        if (c == '/' || c == '_') return 63;      // and '_' likewise
+        return -1;
+    };
+    std::string out;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : in) {
+        if (c == '=') break;
+        const int v = val(c);
+        if (v < 0) return std::string();         // not base64: nothing to open
+        acc = (acc << 6) | (uint32_t) v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char) ((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
@@ -12112,7 +12142,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
-                    else if (key == "grammar") req_grammar = tok.substr(eq + 1);
+                    else if (key == "grammar") req_grammar = base64_decode(tok.substr(eq + 1));
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
