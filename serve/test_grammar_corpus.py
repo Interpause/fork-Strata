@@ -9,8 +9,9 @@ thinking is payload, and only the `<tool_call>` *token* opens a call - which is 
 expectation, not two.
 
 So what this checks is not the old split but the property the split was standing in for: a delimiter spelled as
-characters produces **no structure**, and none of the input is lost on the way.  The text parser's own replay of the
-same file is `serve/test_reasoning_rescue.py`'s `Corpus`, which is what these 37 expectations used to be.
+characters produces **no structure**, and none of the input is lost on the way.  These 37 expectations came
+from the text parser's own replay of the same file; that replay helper was retired with the mechanisms it
+pinned in P6, and the replay now lives here.
 """
 
 import json

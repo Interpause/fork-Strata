@@ -900,15 +900,6 @@ class OutputParser:
                     self._line_parts.append(part)
         return text
 
-    def _opener_ok(self) -> bool:
-        """The reasoning text so far puts a `<tool_call>` at the start of a line, outside a code fence and outside
-        inline code."""
-        return not self.fence and not self.line.strip() and self.ticks % 2 == 0
-
-    def _in_code(self) -> bool:
-        """The text so far leaves the next character inside a code fence or inline code."""
-        return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
-
     def _quoted_think_end(self, i: int) -> bool | None:
         """#537: the `</think>` at self.buf[i] is the model quoting the tag while it thinks, not the end of the
         thinking: written right after a quote or backtick and followed by anything but a line break, as in `</think>`
@@ -1111,12 +1102,8 @@ class OutputParser:
                 if tool >= 0 and (i < 0 or tool < i):
                     if tool:
                         out.append(Event("reasoning", self._track(self.buf[:tool])))
-                    if self._opener_ok():
-                        self.buf = self.buf[tool:]
-                        self.state = "rcall"
-                    else:                            # mid-sentence, in a fence or in inline code: a quote
-                        out.append(Event("reasoning", self._track(CALL_START)))
-                        self.buf = self.buf[tool + len(CALL_START):]
+                    self.buf = self.buf[tool:]
+                    self.state = "rcall"
                     continue
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
@@ -1157,16 +1144,6 @@ class OutputParser:
                         out.append(Event("content", self._track(self.buf[:j])))
                         self.buf = self.buf[j:]
                     return out
-                # #1058: an opener inside a code fence or inline code is text (a quoted example), never a call.  The
-                # text before it decides, so streamed and whole outputs agree.  Mid-sentence openers still count.
-                snap = (self.fence, self.line, self.ticks)
-                self._track(self.buf[:i])
-                in_code = self._in_code()
-                self.fence, self.line, self.ticks = snap
-                if in_code:
-                    out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
-                    self.buf = self.buf[i + len(CALL_START):]
-                    continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
