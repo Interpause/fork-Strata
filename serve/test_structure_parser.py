@@ -260,14 +260,14 @@ class Impossible(unittest.TestCase):
 
     def test_a_delimiter_inside_the_thinking_is_refused_not_rescued(self):
         """Rows 13, 22 and 50: a `<tool_call>` token cannot arrive in the thinking (THINK_BODY is a text terminal),
-        so there is no call to hold, stream early, release after N bytes, or count.  The text parser has `rcall`,
-        `RCALL_MAX` and a pending list for exactly this shape."""
+        so there is no call to hold, stream early, release after N bytes, or count.  The text parser
+        reports exactly this shape as reasoning text instead."""
         with self.assertRaises(dec.StructureError) as caught:
             feeds(["I could call ", Special("<tool_call>")], "entry_think_tools")
         self.assertIn("'think'", str(caught.exception))
 
     def test_a_thinking_reply_has_nothing_to_rescue(self):
-        """Row 50: the server logs `tool_calls_from_reasoning` from these two counts, which are zero by
+        """Row 50: the server reads these two counts to report rescued calls, and they are zero by
         construction here rather than by a rule."""
         events, parser = events_of(["Thinking.", Special("</think>"), "\n\n"] + call(), "entry_think_tools")
         self.assertEqual([e.kind for e in events if e.kind == "tool_call"], ["tool_call"])
@@ -332,7 +332,7 @@ class Impossible(unittest.TestCase):
 
     def test_the_reason_the_turn_ended_changes_no_event(self):
         """Failure 8: `finish(reason)` takes the reason and ignores it.  A finish reason derived from the text
-        (`RCALL_MAX`, a repeat count) has no place here: a reply cut short is reported as the grammar left it."""
+        (a held-call byte count) has no place here: a reply cut short is reported as the grammar left it."""
         cut = [Special("<tool_call>"),
                "\n<function=get_weather>\n<parameter=city>\nParis\n</para"]     # the closer is still arriving
         for reason in (None, "stop", "length", "cancel"):

@@ -1,7 +1,7 @@
-"""serve/test_reasoning_tools.py - #804 (strict form of PR #787): a tool call the model writes inside its reasoning.
+"""serve/test_reasoning_tools.py - a `<tool_call>` written inside the reasoning is reasoning text, never a call.
 
-A call inside the reasoning counts only when tools are declared and the name is one of them; anything else stays
-reasoning text.  Without tools the parser is byte-identical to before.
+There is no rescue: the text parser reports those bytes as reasoning and never reports a call from them.  A call
+written in the answer is unchanged.
 
     python -m unittest serve.test_reasoning_tools -v
 """
@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import sys
 import unittest
-import unittest.mock
 import urllib.request
 from pathlib import Path
 
@@ -38,18 +37,6 @@ def joined(evs, kind):
 
 
 class Parser(unittest.TestCase):
-    def test_a_declared_call_in_the_reasoning_is_a_call(self):
-        text = "before\n" + CALL + "\n</think>\n\nanswer"      # at a line start, nothing but whitespace after it (#1058)
-        for width in (1, 2, 7, 100_000):
-            with self.subTest(width=width):
-                evs = run(text, width)
-                calls = [e.call for e in evs if e.kind == "tool_call"]
-                self.assertEqual([(c.name, c.arguments) for c in calls],
-                                 [("read_file", {"limit": 120, "path": "file.txt"})])
-                self.assertEqual(joined(evs, "reasoning"), "before\n")
-                self.assertEqual(joined(evs, "content"), "answer")
-                self.assertFalse([e for e in evs if e.kind in ("tool_start", "tool_args")])   # never streamed
-
     def test_an_undeclared_name_stays_reasoning(self):
         text = "see " + OTHER + " done</think>\n\nanswer"
         for width in (1, 5, 100_000):
@@ -94,16 +81,6 @@ class Parser(unittest.TestCase):
             self.assertEqual(len([e for e in evs if e.kind == "tool_call"]), 1)
             self.assertEqual(joined(evs, "reasoning"), "think")
 
-    def test_a_tag_that_never_closes_does_not_hold_the_thinking_back(self):
-        from serve import frontend
-        text = "a\n<tool_call> " + "thinking on and on " * 3000 + "</think>\n\nanswer"
-        with unittest.mock.patch.object(frontend, "RCALL_MAX", 1000):
-            evs = run(text, 50)
-        first_reasoning_at = next(i for i, e in enumerate(evs) if e.kind == "reasoning" and len(e.text) > 100)
-        self.assertLess(first_reasoning_at, 100)                     # streamed, not kept until </think>
-        self.assertEqual(joined(evs, "reasoning"), text.split("</think>")[0])
-        self.assertEqual(joined(evs, "content"), "answer")
-
     def test_a_partial_tag_is_held(self):
         p = OutputParser(thinking=True, tools=TOOLS)
         evs = p.feed("hello <tool_c")
@@ -111,53 +88,12 @@ class Parser(unittest.TestCase):
         self.assertEqual(joined(p.feed("ats are nice</think>"), "reasoning"), "<tool_cats are nice")
 
 
-class QuotedThinkEnd(unittest.TestCase):
-    """#537: a `</think>` the model quotes while it thinks - right after a quote or backtick, with no line break after
-    it - is reasoning text; the end of the thinking is still a `</think>` with a line break after it."""
-
-    def test_a_quoted_tag_stays_reasoning(self):
-        for quote in ("in rcall, `</think>` could arrive inside the held body",
-                      'the mock engine returns "</think>\\n\\n2", no tool call',
-                      '```python\ntext = ("</think>\\n\\nI will use the tag now.")\n```',
-                      "split it on '</think>' first"):
-            text = "plan\n" + quote + "\ndone\n</think>\n\nanswer"
-            for width in (1, 7, 100_000):
-                with self.subTest(quote=quote[:24], width=width):
-                    evs = run(text, width)
-                    self.assertEqual(joined(evs, "reasoning"), "plan\n" + quote + "\ndone\n")
-                    self.assertEqual(joined(evs, "content"), "answer")
-
-    def test_a_call_quoted_after_it_is_not_run(self):
-        text = ('it returns "</think>\\n\\n2" here.\nThe call looks like this:\n' + CALL + " in the answer.\n"
-                "</think>\n\n" + CALL)
-        for width in (1, 7, 100_000):
-            with self.subTest(width=width):
-                evs = run(text, width)
-                self.assertEqual(len([e for e in evs if e.kind == "tool_call"]), 1)      # the answer's own call
-                self.assertIn(CALL + " in the answer.", joined(evs, "reasoning"))
-                self.assertEqual(joined(evs, "content"), "")
-
-    def test_the_end_after_a_quote_still_ends_the_thinking(self):
-        for thought in ('she said "yes"', "it is `x`", "it is 'x'"):
-            for width in (1, 100_000):
-                with self.subTest(thought=thought, width=width):
-                    evs = run(thought + "</think>\n\nanswer", width)
-                    self.assertEqual(joined(evs, "reasoning"), thought)
-                    self.assertEqual(joined(evs, "content"), "answer")
-
-    def test_an_output_that_ends_on_the_tag(self):
-        for width in (1, 100_000):
-            evs = run('say "</think>', width)
-            self.assertEqual(joined(evs, "reasoning"), 'say "')
-            self.assertEqual(joined(evs, "content"), "")
-
-
 class OverHttp(unittest.TestCase):
     def test_finish_reasons_and_block_order(self):
         helper = UnfinishedToolCall("test_parser")
         helper.PROPS = {"path": {"type": "string"}}
-        script = "Let me look.\n<tool_call>\n<function=write>\n<parameter=path>\nfile.txt\n</parameter>\n</function>\n" \
-                 "</tool_call>\n</think>\n\ndone"
+        script = "Let me look.\n</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\nfile.txt\n" \
+                 "</parameter>\n</function>\n</tool_call>\n\ndone"
         a = helper.answers(script)
         self.assertEqual((a["openai", False][0], [json.loads(x) for x in a["openai", False][1]]),
                          ("tool_calls", [{"path": "file.txt"}]))

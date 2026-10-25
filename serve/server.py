@@ -4717,7 +4717,7 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
-                                thinking_n += parser.state in ("reasoning", "rcall")
+                                thinking_n += parser.state == "reasoning"
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
@@ -4743,7 +4743,7 @@ class Service:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
                                 if (self.reasoning_loop_recovery and not recovery_count and parser.state == "reasoning"
-                                        and n >= next_loop_check and not parser.buf and not parser.pending
+                                        and n >= next_loop_check and not parser.buf
                                         and not detok.pending()):
                                     next_loop_check = n + LOOP_CHECK_EVERY
                                     repeat_coverage = reasoning_repeat_coverage(reasoning_text)
@@ -4899,7 +4899,7 @@ class Service:
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
-                            thinking_n += parser.state in ("reasoning", "rcall")
+                            thinking_n += parser.state == "reasoning"
                             evs = cut(feed(t, detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
@@ -4982,7 +4982,7 @@ class Service:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                            if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
+                            if finish == "length" and parser.state == "reasoning":   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
@@ -5009,10 +5009,6 @@ class Service:
                 drop_grammar(g)                         # cannot raise, so both files are always released
         for ev in cut(parser.finish(finish)):
             yield "event", ev
-        if parser.rescued or parser.refused:
-            self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
-            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
-                  f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
