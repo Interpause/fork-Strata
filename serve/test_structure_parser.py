@@ -1,22 +1,27 @@
-"""The grammar's structure reported as the API's events, against the text parser that reports them today.
+"""The grammar's structure reported as the API's events, from the structured reader alone.
 
     python -m unittest serve.test_structure_parser -v
 
 No library and no pack: `StructureParser` takes (token id, text) pairs and decides structure from the grammar's
-labels, which are built from the request's tools.  The two things checked here are:
+labels, which are built from the request's tools.  The things checked here are:
 
-* **Parity with `OutputParser`.**  A reply the grammar can produce is reported the same way by both, event for event
-  and argument for argument, so swapping the reader changes nothing a client sees.  This is the check that lets the
-  decoder take over the constrained path.
-* **The differences that are the point.**  A reply the grammar cannot produce is where the two disagree, and each
-  disagreement is a case the text parser has to guess at: a spelled delimiter, a fence, a value holding a
-  ``</parameter>``, a call that never closed.
+* **The structured reader's own report.**  The kinds, the text, each call's name and arguments, and the JSON
+  streamed for those arguments - what a client is told, stated as literal expectations.
+* **The split-invariance property.**  How the reply was cut into tokens is not something a client can tell: every
+  piece boundary gives one shape (`Split`).
+* **The replies the grammar cannot produce.**  A spelled delimiter, a fence, a value holding a
+  ``</parameter>``, a call that never closed: each is a case the text parser had to guess at, and the structured
+  reader reports what the grammar left instead (`Impossible`).
+
+The text reader, `OutputParser`, was the reference until P6.  It no longer reports tool calls at all - a
+`<tool_call>` in a reply it reads reaches the client as the text it is - so the event-by-event parity comparison it
+supported was retired rather than re-pointed at something else.
 """
 
 import json
 import unittest
 
-from serve.frontend import Event, OutputParser, StructureParser, ToolCall
+from serve.frontend import Event, StructureParser
 from serve.grammar import decode as dec
 from serve.grammar import guard
 
@@ -39,8 +44,8 @@ class Special:
 
 
 def text_of(parts) -> str:
-    """What the text parser is fed.  The end-of-turn token is not in it: it is a stop id, so the server breaks
-    before feeding it (see Service._run), and the text parser never sees it either."""
+    """The reply as bytes, every delimiter spelled: what the same reply would be with no id to mark it.  The
+    end-of-turn token is left out because it is a stop id, so neither reader is ever fed it (see Service._run)."""
     return "".join(p.name if isinstance(p, Special) else p for p in parts
                    if not (isinstance(p, Special) and p.name == "<|im_end|>"))
 
@@ -72,7 +77,7 @@ def merge(events):
 
 def shape(events):
     """What a client can tell: the kinds and text, each call's name and arguments, and where its JSON streamed.
-    A call's id is renamed in order of appearance, so the two parsers' random ids can be compared."""
+    A call's id is renamed in order of appearance, so shapes from two runs can be compared without sharing ids."""
     out, args, calls, index = [], {}, {}, {}
 
     def cid(call):
@@ -91,19 +96,6 @@ def shape(events):
     return out, args, calls
 
 
-def both(parts, entry, thinking=True, size=0):
-    """The same reply through both parsers: (text parser's shape, structure parser's shape)."""
-    want = OutputParser(thinking=thinking, tools=TOOLS, stream_tools=True)
-    text = text_of(parts)
-    want_events = merge(want.feed(text) + want.finish())
-    got = StructureParser(entry, TOOLS)
-    got_events = []
-    for tid, piece in tokens(parts, size):
-        got_events += got.feed(tid, piece)
-    got_events += got.finish()
-    return shape(want_events), shape(got_events)
-
-
 def call(name="get_weather", params=(("city", "Paris"), ("days", "3")), close=True):
     parts = [Special("<tool_call>"), "\n<function=", f"{name}>\n"]
     for pname, value in params:
@@ -114,60 +106,28 @@ def call(name="get_weather", params=(("city", "Paris"), ("days", "3")), close=Tr
     return parts
 
 
-class Parity(unittest.TestCase):
-    """A reply the grammar can produce: both parsers must report it identically."""
-
-    def assertSame(self, parts, entry="entry_answer_tools", thinking=True):
-        want, got = both(parts, entry, thinking)
-        self.assertEqual(got[0], want[0], "the events differ")
-        self.assertEqual(got[2], want[2], "the calls differ")
-        for cid, streamed in got[1].items():
-            self.assertEqual(json.loads(streamed), got[2][cid][1], "the streamed JSON is not the call's arguments")
-        return got
-
-    def test_prose_then_a_call(self):
-        self.assertSame(["Checking ", "the weather.", "\n\n"] + call() + [Special("<|im_end|>")], thinking=False)
-
-    def test_a_call_at_byte_zero(self):
-        self.assertSame(call() + [Special("<|im_end|>")], entry="entry_answer_tools", thinking=False)
-
-    def test_two_calls_in_one_turn(self):
-        self.assertSame(call() + ["\n"] + call(params=(("city", "Oslo"), ("days", "1")))
-                        + [Special("<|im_end|>")], thinking=False)
-
-    def test_a_thinking_reply(self):
-        self.assertSame(["\nLet me think.\n", Special("</think>"), "\n\n", "Answer.", Special("<|im_end|>")],
-                        entry="entry_think_tools")
-
-    def test_a_call_missing_only_its_closing_token_is_still_whole(self):
-        # The body ended; only the wrapper's closing token did not arrive.  Its arguments are complete, so the call
-        # is delivered - the shape the text parser has always accepted (`UnfinishedToolCall`).
-        self.assertSame(["", Special("<tool_call>"), "\n<function=", "list_files>\n", "</function>\n"],
-                        thinking=False)
-
-    def test_a_call_with_no_parameters(self):
-        self.assertSame(["", Special("<tool_call>"), "\n<function=", "list_files>\n", "</function>\n",
-                         Special("</tool_call>"), Special("<|im_end|>")], thinking=False)
-
-    def test_a_plain_answer_with_no_tools(self):
-        self.assertSame(["just prose", Special("<|im_end|>")], entry="entry_answer_plain", thinking=False)
-
-    def test_a_value_the_schema_does_not_call_a_string(self):
-        # `days` is an integer: both parsers hand the client the JSON number, not the bytes.
-        got = self.assertSame(call(params=(("city", "Paris"), ("days", "3"))) + [Special("<|im_end|>")],
-                              thinking=False)
-        self.assertEqual(got[2][next(iter(got[2]))][1], {"city": "Paris", "days": 3})
+class Split(unittest.TestCase):
+    """How the reply was cut into tokens is not something a client can tell: every piece boundary gives one shape."""
 
     def test_the_split_of_the_tokens_does_not_change_anything(self):
-        parts = ["Checking the weather.", "\n\n"] + call() + [Special("<|im_end|>")]
-        want = both(parts, "entry_answer_tools")[1]
-        for size in (1, 2, 3, 5, 7, 13):
+        parts = (["Checking the weather.", "\n\n"] + call()
+                 + ["\n"] + call(params=(("city", "Oslo"), ("days", "1"))) + [Special("<|im_end|>")])
+        want = None
+        for size in (0, 1, 2, 3, 5, 8, 13):
             with self.subTest(size=size):
-                self.assertEqual(both(parts, "entry_answer_tools", size=size)[1], want)
+                parser = StructureParser("entry_answer_tools", TOOLS)
+                events = []
+                for tid, piece in tokens(parts, size):
+                    events += parser.feed(tid, piece)
+                events += parser.finish()
+                if want is None:
+                    want = shape(events)          # size=0: one token per part, the reference
+                self.assertEqual(shape(events), want)
 
 
 class Differences(unittest.TestCase):
-    """Where the two disagree, and why the grammar's answer is the one to trust."""
+    """What the structured reader reports where the text parser had to guess, and why the grammar's answer is the
+    one to trust."""
 
     def structure(self, parts, entry="entry_answer_tools", thinking=True):
         got = StructureParser(entry, TOOLS)
@@ -182,7 +142,7 @@ class Differences(unittest.TestCase):
         self.assertEqual(got[2][next(iter(got[2]))][1], {"city": value})
 
     def test_a_fenced_call_is_prose_because_its_delimiters_are_not_tokens(self):
-        # The fence tracker exists in the text parser to make this guess; here the delimiters are simply not ids.
+        # There is no fence tracker left to make this guess: the delimiters are simply not ids.
         fenced = "```\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call>\n```"
         got = self.structure([fenced, Special("<|im_end|>")], thinking=False)
         self.assertEqual([k for k, *_ in got[0]], ["content"])
@@ -225,8 +185,8 @@ def feeds(parts, entry, tools=None):
 class Impossible(unittest.TestCase):
     """A reply the grammar cannot produce, and what the parser does with it (p5.md C2's failures).
 
-    Each test is one situation the text parser decides by looking at the bytes and the decoder cannot reach at all,
-    so what matters is not that it behaves *well* but that the decision has no counterpart to disagree with: the
+    Each test is one situation the text parser had to decide by looking at the bytes and the decoder cannot reach at
+    all, so what matters is not that it behaves *well* but that the decision has no counterpart to disagree with: the
     bytes are prose, or the delimiter is in a state that does not take it, and the parser says so instead of
     guessing.  The mask makes the impossible ones unsamplable (`test_grammar_matcher`); these are the same cases one
     layer up, where a client would see the difference.
@@ -260,8 +220,8 @@ class Impossible(unittest.TestCase):
 
     def test_a_delimiter_inside_the_thinking_is_refused_not_rescued(self):
         """Rows 13, 22 and 50: a `<tool_call>` token cannot arrive in the thinking (THINK_BODY is a text terminal),
-        so there is no call to hold, stream early, release after N bytes, or count.  The text parser
-        reports exactly this shape as reasoning text instead."""
+        so there is no call to hold, stream early, release after N bytes, or count.  Nothing is rescued on the text
+        route either: it reports no calls at all (P6)."""
         with self.assertRaises(dec.StructureError) as caught:
             feeds(["I could call ", Special("<tool_call>")], "entry_think_tools")
         self.assertIn("'think'", str(caught.exception))
@@ -296,17 +256,16 @@ class Impossible(unittest.TestCase):
         self.assertIn("get_weather", events[0].text)
 
     def test_an_opener_in_fences_or_inline_code_is_prose(self):
-        """Failure 1 and rows 10, 27: a fence or a backtick has no structural meaning, so the text parser's fence and
-        inline-code trackers have nothing to do here - and the two agree, because the delimiters were never tokens."""
+        """Failure 1 and rows 10, 27: a fence or a backtick has no structural meaning, and the delimiters were never
+        tokens, so the reply is reasoning text and nothing else - there is no fence tracker here to keep in step."""
         for text in ("```\n" + text_of(call()) + "\n```\n",
                      "Use `<tool_call>` then `<function=get_weather>` in your note.",
                      "I'll open a <tool_call> block, it is how calls look."):
             with self.subTest(text=text):
                 events, _ = events_of([text], "entry_think_tools")
                 self.assertEqual([e.kind for e in merge(events) if e.kind != "reasoning"], [])
-                want = OutputParser(thinking=True, tools=TOOLS, stream_tools=True)
-                self.assertEqual(merge(events), merge(want.feed(text) + want.finish()),
-                                 "the two readers report a quoted call the same way")
+                self.assertEqual("".join(e.text for e in events if e.kind == "reasoning"), text,
+                                 "the bytes are the reply, in the reasoning")
 
     def test_no_text_event_carries_the_call(self):
         """Failure 7: the call's bytes are its arguments, never also content or reasoning."""
@@ -322,7 +281,7 @@ class Impossible(unittest.TestCase):
     def test_a_reply_with_no_structure_keeps_its_bytes(self):
         """Failure 9: for a reply with no structure, the events are the reply - the same bytes, in the same kinds,
         which is why the constrained path cannot change what a client reads.  A literal expectation, not a
-        comparison with the text parser, so the two cannot drift together."""
+        comparison with another reader, so nothing can drift along with it."""
         events, _ = events_of(["Paris is the capital of France."], "entry_answer_plain", tools=[])
         self.assertEqual([(e.kind, e.text) for e in events],
                          [("content", "Paris is the capital of France.")])
