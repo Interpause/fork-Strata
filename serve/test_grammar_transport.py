@@ -111,8 +111,9 @@ class Capability(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.eng.keys({"strata_grammar": "/a.gr"})
             self.eng.keys({"strata_grammar": "/b.gr"})
-        self.assertEqual(out.getvalue().count("decodes without a grammar"), 1)
+        self.assertEqual(out.getvalue().count("[strata] WARNING:"), 1)
         self.assertIn("no grammar=1", out.getvalue())
+        self.assertIn("Unsafe", out.getvalue())
 
     def test_a_request_without_a_grammar_says_nothing(self):
         out = io.StringIO()
@@ -238,6 +239,20 @@ class Request(unittest.TestCase):
         svc, engine, tok = service(self.pack, reply="=f>\n</function>\n</tool_call>")
         run(svc, tok, thinking=False, tools=tools, force=FORCE_ANY)
         self.assertIn("start: entry_call_name", engine.calls[0]["text"])
+
+    def test_the_unconstrained_line_is_said_once_and_calls_the_reply_unsafe(self):
+        # D-050: one line per process, and it says the text reader is unprotected - not merely "unconstrained".
+        Service._unconstrained_said = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.svc.grammar_note("first reason")
+            self.svc.grammar_note("second reason")
+        said = out.getvalue()
+        self.assertEqual(said.count("[strata] WARNING:"), 1)
+        self.assertIn("first reason", said)
+        self.assertIn("Unsafe", said)
+        self.assertIn("D-050", said)
+        self.assertEqual(self.svc.grammar_notes, {"first reason", "second reason"})
 
     def test_a_prompt_without_a_template_tail_sends_no_grammar(self):
         # A completion-style prompt: the grammar has no entry for it, so nothing is sent and the reply is unchanged.

@@ -1312,7 +1312,9 @@ class StrataEngine:
             if not StrataEngine._no_grammar_said:
                 StrataEngine._no_grammar_said = True
                 print("[strata] WARNING: the engine reported no grammar=1 in its INFO line (no tokenizer was "
-                      "loaded for it): this reply decodes without a grammar (P7 makes this an error)", flush=True)
+                      "loaded for it): this reply is read by the text parser, which has no fence, rescue or "
+                      "partial-tag rule left (D-050), so a delimiter it spells can be taken as a call. Unsafe "
+                      "until P7 makes this an error", flush=True)
         return self.sampling_keys(sampling)
 
     @staticmethod
@@ -3279,6 +3281,8 @@ def common_opening(openings: list[list[int]]) -> tuple[list[int], list[list[int]
 
 
 class Service:
+    _unconstrained_said = False          # the one line about a reply no grammar constrained (D-050)
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, pack_dir: Path | None = None):
@@ -3291,7 +3295,7 @@ class Service:
         self.pipeline = grammar_pipeline.Pipeline(tokenizer) if pack_dir is not None else None
         if self.pack_dir is not None:
             sweep_grammar_dirs(self.pack_dir)         # the pid directories of servers that are gone
-        self.grammar_notes: set[str] = set()          # a grammar problem is said once, not once per request
+        self.grammar_notes: set[str] = set()          # every reason a reply got no grammar (D-050 says one out loud)
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -4428,11 +4432,17 @@ class Service:
         return str(path), grammar.entry
 
     def grammar_note(self, why: str) -> None:
-        """Say a grammar problem once per kind: a prompt that is not from this template fails on every request."""
+        """Record every reason a reply got no grammar, and say the first one once per process: a prompt that is not
+        from this template fails on every request, and the reply it produces is the unprotected one (D-050)."""
         if why in self.grammar_notes or len(self.grammar_notes) >= 32:
             return
         self.grammar_notes.add(why)
-        print(f"[strata] WARNING: {why}; this reply decodes without a grammar (P7 makes this an error)", flush=True)
+        if Service._unconstrained_said:
+            return
+        Service._unconstrained_said = True
+        print(f"[strata] WARNING: {why}; this reply is read by the text parser, which has no fence, rescue or "
+              f"partial-tag rule left (D-050), so a delimiter it spells can be taken as a call. Unsafe until P7 "
+              f"makes this an error", flush=True)
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
