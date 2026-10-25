@@ -57,9 +57,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (FORCE_ANY, FORCE_ANY_HEAD, THINK_END, ChatTemplate, Event, OutputParser,
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser,
                             StructureParser,  # noqa: E402
-                            anthropic_to_messages, forced_call, images_of, literal_tags, mark_think_literals,
+                            anthropic_to_messages, forced_choice, images_of, literal_tags, mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -280,9 +280,6 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 # low-effort instruction in place of the xhigh one.  Both off by default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
-# tool_choice "required" / "any" with several tools: the bias on the tokens that go on with an offered tool's name
-# while the server picks it (Service.call_opening); every other token stays where it was, so none can win
-NAME_BIAS = 100.0
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
@@ -3270,16 +3267,6 @@ def slot_save_dir(value, base: str | None = None) -> str:
     return path
 
 
-def common_opening(openings: list[list[int]]) -> tuple[list[int], list[list[int]] | None]:
-    """Token sequences (each tool's call opening) -> (the ids they all go on with, what is left of each after them).
-    None in place of the rest: one opening is complete, nothing is left to choose."""
-    common = []
-    while openings and all(openings) and len({o[0] for o in openings}) == 1:
-        common.append(openings[0][0])
-        openings = [o[1:] for o in openings]
-    return common, (openings if openings and all(openings) else None)
-
-
 class Service:
     _unconstrained_said = False          # the one line about a reply no grammar constrained (D-050)
 
@@ -4089,18 +4076,6 @@ class Service:
         return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
             self.tok.encode(prompt, parse_special=True)
 
-    def call_opening(self, force, tools) -> tuple[list[int], list[list[int]] | None]:
-        """`force` (forced_call) -> (the ids that open the call, the openings still to choose from or None).  A
-        named call is written whole.  FORCE_ANY ("required" / "any" with several tools): each offered tool's
-        whole opening `<tool_call>\n<function=NAME>\n` is tokenized as the model would write it; their common start
-        opens the call, and Service.run writes the rest one token at a time, choosing only among the tokens that go
-        on with one of these openings - so the call can only name an offered tool.  Before, the model wrote the name
-        itself after `<function=` and often made one up (`call`, with the real name inside its arguments)."""
-        if force != FORCE_ANY:
-            return self.tok.encode(force, parse_special=True), None
-        names = dict.fromkeys(t["name"] for t in tools or [] if isinstance(t, dict) and isinstance(t.get("name"), str))
-        return common_opening([self.tok.encode(f"{force}{name}>\n", parse_special=True) for name in names])
-
     def grammar_ready(self) -> bool:
         """A grammar can be built for this request and the engine will compile it.
 
@@ -4111,57 +4086,19 @@ class Service:
         info = getattr(self.engine, "info", None) or {}
         return self.pipeline is not None and info.get("grammar") == 1
 
-    def forced_opening(self, force, tools, after_thinking=False) -> tuple[list[int], list[list[int]] | None]:
-        """`call_opening`, short of the name when a grammar writes it.
-
-        FORCE_ANY ("required" with several tools) used to stop the prompt at the longest token prefix the offered
-        openings share, and then write the rest of the name token by token.  With a grammar that is both redundant and
-        wrong: `entry_call_name` is `"=" tool_dispatch ...` and `tool_dispatch` offers only the declared tools, so the
-        name cannot come out undeclared - while the token prefix can stop inside a name (`<function=get`), a tail no
-        entry resolves, so the request quietly decoded unconstrained (`tmp/p5-c2/verify-a.out`).  So the prompt ends
-        at `<function` and the reply writes `=NAME>`, which is the entry's own first tokens.
-
-        Without a grammar the choosing stays: it is the only thing keeping an invented name out of the call there.
-
-        `after_thinking` is that same choosing for a call a budget or `tool_choice` writes once the thinking is over:
-        the opening goes into the prompt mid-request, where the engine's matcher never sees it, so the pass that
-        follows can only close the thinking (`tmp/p5-c2/FAIL-check3.txt`: `</function>\n</think>` where
-        `</tool_call>` belongs, and the text reader is the lenient one that reads past it - D-044).
-        """
-        if force == FORCE_ANY and not after_thinking and self.grammar_ready():
-            return self.tok.encode(FORCE_ANY_HEAD, parse_special=True), None
-        return self.call_opening(force, tools)
-
     def grammar_tools(self, force, tools):
         """The tools the grammar offers: the one a named `tool_choice` forces, or all of them.
 
         A grammar's `tool_dispatch` (behind `entry_call_name` and behind the answer of `entry_*_tools_required`)
         offers every tool it was built with, so a named `tool_choice` has to narrow the fragment or it would accept
         any declared tool - OpenAI's words for that form are "forces the model to call that tool".  `force` is
-        `frontend.forced_call`'s text: `FORCE_ANY` for "required", else that head plus `NAME>\n`.
+        `frontend.forced_choice`'s value: ("required", None) to call any of them, ("named", NAME) for one.
         """
-        if isinstance(force, str) and force and force != FORCE_ANY and force.startswith(FORCE_ANY):
-            wanted = force[len(FORCE_ANY):].removesuffix(">\n")
-            named = [t for t in tools or [] if isinstance(t, dict) and t.get("name") == wanted]
+        if force and force[0] == "named":
+            named = [t for t in tools or [] if isinstance(t, dict) and t.get("name") == force[1]]
             if named:
                 return named
         return tools
-
-    def can_bias(self) -> bool:
-        """The engine takes a request's logit_bias (see logit_bias.validate_request)."""
-        info = getattr(self.engine, "info", None) or {}
-        return info.get("logit_bias") == 1 and not getattr(self.engine, "batch", 0)
-
-    def closest_token(self, t, allowed) -> int:
-        """The token of `allowed` (in the tools' order) whose text starts most like token `t`'s: what a name is
-        continued with when the engine wrote a token none of the offered names go on with (an engine without
-        logit_bias, see Service.run)."""
-        said = self.tok.decode([t]).strip().lower()
-
-        def shared(a):
-            text = self.tok.decode([a]).strip().lower()
-            return next((k for k, (x, y) in enumerate(zip(text, said)) if x != y), min(len(text), len(said)))
-        return max(allowed, key=shared)
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -4216,14 +4153,12 @@ class Service:
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
-        prompt; with thinking, Service.run writes it once the thinking is over."""
+        the rest of the context.  `force` is `frontend.forced_choice`'s value, and only reaches the grammar: nothing
+        is written into the prompt for it."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.forced_opening(force, tools)[0]
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -4396,14 +4331,16 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
-    def begin_grammar(self, ids, tools, force, sampling):
+    def begin_grammar(self, ids, tools, required, sampling):
         """-> (the file the engine reads, the entry rule it was built for), or None.
 
         The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
         written to be read back at once and deleted in run()'s `finally`, and writing it this close to the engine call
-        is what keeps it from outliving the request.  `force` (a tool_choice that requires a call) drops the
+        is what keeps it from outliving the request.  `required` (a tool_choice that requires a call) drops the
         prose-only branch; with thinking on it is the only thing that says so, since the prompt still ends at the
-        reasoning tail.
+        reasoning tail.  Nothing is written into the prompt for it: with a grammar the entry already offers the call,
+        and a token prefix inside a name (`<function=get`) is a tail no entry resolves, so the request quietly
+        decoded unconstrained (D-044).
 
         Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
         all there is to return (D-038).
@@ -4420,7 +4357,7 @@ class Service:
         try:
             grammar = self.pipeline.for_request(ids, tools=tools,
                                                schema=format_schema((sampling or {}).get("response_format")),
-                                               required=force is not None)
+                                               required=required)
         except Exception as e:                  # noqa: BLE001 - a grammar never fails a request in this phase
             self.grammar_note(f"{type(e).__name__}: {e}")
             return None
@@ -4496,7 +4433,7 @@ class Service:
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` is `frontend.forced_choice`'s value, read only by grammar_tools and begin_grammar."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -4547,13 +4484,7 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
-        forced = []                                     # without thinking the prompt ends with the forced opening:
-        naming = None                                   # the parser reads it as if the model had written it
-        opening: list[Event] = []                       # (naming: the offered names' openings still to choose from)
-        if force and not thinking:
-            forced, naming = self.forced_opening(force, tools)
-            force = None
-        tail = ""                                       # the last characters written (the newlines before a call)
+        opening: list[Event] = []
         answered = False                                # content or a call came out
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -4565,7 +4496,7 @@ class Service:
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         forced_required = force is not None            # D-045: a continuation keeps the request's tool_choice
-        gtools = self.grammar_tools(force, tools)   # before `force` is cleared below: it decides the fragment
+        gtools = self.grammar_tools(force, tools)   # a named tool_choice narrows the fragment (D-053)
         gfiles = []                                     # the request's grammar files, dropped in the finally
         try:
             grammar = self.begin_grammar(ids, gtools, force, sampling)
@@ -4580,10 +4511,6 @@ class Service:
             if structured:
                 parser = StructureParser(gentry, gtools)
                 opening = parser.opening()
-                for t in forced:                            # prompt bytes, not output: the detokenizer still sees them
-                    detok.push(t)
-            else:
-                opening = [ev for t in forced for ev in parser.feed(detok.push(t))]
 
             def feed(t, piece):
                 """One generated token into whichever parser is reading: the grammar's needs the id, the text parser
@@ -4674,19 +4601,12 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        pass_new, pass_sampling, allowed, chosen = max_new - n, sampling, None, None
-                        if naming is not None:      # one token, of those that go on with an offered tool's name
-                            allowed, pass_new = list(dict.fromkeys(o[0] for o in naming)), 1
-                            if self.can_bias():
-                                pass_sampling = {**(sampling or {}), "logit_bias": {
-                                    **bias_api.normalize((sampling or {}).get("logit_bias")),
-                                    **dict.fromkeys(allowed, NAME_BIAS)}}
+                        pass_new, pass_sampling = max_new - n, sampling
                         gen = self.engine.generate(prompt, pass_new, pass_sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, pass_new, pass_sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
-                        opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             # A value the frontend holds back (a tool call's array or object argument is sent
                             # whole, once complete) can keep the stream silent for minutes while tokens are
@@ -4703,15 +4623,7 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
-                                if allowed is not None and t not in allowed:
-                                    print("[strata] tool_choice: the engine began a name no offered tool has (it "
-                                          "cannot bias tokens): the closest offered name is written", flush=True)
-                                    t = self.closest_token(t, allowed)
                                 if t in self.stop_ids:
-                                    if force and not structured and parser.state == "reasoning" \
-                                            and parser.buf == THINK_END:
-                                        opens = True    # #537: the held </think> was the end: the call opens there
-                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -4724,7 +4636,6 @@ class Service:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
-                                tail = (tail + piece)[-2:]
                                 evs = cut(feed(t, piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
@@ -4761,20 +4672,6 @@ class Service:
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
                                         break
-                                if force and not structured:
-                                    # A grammar writes the reply whole (`answer_tools_required` is
-                                    # `tool_calls <|im_end|>`), so there is no opening for the prompt to carry and no
-                                    # pass boundary here: a second pass restarts the engine's matcher at the entry,
-                                    # which is `thinking` again, and `THINK_BODY` would take the rest of the reply as
-                                    # reasoning (D-044).
-                                    if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
-                                        force = None    # the model is writing a call of its own
-                                    elif parser.state == "content" and not parser.buf and not detok.pending():
-                                        opens = True
-                                        break
-                                if allowed is not None:
-                                    chosen = t
-                                    break
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -4843,59 +4740,28 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if chosen is not None and not cancel.is_set():
-                            # the name goes on with the chosen token: what all the openings left share is written
-                            # as it is, up to the next choice or the end of the opening (`>` and the newline)
-                            extra, naming = common_opening([o[1:] for o in naming if o[0] == chosen])
-                            if max_new - n - len(extra) < 1:
-                                break                   # no room for the call's arguments: "length"
-                            for t in extra:
-                                n += 1
-                                raw_ids.append(t)
-                                evs = cut(feed(t, detok.push(t)))
-                                self._note(n, evs, st, rate)
-                                for ev in evs:
-                                    yield "event", ev
-                            prompt = prompt + seg + extra
-                            continue
-                        if not (wrap or opens) or cancel.is_set():
+                        if not wrap or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
-                        # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
-                        # thinking ended, after the blank line the template puts before a call.
-                        if wrap:
-                            budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP
-                        else:
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n"))))
-                        extra = self.tok.encode(text, parse_special=True)
-                        if force and structured:
-                            # Only a budget break gets here (the content break above excludes a grammar): the call is
-                            # still the grammar's to write, so only the wrap-up is appended (D-044).
-                            force = None
-                            extra = extra if wrap else []
-                        elif force:
-                            first, naming = self.forced_opening(force, tools, after_thinking=True)
-                            extra, force = extra + first, None
+                        budget = st["thinking_budget"] = None
+                        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap and gfile:
+                        if gfile:
                             # D-045: the wrap-up writes `</think>` and the template's two newlines INTO the prompt, so
                             # the next pass starts at the answer, and a grammar built for the first pass cannot be
                             # there - a matcher never sees prompt bytes, so it restarts where the first pass began
                             # and `THINK_BODY` reads the answer as reasoning.  The continuation gets the shape its
                             # own tail names.  A grammar that cannot be built leaves the first file in place (the
                             # behaviour before this) and `begin_grammar` has already said why.
-                            cont = self.begin_grammar(list(prompt) + seg + extra, gtools,
-                                                      FORCE_ANY if forced_required else None, sampling)
+                            cont = self.begin_grammar(list(prompt) + seg + extra, gtools, forced_required, sampling)
                             if cont:
                                 gfiles.append(cont[0])
                                 sampling = {**sampling, "strata_grammar": cont[0]}
-                        if wrap:
-                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
-                                  flush=True)
+                        print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                              flush=True)
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
@@ -6309,7 +6175,7 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            force = forced_choice(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -6552,7 +6418,7 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            force = forced_choice(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences

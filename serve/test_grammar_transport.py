@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import serve.server as server_module  # noqa: E402
-from serve.frontend import FORCE_ANY, ChatTemplate  # noqa: E402
+from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
 from serve.server import drop_grammar, grammar_file, hold_grammar, hold_grammar_file  # noqa: E402
 from serve.server import sweep_grammar_dirs  # noqa: E402
@@ -229,16 +229,29 @@ class Request(unittest.TestCase):
 
     def test_a_required_call_drops_the_prose_only_branch(self):
         tools = [{"name": "f", "parameters": {"type": "object", "properties": {}}}]   # as the frontend passes them
-        run(self.svc, self.tok, thinking=True, tools=tools, force=FORCE_ANY)
+        run(self.svc, self.tok, thinking=True, tools=tools, force=("required", None))
         self.assertIn("start: entry_think_tools_required", self.engine.calls[0]["text"])
 
-    def test_a_call_the_prompt_already_opened_is_the_mid_call_entry(self):
-        # Without thinking the forced opening ends the prompt, so the reply starts inside the call.
+    def test_a_named_choice_offers_only_that_tool(self):
+        """A named `tool_choice` narrows the fragment: `tool_dispatch` would otherwise offer every declared tool."""
+        tools = [{"name": n, "parameters": {"type": "object", "properties": {}}} for n in ("write", "read")]
+        # the fragment's rules carry each tool's index: call_t0_write is "write", call_t1_read is "read"
+        run(self.svc, self.tok, thinking=True, tools=tools, force=("named", "write"))
+        self.assertIn("call_t0_write", self.engine.calls[-1]["text"])
+        self.assertNotIn("call_t1_read", self.engine.calls[-1]["text"])
+        # without the narrowing both are offered, so the assertions above cannot pass vacuously
+        run(self.svc, self.tok, thinking=True, tools=tools, force=None)
+        self.assertIn("call_t0_write", self.engine.calls[-1]["text"])
+        self.assertIn("call_t1_read", self.engine.calls[-1]["text"])
+
+    def test_without_thinking_a_required_call_starts_at_the_answer_entry(self):
+        # Nothing is written into the prompt for tool_choice: with thinking off it already ends at the template's
+        # answer tail (an empty thinking block), so the reply starts at the answer entry with the prose-only branch
+        # dropped - there is no mid-call prompt here to start inside (D-053).
         tools = [{"name": "f", "parameters": {"type": "object", "properties": {}}}]   # as the frontend passes them
-        # the entry has the "=" and the name still to write, so the reply is that call for the one parameterless tool
-        svc, engine, tok = service(self.pack, reply="=f>\n</function>\n</tool_call>")
-        run(svc, tok, thinking=False, tools=tools, force=FORCE_ANY)
-        self.assertIn("start: entry_call_name", engine.calls[0]["text"])
+        run(self.svc, self.tok, thinking=False, tools=tools, force=("required", None))
+        self.assertIn("start: entry_answer_tools_required", self.engine.calls[0]["text"])
+        self.assertNotIn("start: entry_call_name", self.engine.calls[0]["text"])
 
     def test_the_unconstrained_line_is_said_once_and_calls_the_reply_unsafe(self):
         # D-050: one line per process, and it says the text reader is unprotected - not merely "unconstrained".

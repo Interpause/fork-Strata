@@ -1,9 +1,11 @@
 """Chat history normalization before rendering the model's prompt."""
+import contextlib
 import copy
+import io
 from pathlib import Path
 import unittest
 
-from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
+from serve.frontend import ChatTemplate, anthropic_to_messages, forced_choice, openai_to_messages
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
@@ -194,14 +196,48 @@ class EmptyTurnsSwitch(unittest.TestCase):
             self.assertNotEqual(template.render(msgs), clean)
 
 
-class ForcedCallOpening(unittest.TestCase):
-    def test_required_with_one_tool_names_it(self):
-        from serve.frontend import forced_call
-        one, two = [{"name": "a"}], [{"name": "a"}, {"name": "b"}]
-        self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
-        self.assertEqual(forced_call("required", two), "<tool_call>\n<function=")    # FORCE_ANY: see call_opening
-        self.assertEqual(forced_call({"type": "any"}, two), "<tool_call>\n<function=")
-        self.assertIsNone(forced_call("auto", one))
+class ForcedChoice(unittest.TestCase):
+    """`forced_choice`: what the reply must be, from a client's `tool_choice`.
+
+    Nothing is written into the prompt for this - the value only reaches `Service.grammar_tools` (a named choice
+    narrows the fragment to that one tool) and `Service.begin_grammar` (a required choice drops the prose-only
+    branch).  A value it cannot honour acts as "auto" with one line on stdout, not a 400 (D-053)."""
+
+    TOOLS = [{"name": "a"}, {"name": "b"}]
+
+    def test_the_model_decides(self):
+        for choice in (None, "auto", "none", {"type": "auto"}):        # Anthropic {"type": "auto"} too
+            with self.subTest(choice=choice):
+                self.assertIsNone(forced_choice(choice, self.TOOLS))
+
+    def test_a_required_call_offers_any_of_the_tools(self):
+        self.assertEqual(forced_choice("required", self.TOOLS), ("required", None))
+        self.assertEqual(forced_choice({"type": "any"}, self.TOOLS), ("required", None))
+
+    def test_one_offered_tool_is_named(self):
+        # one tool to call, so name it and let the grammar offer only that one
+        self.assertEqual(forced_choice("required", [{"name": "a"}]), ("named", "a"))
+
+    def test_a_named_choice_names_the_tool(self):
+        for choice in ({"type": "function", "function": {"name": "b"}},    # OpenAI
+                       {"type": "function", "name": "b"},                 # its flat shape
+                       {"type": "tool", "name": "b"}):                    # Anthropic
+            with self.subTest(choice=choice):
+                self.assertEqual(forced_choice(choice, self.TOOLS), ("named", "b"))
+
+    def test_a_value_it_cannot_honour_is_said_and_the_model_decides(self):
+        for choice, tools in (({"type": "tool", "name": "gone"}, self.TOOLS),   # names no offered tool
+                              ("required", []), ("required", None),             # nothing to call
+                              ({"type": "no_such_shape"}, self.TOOLS)):
+            with self.subTest(choice=choice, tools=tools):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertIsNone(forced_choice(choice, tools))
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, out.getvalue())
+                self.assertIn("[strata]", lines[0])
+                self.assertIn("not supported here", lines[0])
+                self.assertIn("tool_choice", lines[0])
 
 
 class QuotedToolCallCloser(unittest.TestCase):
