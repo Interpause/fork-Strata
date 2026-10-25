@@ -840,61 +840,7 @@ class OutputParser:
         self.pending: list = []
         self.rescued = 0
         self.refused = 0
-        self.fence, self.line, self.ticks = "", "", 0
         self._reset_scan()
-
-    @property
-    def line(self) -> str:
-        """Materialize the current line only for a decision, newline, or state snapshot."""
-        if self._line_blocks is not None:
-            self._line_blocks.extend(self._line_parts)
-            self._line_parts = ["".join(self._line_blocks)]
-            self._line_blocks = None
-        elif len(self._line_parts) > 1:
-            self._line_parts = ["".join(self._line_parts)]
-        return self._line_parts[0] if self._line_parts else ""
-
-    @line.setter
-    def line(self, text: str):
-        self._line_parts = [text] if text else []
-        self._line_blocks = None
-
-    def _track(self, text: str) -> str:
-        """Follow the reasoning text that has gone out: the open code fence, the current line, and the backticks of
-        the current paragraph.  Returns the text."""
-        # Most token fragments stay on the current line. Fence and paragraph
-        # bookkeeping happens only when a newline completes that line.
-        if "\n" not in text:
-            if text:
-                self._line_parts.append(text)
-                if len(self._line_parts) == 64:
-                    # Release small fragment objects in bounded groups. Completed
-                    # blocks are never recopied until the full line is requested.
-                    if self._line_blocks is None:
-                        self._line_blocks = []
-                    self._line_blocks.append("".join(self._line_parts))
-                    self._line_parts.clear()
-            return text
-        parts = text.split("\n")
-        for k, part in enumerate(parts):
-            if k < len(parts) - 1:
-                line = self.line + part if self._line_parts or self._line_blocks else part
-                self._line_parts.clear()
-                self._line_blocks = None
-                s = line.lstrip()
-                if self.fence:
-                    if s.startswith(self.fence * 3):
-                        self.fence = ""
-                elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
-                    self.fence = s[0]
-                elif not s:
-                    self.ticks = 0
-                else:
-                    self.ticks += line.count("`")
-            else:
-                if part:
-                    self._line_parts.append(part)
-        return text
 
     def _reset_scan(self):
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
@@ -1019,14 +965,13 @@ class OutputParser:
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
                     if len(self.buf) > keep:
-                        out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
+                        out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
                     return out
                 if i:
-                    out.append(Event("reasoning", self._track(self.buf[:i])))
+                    out.append(Event("reasoning", self.buf[:i]))
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
-                self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -1042,11 +987,11 @@ class OutputParser:
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
-                        out.append(Event("content", self._track(self.buf[:j])))
+                        out.append(Event("content", self.buf[:j]))
                         self.buf = self.buf[j:]
                     return out
                 if i and self.buf[:i].strip():
-                    out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                    out.append(Event("content", self.buf[:i].rstrip("\n")))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
@@ -1069,7 +1014,7 @@ class OutputParser:
                     # The tag the body came from was prose that names the format ("I'll use a <tool_call> block"),
                     # which the walk now knows for a fact rather than guessing from what follows it: its own bytes
                     # are content, and the scan resumes after them, because the tag it mentions may open the call.
-                    out.append(Event("content", self._track(CALL_START)))
+                    out.append(Event("content", CALL_START))
                     self.buf, self.state = body + CALL_END, "content"
                     continue
                 out += self._finish_call(body)
