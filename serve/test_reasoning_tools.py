@@ -19,7 +19,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, OutputParser  # noqa: E402
-from serve.grammar import guard  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 from serve.test_server import CTX  # noqa: E402
 
@@ -80,48 +79,6 @@ class Parser(unittest.TestCase):
                 self.assertEqual(joined(evs, "content"), "the answer")
 
 
-class GrammarTokenizer(ByteTokenizer):
-    """`ByteTokenizer` plus the grammar's delimiter ids: a real decode reports `<tool_call>` as a special token, and
-    `StructureParser` decides structure from that id, so a test of the structured route has to emit them."""
-
-    DELIMITERS = tuple(guard.DELIMITER_IDS)
-    BY_ID = {tid: text for text, tid in guard.DELIMITER_IDS.items()}
-
-    @property
-    def max_special_len(self):
-        return max(len(s) for s in self.SPECIALS + list(self.DELIMITERS))
-
-    def encode_marked(self, text, parse_special=False, plain=()):
-        """`ByteTokenizer.encode_marked`, with each delimiter one token carrying the pack's own id.  The prompt
-        encoder relies on `plain`, so a byte range it names is never matched as a delimiter here either."""
-        out, marks, i = [], [], 0
-        while i < len(text):
-            hit = None
-            if parse_special and not any(a <= i < b for a, b in plain):
-                hit = next((s for s in sorted(self.DELIMITERS, key=len, reverse=True)
-                            if text.startswith(s, i)), None)
-            if hit is None:
-                out.extend(text[i:i + 1].encode("utf-8"))       # one id per UTF-8 byte, as the parent does
-                i += 1
-                continue
-            out.append(guard.DELIMITER_IDS[hit])
-            i += len(hit)
-            marks.append((i, len(out)))
-        return out, marks
-
-    def decode(self, ids, errors="replace"):
-        raw = bytearray()
-        for t in ids:
-            text = self.BY_ID.get(t)
-            if text is not None:
-                raw += text.encode("utf-8")
-            elif t >= 256:
-                raw += self.SPECIALS[t - 256].encode("utf-8")   # a parent id, which these replies never emit
-            else:
-                raw += bytes([t])
-        return raw.decode("utf-8", errors=errors)
-
-
 PROPS = {"path": {"type": "string"}}
 # The template's own shape: reasoning, the answer, then exactly two newlines and the call.  `answer_tools` in
 # skeleton.lark has no production with prose after a call, so the answer has to come before it.
@@ -136,7 +93,7 @@ class OverHttp(unittest.TestCase):
 
     def setUp(self):
         self.pack = tempfile.mkdtemp()      # sweep_grammar_dirs runs on Service.__init__: never reuse a directory
-        tok = GrammarTokenizer()
+        tok = ByteTokenizer()
         engine = MockEngine(tok, SCRIPT, max_context=CTX)
         engine.info = {"grammar": 1}        # grammar_ready(): the engine compiles the file the server writes for it
         self.httpd = serve(Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),

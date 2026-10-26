@@ -72,7 +72,8 @@ class Structured(unittest.TestCase):
         prompt = self.tok.decode(self.engine.last_prompt)
         self.assertIn("OUTPUT FORMAT REQUIREMENT", prompt)
         self.assertIn('"duration_ms"', prompt)
-        code, raw = self.chat("Consider the shot.</think>\n" + json.dumps(STORY), stream=True, reasoning_effort="low")
+        # the template writes exactly two newlines after the </think> token (skeleton.lark's `thinking` rule)
+        code, raw = self.chat("Consider the shot.\n</think>\n\n" + json.dumps(STORY), stream=True, reasoning_effort="low")
         self.assertEqual(code, 200)
         chunks = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
         content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)

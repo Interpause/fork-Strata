@@ -603,7 +603,8 @@ class LiteralThinkTags(unittest.TestCase):
         cls.tok = ThinkTokenizer()
         cls.svc = Service(MockEngine(cls.tok, "ok", max_context=CTX), cls.tok,
                           ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        cls.open, cls.close = (cls.tok.encode(t)[0] for t in ("<think>", "</think>"))
+        # `parse_special`: the prompt is encoded that way, and the stand-in gives a delimiter its pack id only then
+        cls.open, cls.close = (cls.tok.encode(t, parse_special=True)[0] for t in ("<think>", "</think>"))
 
     def ids(self, messages, tools=None, **kw):
         return self.svc.prepare(messages, tools, kw)[0]
@@ -723,7 +724,7 @@ class LiteralControlTokens(unittest.TestCase):
         ids = self.ids([{"role": "user", "content": text}], enable_thinking=False)
         own = self.counts(self.old_ids([{"role": "user", "content": "x"}], enable_thinking=False))
         self.assertEqual(self.counts(ids), own)
-        self.assertEqual(ids.count(self.tok.encode("</think>")[0]), 1)    # the template's empty thinking block
+        self.assertEqual(ids.count(self.tok.encode("</think>", parse_special=True)[0]), 1)   # the empty block
         self.assertIn(text, self.tok.decode(ids))
 
     def test_a_literal_inside_a_longer_one(self):
@@ -743,7 +744,10 @@ class LiteralControlTokens(unittest.TestCase):
         b2u = ST.bytes_to_unicode()
         tokens = [b2u[b] for b in range(256)] + ["<think>", "</think>", "<|im_end|>"]
         self.assertEqual(ST.Tokenizer(tokens, [], [1] * 256 + [4, 4, 3]).control_tokens, ["<|im_end|>"])
-        self.assertEqual(ThinkTokenizer().control_tokens, ByteTokenizer.SPECIALS)
+        # The stand-in carries the grammar's delimiters too now (they are control tokens of the pack), minus the
+        # reasoning markers `ThinkTokenizer` matches as plain text: `SPECIALS` plus the two the template uses for
+        # a call.  The real-tokenizer assertion above is the model's own list and is unaffected.
+        self.assertEqual(ThinkTokenizer().control_tokens, ByteTokenizer.SPECIALS + ["<tool_call>", "</tool_call>"])
 
 
 class EffortAtTheEnd(unittest.TestCase):
@@ -752,7 +756,7 @@ class EffortAtTheEnd(unittest.TestCase):
     on the token ids (src/program/generate.cpp: the last <|im_start|>, and with --tail-role-token the one in front
     of a trailing system turn); the default prompt does not change."""
 
-    TURN = 256                                       # the byte tokenizer's <|im_start|>
+    TURN = ByteTokenizer().encode("<|im_start|>", parse_special=True)[0]   # the byte tokenizer's <|im_start|>
     ROLE = ord("s")                                  # "system"'s first byte stands for its token
 
     def setUp(self):
@@ -1515,7 +1519,9 @@ class IncrementalPrompts(unittest.TestCase):
 
     def service(self, **info):
         engine = RecordingPrompt(self.svc.tok, "The answer.", max_context=CTX)
-        engine.info = info
+        # an INFO fact the test sets is one key of the line, not the whole line: `MockEngine` reports `grammar=1`,
+        # which `begin_grammar` needs for the chat request in `test_counting_tokens_leaves_the_kept_prompts_alone`
+        engine.info.update(info)
         return Service(engine, self.svc.tok, self.svc.template)
 
     def test_the_kept_prompts_follow_the_engines_conversation_slots(self):
@@ -1877,9 +1883,12 @@ class PcieShare(unittest.TestCase):
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 0",
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20"])       # an older engine
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            for _ in range(3):
-                list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        # The text path: this test is about the DONE line's PCIe figures, and its raw prompt is not
+        # template-shaped, so a grammar has no entry for it.  `begin_grammar` -> None is the opt-out.
+        with mock.patch.object(svc, "begin_grammar", return_value=None):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                for _ in range(3):
+                    list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
         rows = list(svc.history)
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
@@ -1968,8 +1977,12 @@ class RepeatStop(unittest.TestCase):
         if limit is not None:
             svc.repeat_stop_tokens = limit
         ids = tok.encode("hi")
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+        # The text path: repeat-stop is a sampling pathology, not a structure question, and this raw prompt is not
+        # template-shaped, so a grammar has no entry for it.  `begin_grammar` -> None is the opt-out.
+        with mock.patch.object(svc, "begin_grammar", return_value=None):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event())
+                        if kind == "done"][0]
         return done, out.getvalue()
 
     def test_a_long_run_is_ended(self):
@@ -2024,7 +2037,10 @@ class NonFiniteLogits(unittest.TestCase):
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         ids = tok.encode("hi")
         events, done, error = [], None, None
-        with contextlib.redirect_stdout(io.StringIO()) as out:
+        # The text path: the non-finite retry is an engine behaviour, not a structure question, and this raw prompt
+        # is not template-shaped, so a grammar has no entry for it.  `begin_grammar` -> None is the opt-out.
+        with mock.patch.object(svc, "begin_grammar", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
             try:
                 for kind, x in svc.run(ids, False, None, 100, {}, threading.Event()):
                     if kind == "done":
@@ -3083,6 +3099,7 @@ class WebApp(unittest.TestCase):
 
     def test_build_model_path_and_slot_status(self):
         engine = self.svc.engine
+        had, previous = hasattr(engine, "info"), getattr(engine, "info", None)
         engine.model_path = "models/example.gguf"
         engine.info = {"version": "0.1.21"}
         try:
@@ -3099,7 +3116,13 @@ class WebApp(unittest.TestCase):
         finally:
             with self.svc.status_lock:
                 self.svc.status["busy"] = False
-            del engine.model_path, engine.info
+            del engine.model_path
+            # the INFO line is the fixture's own (`MockEngine` reports `grammar=1`): this test borrows it, and
+            # deleting it made every later chat in this class a grammar refusal (D-030)
+            if had:
+                engine.info = previous
+            else:
+                del engine.info
         props = json.loads(self.get("/props")[2])
         self.assertNotIn("build_info", props)
         self.assertNotIn("model_path", props)
@@ -3535,7 +3558,10 @@ class ThinkingEngine(MockEngine):
         self.prompts.append(list(ids))
         done = self.tok.decode(ids).endswith("</think>\n\n")
         text = self.ANSWER if done else self.THOUGHT + "</think>\n\n" + self.ANSWER
-        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+        # `parse_special`: the grammar's `</think>` is a delimiter token, and `StructureParser` decides a reply's
+        # structure from the token's id, so a byte-spelled closer would never end the thinking.
+        for t in (self.tok.encode(text, parse_special=True) +
+                  self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
             yield t
@@ -3583,7 +3609,11 @@ class ReplyEndingInsideThinking(unittest.TestCase):
     def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
         # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
         self.engine.THOUGHT = 'two plus two is "4"</think>'
-        c = self.chat()
+        # The text path: the reply spells its closer as bytes, and holding it until the next character is the text
+        # reader's rule; with the grammar that text is a delimiter token that ends the thinking at once, so the
+        # question only arises without one.  Returning None is the opt-out.
+        with mock.patch.object(self.svc, "begin_grammar", return_value=None):
+            c = self.chat()
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
@@ -3934,6 +3964,9 @@ class StatusHandover(unittest.TestCase):
         svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
         svc.fifo = SlowRelease()
+        # The text path: this test is about the status handed over between two requests, not reply structure, and
+        # its raw prompt is not template-shaped, so a grammar has no entry for it.  Returning None is the opt-out.
+        svc.begin_grammar = lambda *a, **k: None
         ids = tok.encode("hi")
         first = svc.run(ids, True, None, 30, {}, threading.Event())
         for _ in range(5):
@@ -4566,6 +4599,9 @@ class LostStep(unittest.TestCase):
                 eng.silence_s = 0.5
                 tok = ByteTokenizer()
                 svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+                # The text path: this test is about recovering from a silent or stopped engine, not reply
+                # structure, and the fake engine reports no `grammar=1`.  Returning None is the opt-out.
+                svc.begin_grammar = lambda *a, **k: None
                 httpd = serve(svc, port=0)
                 base = f"http://127.0.0.1:{httpd.server_address[1]}"
                 body = {"model": "m", "max_tokens": 2, "reasoning_effort": "none", "stream": stream,

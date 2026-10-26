@@ -4,8 +4,9 @@
 
 Host-only: the request is driven through `Service.run` with the mock engine, the same way the server tests do.  The
 server compiles nothing, so what these tests are about is the file alone - written, held, adopted, removed - and they
-need no `tools/build_llguidance.sh`, which is also the state a machine without it is in: the file and the key still
-travel, nothing is constrained (D-020).
+need no `tools/build_llguidance.sh`.  Since D-030 a request that cannot be given a grammar is refused rather than
+decoded unconstrained, so `Refusals` below pins each of the six conditions and `ClientVisible` pins what a client
+sees on the four request shapes.
 """
 import base64
 import contextlib
@@ -18,17 +19,29 @@ import tempfile
 import threading
 import unittest
 import unittest.mock
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import serve.server as server_module  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
+from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
 from serve.server import drop_grammar, grammar_file, hold_grammar, hold_grammar_file  # noqa: E402
-from serve.server import sweep_grammar_dirs  # noqa: E402
+from serve.server import serve, sweep_grammar_dirs  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
+ANSWER = "Hello."                               # a script `entry_answer_plain` accepts: the answer, nothing before it
+# A thinking turn's prompt tail already ends at the template's `<think>\n` (entries.THINKING_ON_TAIL), so the reply
+# starts inside the thinking block: some reasoning, the close, the two-newline separator, then the answer.
+THINKING = "\n\n</think>\n\n" + ANSWER
+
+
+def thinking_call(name):
+    """The reply a required-call thinking entry allows: a closed thinking block, then one call to `name`."""
+    return "\n\n</think>\n\n<tool_call>\n<function=%s>\n</function>\n</tool_call>" % name
 
 
 class Recorder(MockEngine):
@@ -46,7 +59,11 @@ class Recorder(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
-def service(pack_dir=None, reply="</think>\n\nHello."):
+def service(pack_dir=None, reply=ANSWER):
+    """`reply` is the script the engine replays, so it must be one the grammar of the entry state applied to it can
+    actually emit: an answer-only turn for `thinking=False`, a reply that starts inside the thinking block (the
+    prompt's tail already ends at `<think>\\n`) for `thinking=True`.  A list gives one script per request, in the
+    order they run."""
     tok = ByteTokenizer()
     engine = Recorder(tok, reply, max_context=CTX)
     # The engine says it compiles a grammar: `begin_grammar` needs `INFO grammar=1` as well as a pipeline (7ee998b5,
@@ -113,7 +130,7 @@ class Capability(unittest.TestCase):
             self.eng.keys({"strata_grammar": "/b.gr"})
         self.assertEqual(out.getvalue().count("[strata] WARNING:"), 1)
         self.assertIn("no grammar=1", out.getvalue())
-        self.assertIn("Unsafe", out.getvalue())
+        self.assertIn("refuses a chat-shaped request", out.getvalue())   # the same condition begin_grammar refuses (D-030)
 
     def test_a_request_without_a_grammar_says_nothing(self):
         out = io.StringIO()
@@ -212,6 +229,8 @@ class Request(unittest.TestCase):
         self.assertFalse(Path(path).exists())
 
     def test_two_request_shapes_are_two_files_and_one_splice_each(self):
+        # One script per request, in the order they run: an answer-only turn, then a thinking one.
+        self.svc, self.engine, self.tok = service(self.pack, [ANSWER, THINKING])
         run(self.svc, self.tok)
         run(self.svc, self.tok, thinking=True)
         paths = [call["path"] for call in self.engine.calls]
@@ -229,6 +248,8 @@ class Request(unittest.TestCase):
 
     def test_a_required_call_drops_the_prose_only_branch(self):
         tools = [{"name": "f", "parameters": {"type": "object", "properties": {}}}]   # as the frontend passes them
+        # A thinking turn starts at entry_think*, and a required call's branch has no prose: the script is the call.
+        self.svc, self.engine, self.tok = service(self.pack, thinking_call("f"))
         run(self.svc, self.tok, thinking=True, tools=tools, force=("required", None))
         self.assertIn("start: entry_think_tools_required", self.engine.calls[0]["text"])
 
@@ -236,6 +257,8 @@ class Request(unittest.TestCase):
         """A named `tool_choice` narrows the fragment: `tool_dispatch` would otherwise offer every declared tool."""
         tools = [{"name": n, "parameters": {"type": "object", "properties": {}}} for n in ("write", "read")]
         # the fragment's rules carry each tool's index: call_t0_write is "write", call_t1_read is "read"
+        # A thinking turn starts at entry_think*, and a named choice's branch has no prose: the script is the call.
+        self.svc, self.engine, self.tok = service(self.pack, thinking_call("write"))
         run(self.svc, self.tok, thinking=True, tools=tools, force=("named", "write"))
         self.assertIn("call_t0_write", self.engine.calls[-1]["text"])
         self.assertNotIn("call_t1_read", self.engine.calls[-1]["text"])
@@ -253,32 +276,25 @@ class Request(unittest.TestCase):
         self.assertIn("start: entry_answer_tools_required", self.engine.calls[0]["text"])
         self.assertNotIn("start: entry_call_name", self.engine.calls[0]["text"])
 
-    def test_the_unconstrained_line_is_said_once_and_calls_the_reply_unsafe(self):
-        # D-050: one line per process, and it says the text reader is unprotected - not merely "unconstrained".
-        Service._unconstrained_said = False
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.svc.grammar_note("first reason")
-            self.svc.grammar_note("second reason")
-        said = out.getvalue()
-        self.assertEqual(said.count("[strata] WARNING:"), 1)
-        self.assertIn("first reason", said)
-        self.assertIn("Unsafe", said)
-        self.assertIn("D-050", said)
-        self.assertEqual(self.svc.grammar_notes, {"first reason", "second reason"})
+    def test_a_prompt_without_a_template_tail_is_refused_as_a_server_fault(self):
+        # A completion-style prompt: every prompt a chat route decodes is rendered by this template, so a tail with
+        # no entry is template drift, and the request fails instead of decoding unconstrained (D-030).
+        ids = self.tok.encode("plain prompt, no chat template")
+        with self.assertRaises(grammar_pipeline.GrammarUnavailable) as caught:
+            list(self.svc.run(ids, False, None, 8, {}, threading.Event()))
+        self.assertEqual(caught.exception.status, 500)
+        self.assertIn("no state the grammar has an entry for", str(caught.exception))
+        self.assertEqual(self.engine.calls, [], "nothing may decode a request with no grammar")
 
-    def test_a_prompt_without_a_template_tail_sends_no_grammar(self):
-        # A completion-style prompt: the grammar has no entry for it, so nothing is sent and the reply is unchanged.
-        list(self.svc.run(self.tok.encode("plain prompt, no chat template"), False, None, 8, {},
-                          threading.Event()))
-        self.assertIsNone(self.engine.calls[0]["path"])
-        self.assertTrue(self.svc.grammar_notes)
-
-    def test_a_server_without_a_pack_carries_no_grammar(self):
+    def test_a_server_without_a_pack_tokenizer_refuses_every_chat(self):
+        # The old property - "carries no grammar, so the reply is unconstrained" - is exactly what D-030 deletes.
         svc, engine, tok = service(None)
         self.assertIsNone(svc.pipeline)
-        run(svc, tok)
-        self.assertIsNone(engine.calls[0]["path"])
+        with self.assertRaises(grammar_pipeline.GrammarUnavailable) as caught:
+            run(svc, tok)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertIn("no grammar pipeline", str(caught.exception))
+        self.assertEqual(engine.calls, [])
 
     def test_the_json_entry_uses_the_requests_schema(self):
         sampling = {"response_format": {"type": "json_schema", "json_schema": {
@@ -288,10 +304,162 @@ class Request(unittest.TestCase):
         self.assertIn("start: entry_answer_json", text)
         self.assertIn('"a"', text)
 
-    def test_a_broken_schema_sends_no_grammar(self):
+    def test_a_response_format_that_is_not_a_schema_fails_before_the_engine(self):
+        # The property this replaces was "no grammar is sent and the reply is still decoded" - which is the one
+        # D-030 deletes.  `format_schema` is the single reader of response_format's shapes, and `[]` is not a
+        # schema: the request is malformed (400), so it never reaches the engine and no grammar file exists for it.
         sampling = {"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": []}}}
-        run(self.svc, self.tok, sampling=sampling)
-        self.assertIsNone(self.engine.calls[0]["path"])
+        with self.assertRaises(ValueError) as caught:
+            run(self.svc, self.tok, sampling=sampling)
+        self.assertIn("json_schema needs a schema object", str(caught.exception))
+        self.assertEqual(self.engine.calls, [], "a refused shape must not be decoded")
+
+
+class Refusals(unittest.TestCase):
+    """D-030: a request that cannot be constrained is refused, with a message and a status of its own.
+
+    Six conditions used to send no grammar and say so once per process.  Each is now a
+    `grammar_pipeline.GrammarUnavailable`, the status names whose condition it is (503 the server cannot supply or
+    write a grammar, 500 Strata's copy is at fault, 400 the request asks for something no grammar can express), and
+    the engine is never called - so no reply decodes unconstrained.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.pack = Path(self.dir.name)
+        (self.pack / "vocab.json").write_text("{}", encoding="utf-8")
+        self.svc, self.engine, self.tok = service(self.pack)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def refused(self, ids=None, **run_kw):
+        """Run one request and return the refusal, asserting nothing decoded."""
+        if ids is None:
+            ids = self.svc.prepare([{"role": "user", "content": "hi"}], run_kw.pop("tools", None),
+                                   {"enable_thinking": False}, req=run_kw.get("sampling") or {},
+                                   force=run_kw.get("force"))[0]
+        with self.assertRaises(grammar_pipeline.GrammarUnavailable) as caught:
+            list(self.svc.run(ids, run_kw.get("thinking", False), run_kw.get("tools"), 8,
+                              dict(run_kw.get("sampling") or {}), threading.Event(), force=run_kw.get("force")))
+        self.assertEqual(self.engine.calls, [], "the engine must not decode a request with no grammar")
+        return caught.exception
+
+    def test_no_pack_tokenizer_refuses_with_its_own_message(self):
+        svc, engine, tok = service(None)
+        with self.assertRaises(grammar_pipeline.GrammarUnavailable) as caught:
+            run(svc, tok)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertIn("no grammar pipeline", str(caught.exception))
+        self.assertIn("without a pack tokenizer", str(caught.exception))
+        self.assertEqual(engine.calls, [])
+
+    def test_an_engine_without_grammar_one_refuses_with_its_own_message(self):
+        self.engine.info = {}                     # an older engine, or one built without tools/build_llguidance.sh
+        e = self.refused()
+        self.assertEqual(e.status, 503)
+        self.assertIn("INFO line has no grammar=1", str(e))
+        self.assertIn("tools/build_llguidance.sh", str(e))
+
+    def test_a_prompt_tail_the_template_never_writes_is_refused_as_a_server_fault(self):
+        e = self.refused(ids=self.tok.encode("plain prompt, no chat template"))
+        self.assertEqual(e.status, 500)           # the server rendered every prompt: this is template drift
+        self.assertIn("no state the grammar has an entry for", str(e))
+
+    def test_a_prompt_inside_an_undeclared_call_is_refused_as_the_requests_fault(self):
+        e = self.refused(ids=self.tok.encode("<|im_start|>assistant\n<function=gone>\n", parse_special=True))
+        self.assertEqual(e.status, 400)           # the conversation names a tool this request did not declare
+        self.assertIn("'gone'", str(e))
+        self.assertIn("did not declare", str(e))
+
+    def test_a_required_call_with_no_tools_is_refused_as_the_requests_fault(self):
+        e = self.refused(ids=self.tok.encode("<think>\n\n</think>\n\n"), force=("required", None))
+        self.assertEqual(e.status, 400)           # tool_choice required with no tools is the request's own contradiction
+        self.assertIn("requires a call but the request declared no tools", str(e))
+
+    def test_a_skeleton_that_no_longer_splices_is_refused_as_a_server_fault(self):
+        with unittest.mock.patch.object(server_module.grammar_pipeline.bg, "skeleton",
+                                        return_value="no splice markers here"):
+            e = self.refused()
+        self.assertEqual(e.status, 500)
+        self.assertIn("skeleton no longer splices", str(e))
+        self.assertIn("SPLICE", str(e))           # the builder names the marker it could not find
+
+    def test_a_grammar_file_that_cannot_be_written_is_refused_as_a_capacity_fault(self):
+        with unittest.mock.patch.object(server_module, "hold_grammar_file",
+                                        side_effect=OSError("No space left on device")):
+            e = self.refused()
+        self.assertEqual(e.status, 503)
+        self.assertIn("grammar file cannot be written", str(e))
+        self.assertIn("No space left on device", str(e))
+
+    def test_a_grammar_file_with_an_unusable_name_is_refused_as_a_server_fault(self):
+        with unittest.mock.patch.object(server_module, "hold_grammar_file",
+                                        side_effect=ValueError("a grammar file needs a name")):
+            e = self.refused()
+        self.assertEqual(e.status, 500)
+        self.assertIn("name is unusable", str(e))
+
+
+class ClientVisible(unittest.TestCase):
+    """What the client sees when `begin_grammar` refuses inside a generator that has not yielded yet.
+
+    The raise happens on the first `next()`, before the engine is called and before any answer text, so a
+    non-streaming request is answered with the refusal's status.  A streaming request has already sent its 200 and
+    its headers, so the refusal travels as that surface's error event instead - with the same message and code.
+    """
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = MockEngine(self.tok, "</think>\n\nhi", max_context=CTX)
+        # No pack: no pipeline, which is condition 1 - a server-side condition that must not be a 400.  `pack_dir`
+        # is explicit because the Service's default is now a lazily made one (AUTO_PACK), which would build a
+        # pipeline and answer 200 instead of refusing.
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), pack_dir=None)
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            response = urllib.request.urlopen(req, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            data = response.read().decode()
+            return response.status, data if "event-stream" in response.headers.get("Content-Type", "") else json.loads(data)
+
+    def test_a_chat_request_with_no_grammar_is_a_503_server_error_not_a_400(self):
+        code, body = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(code, 503)
+        self.assertEqual((body["error"]["type"], body["error"]["code"]), ("server_error", "grammar_unavailable"))
+        self.assertIn("no grammar pipeline", body["error"]["message"])
+
+    def test_a_streaming_chat_sends_the_refusal_as_an_error_event_after_its_headers(self):
+        # `_sse()` writes the 200 and its headers before the first `next()`, so this cannot be a status any more.
+        code, raw = self.post("/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        self.assertEqual(code, 200)
+        self.assertIn('"code": "grammar_unavailable"', raw)
+        self.assertIn('"type": "server_error"', raw)
+        self.assertIn("no grammar pipeline", raw)
+        self.assertIn("data: [DONE]", raw)
+
+    def test_a_responses_request_with_no_grammar_is_a_503_server_error(self):
+        code, body = self.post("/v1/responses", {"input": "hi"})
+        self.assertEqual(code, 503)
+        self.assertEqual((body["error"]["type"], body["error"]["code"]), ("server_error", "grammar_unavailable"))
+
+    def test_a_streaming_responses_request_reports_the_refusal_as_response_failed(self):
+        code, raw = self.post("/v1/responses", {"input": "hi", "stream": True})
+        self.assertEqual(code, 200)
+        self.assertIn("response.failed", raw)
+        self.assertIn('"grammar_unavailable"', raw)
 
 
 class Routing(unittest.TestCase):

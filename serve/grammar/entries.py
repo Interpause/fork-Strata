@@ -36,7 +36,17 @@ _UNNAMED = re.compile(r"<function=?$")
 
 
 class UnresolvedTail(ValueError):
-    """The prompt does not end in a state this grammar has an entry for."""
+    """The prompt does not end in a state this grammar has an entry for.
+
+    `reason` says whose condition the unresolved tail is, which is what decides the HTTP status the refusal is
+    reported with: `undeclared_call` and `required_without_tools` come from what the client sent, and `unknown_tail`
+    is the server's own - every prompt a chat route decodes was rendered by this template, so a tail with no entry
+    is template drift rather than a field the client can correct.
+    """
+
+    def __init__(self, message: str, reason: str = "unknown_tail"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def resolve_entry(tail: str, tools: list[dict[str, Any]] | None = None,
@@ -58,7 +68,8 @@ def resolve_entry(tail: str, tools: list[dict[str, Any]] | None = None,
             fn = tool.get("function", tool)
             if fn.get("name") == name:
                 return f"entry_call_named_{slugify(name, idx)}"
-        raise UnresolvedTail(f"the prompt is inside a call to {name!r}, which this request did not declare")
+        raise UnresolvedTail(f"the prompt is inside a call to {name!r}, which this request did not declare",
+                             reason="undeclared_call")
     if _UNNAMED.search(tail):
         return "entry_call_name"
 
@@ -76,7 +87,8 @@ def resolve_entry(tail: str, tools: list[dict[str, Any]] | None = None,
     if tools:
         return f"entry_{phase}_tools_required" if required else f"entry_{phase}_tools"
     if required:
-        raise UnresolvedTail("tool_choice requires a call but the request declared no tools")
+        raise UnresolvedTail("tool_choice requires a call but the request declared no tools",
+                             reason="required_without_tools")
     if schema is not None:
         return f"entry_{phase}_json"
     return f"entry_{phase}_plain"

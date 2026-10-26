@@ -31,6 +31,30 @@ CACHE_MAX = 64
 TAIL_TOKENS = 256
 
 
+class GrammarUnavailable(RuntimeError):
+    """This request has no grammar, so it cannot be decoded at all (D-030).
+
+    One class for every reason the server can have for refusing a reply it cannot constrain, because both API
+    surfaces map it the same way: `status` alone decides the HTTP status and `kind` the error family, so a new
+    reason is a new message, never a new branch at the boundary.  Below 500 the request asked for something no
+    grammar can express; 500 is Strata's own fault (a skeleton that does not splice, an unusable file name); 503 is
+    a grammar the server cannot supply or write at all (no pack tokenizer, an engine built without the grammar
+    decoder, an unwritable grammar directory).  Not a ValueError: the generic handlers turn one of those into a 400,
+    which would call the server's own condition the client's.
+    """
+
+    code = "grammar_unavailable"
+
+    def __init__(self, message: str, status: int = 500):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def kind(self) -> str:
+        """The error family both APIs spell: `invalid_request_error` for a 4xx, `server_error` otherwise."""
+        return "invalid_request_error" if self.status < 500 else "server_error"
+
+
 @dataclass(frozen=True)
 class Grammar:
     """What one request decodes with.  `id` is the 16-hex basename of the file the engine reads."""

@@ -24,6 +24,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import collections
 import base64
@@ -63,6 +64,8 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve.grammar import build as grammar_build  # noqa: E402
+from serve.grammar import entries as grammar_entries  # noqa: E402
 from serve.grammar import guard  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -407,10 +410,15 @@ class Engine(Protocol):
 
 class MockEngine:
     """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
-    scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
+    scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it).
 
-    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
+    `info` reports `grammar=1`, as a real engine built with the decoder does: since D-030 a request without a grammar
+    is refused, so `grammar=False` is for the test that really drives the no-grammar path."""
+
+    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
+                 grammar: bool = True):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
+        self.info = {"grammar": 1} if grammar else {}
         end = tokenizer.encode(IM_END, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
@@ -1309,9 +1317,8 @@ class StrataEngine:
             if not StrataEngine._no_grammar_said:
                 StrataEngine._no_grammar_said = True
                 print("[strata] WARNING: the engine reported no grammar=1 in its INFO line (no tokenizer was "
-                      "loaded for it): this reply is read by the text parser, which has no fence, rescue or "
-                      "partial-tag rule left (D-050), so a delimiter it spells can be taken as a call. Unsafe "
-                      "until P7 makes this an error", flush=True)
+                      "loaded for it): the key is dropped here, and `begin_grammar` refuses a chat-shaped request "
+                      "for the same condition (D-030)", flush=True)
         return self.sampling_keys(sampling)
 
     @staticmethod
@@ -3097,18 +3104,27 @@ def vision_env(cfg: dict, env: dict) -> dict:
 
 
 class ByteTokenizer:
-    """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
+    """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256, and the
+    grammar's delimiters at the pack's own ids.
+
+    The delimiters have to carry `serve/grammar/guard.py`'s ids, not one byte each: `StructureParser` decides a
+    reply's structure from the token's *id*, so a `</think>` spelled as eight byte ids is never a close and every
+    reply would stay in the reasoning state for ever.
+    """
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+
+    DELIMITERS = tuple(guard.DELIMITER_IDS)         # the pack's seven, as the grammar's guard names them
+    BY_ID = {tid: text for text, tid in guard.DELIMITER_IDS.items()}
 
     ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
 
     @property
     def max_special_len(self):
-        return max(len(s) for s in self.SPECIALS)
+        return max(len(s) for s in self.SPECIALS + list(self.DELIMITERS))
 
     @property
     def control_tokens(self):
-        return [s for s in self.SPECIALS if s not in self.ALWAYS]
+        return [s for s in dict.fromkeys(self.SPECIALS + list(self.DELIMITERS)) if s not in self.ALWAYS]
 
     def encode(self, text, parse_special=False, plain=()):
         return self.encode_marked(text, parse_special, plain)[0]
@@ -3117,6 +3133,17 @@ class ByteTokenizer:
         """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
         out, marks, i = [], [], 0
         while i < len(text):
+            # The delimiters first: <|im_end|> is both a special and a delimiter, and the pack gives it the
+            # delimiter's id (the grammar names that token), never the stand-in SPECIALS id.
+            hit = None
+            if parse_special and not any(a <= i < b for a, b in plain):
+                hit = next((s for s in sorted(self.DELIMITERS, key=len, reverse=True) if text.startswith(s, i)),
+                           None)
+            if hit is not None:
+                out.append(guard.DELIMITER_IDS[hit])
+                i += len(hit)
+                marks.append((i, len(out)))
+                continue
             for k, s in enumerate(self.SPECIALS):
                 if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
                         a <= i < b for a, b in plain):
@@ -3132,7 +3159,13 @@ class ByteTokenizer:
     def decode(self, ids, errors="replace"):
         raw = bytearray()
         for t in ids:
-            raw += self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
+            text = self.BY_ID.get(t)                # before the SPECIALS branch: 248068 would index past its end
+            if text is not None:
+                raw += text.encode("utf-8")
+            elif t >= 256:
+                raw += self.SPECIALS[t - 256].encode()
+            else:
+                raw += bytes([t])
         return raw.decode("utf-8", errors=errors)
 
 
@@ -3267,22 +3300,52 @@ def slot_save_dir(value, base: str | None = None) -> str:
     return path
 
 
-class Service:
-    _unconstrained_said = False          # the one line about a reply no grammar constrained (D-050)
+AUTO_PACK = object()        # Service's pack_dir default: a pack-shaped temp directory, made once per process
 
+
+_auto_pack_path: Path | None = None
+_auto_pack_lock = threading.Lock()
+
+
+def auto_pack_dir() -> Path:
+    """The writable, pack-shaped directory a `Service` gets when it names no pack directory (`AUTO_PACK`).
+
+    The real server always passes the model's own tokenizer directory, and `pack_dir` being not None is also what
+    builds the grammar pipeline; since D-030 a Service without one refuses every chat-shaped request.  A test that
+    drives the mock engine needs somewhere for the grammar file and nothing more, so this is one temp directory per
+    process, made on first use, carrying the `vocab.json` that makes it look like a pack, and removed at process
+    exit.  `None` keeps its meaning - no pipeline - for the tests of that refusal; it is passed explicitly.
+
+    The grammar file itself usually lands in /dev/shm (`grammar_file`), so this directory is mostly the marker that
+    a pipeline may exist at all.
+    """
+    global _auto_pack_path
+    with _auto_pack_lock:
+        if _auto_pack_path is None:
+            directory = Path(tempfile.mkdtemp(prefix="strata-auto-pack-"))
+            (directory / "vocab.json").write_text("{}", encoding="utf-8")
+            atexit.register(shutil.rmtree, directory, True)
+            _auto_pack_path = directory
+        return _auto_pack_path
+
+
+class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False, pack_dir: Path | None = None):
+                 fit_max_tokens: bool = False, pack_dir: Path | None | object = AUTO_PACK):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         # The request's grammar (contracts C1/C2 in tmp/impl-plan/contracts): spliced once per shape and handed to
         # the engine as a file, which is the only thing that compiles it - so nothing is cached on this side, and a
-        # cache would be a second place where a grammar's identity is decided (D-038).  Only a pack's tokenizer can
-        # do it - a mock or byte tokenizer has no ids to constrain - so a server without one carries no grammar.
+        # cache would be a second place where a grammar's identity is decided (D-038).  The pack's tokenizer is what
+        # a decode is constrained by; a stand-in (the tests' byte tokenizer) is enough to build and write the file,
+        # which is what a mock engine is driven with.  Without any directory there is no pipeline, and
+        # `begin_grammar` refuses every chat-shaped request (D-030).  `None` is that state, explicitly.
+        if pack_dir is AUTO_PACK:
+            pack_dir = auto_pack_dir()                # so a mock engine can be driven without a pack
         self.pack_dir = Path(pack_dir) if pack_dir is not None else None
         self.pipeline = grammar_pipeline.Pipeline(tokenizer) if pack_dir is not None else None
         if self.pack_dir is not None:
             sweep_grammar_dirs(self.pack_dir)         # the pid directories of servers that are gone
-        self.grammar_notes: set[str] = set()          # every reason a reply got no grammar (D-050 says one out loud)
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -4080,8 +4143,9 @@ class Service:
         """A grammar can be built for this request and the engine will compile it.
 
         Both halves are needed: the pipeline splices the Lark and needs the pack's tokenizer, and the engine needs its
-        own tokenizer to constrain a decode (the `grammar=1` on its INFO line).  Less than both and the reply is read
-        by the text parser, so anything that changes what the prompt ends with asks this first.
+        own tokenizer to constrain a decode (the `grammar=1` on its INFO line).  Less than both and `begin_grammar`
+        refuses the request with the half that is missing (D-030), because there is no unconstrained reply left to
+        read; anything that changes what the prompt ends with asks this first.
         """
         info = getattr(self.engine, "info", None) or {}
         return self.pipeline is not None and info.get("grammar") == 1
@@ -4332,54 +4396,53 @@ class Service:
             Path(path).unlink(missing_ok=True)
 
     def begin_grammar(self, ids, tools, required, sampling):
-        """-> (the file the engine reads, the entry rule it was built for), or None.
+        """-> (the file the engine reads, the entry rule it was built for).  Never None: it raises otherwise.
 
         The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
         written to be read back at once and deleted in run()'s `finally`, and writing it this close to the engine call
         is what keeps it from outliving the request.  `required` (a tool_choice that requires a call) drops the
         prose-only branch; with thinking on it is the only thing that says so, since the prompt still ends at the
         reasoning tail.  Nothing is written into the prompt for it: with a grammar the entry already offers the call,
-        and a token prefix inside a name (`<function=get`) is a tail no entry resolves, so the request quietly
-        decoded unconstrained (D-044).
+        and a token prefix inside a name (`<function=get`) is a tail no entry resolves (D-044).
 
         Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
         all there is to return (D-038).
 
-        A request that cannot be constrained here - no pipeline, or an engine that reports no grammar - and one
-        whose grammar fails to build or write all send no grammar.  Each reason is said once and the request goes on
-        (D-020, D-050).
+        A reply with no grammar has no reader left (D-030), so every condition that used to send none raises
+        `grammar_pipeline.GrammarUnavailable` with a message of its own and the status that names whose condition it
+        is: 503 when the server cannot supply or write a grammar at all, 500 when Strata's own copy is at fault, and
+        400 when the client's request asks for something no grammar can express.
         """
-        if not self.grammar_ready():
-            self.grammar_note("this server has no grammar pipeline (no pack tokenizer)"
-                              if self.pipeline is None else
-                              "the engine reported no grammar=1 in its INFO line")
-            return None
+        if self.pipeline is None:
+            raise grammar_pipeline.GrammarUnavailable(
+                "this server has no grammar pipeline: it was started without a pack tokenizer, so a reply cannot be "
+                "constrained", status=503)
+        if not self.grammar_ready():            # the pipeline exists, so this is the engine's half
+            raise grammar_pipeline.GrammarUnavailable(
+                "the engine's INFO line has no grammar=1: it was built without the grammar decoder (run "
+                "tools/build_llguidance.sh and restart)", status=503)
         try:
             grammar = self.pipeline.for_request(ids, tools=tools,
                                                schema=format_schema((sampling or {}).get("response_format")),
                                                required=required)
-        except Exception as e:                  # noqa: BLE001 - a grammar never fails a request in this phase
-            self.grammar_note(f"{type(e).__name__}: {e}")
-            return None
+        except grammar_entries.UnresolvedTail as e:
+            # D-058: whose condition an unresolved tail is decides the status.  A call to a tool this request did
+            # not declare, and `tool_choice` without tools, are the request's own (400); a tail this server's
+            # template never writes is template drift (500).
+            raise grammar_pipeline.GrammarUnavailable(
+                str(e), status=400 if e.reason in ("undeclared_call", "required_without_tools") else 500) from None
+        except grammar_build.GrammarError as e:
+            raise grammar_pipeline.GrammarUnavailable(
+                f"the grammar skeleton no longer splices: {e}", status=500) from None
         try:
             path = hold_grammar_file(self.pack_dir, grammar.id, grammar.text)   # write and hold, as one step
-        except (OSError, ValueError) as e:
-            self.grammar_note(f"cannot write the grammar file: {e}")
-            return None
+        except OSError as e:
+            raise grammar_pipeline.GrammarUnavailable(
+                f"the grammar file cannot be written: {e}", status=503) from None
+        except ValueError as e:
+            raise grammar_pipeline.GrammarUnavailable(
+                f"the grammar file name is unusable: {e}", status=500) from None
         return str(path), grammar.entry
-
-    def grammar_note(self, why: str) -> None:
-        """Record every reason a reply got no grammar, and say the first one once per process: a prompt that is not
-        from this template fails on every request, and the reply it produces is the unprotected one (D-050)."""
-        if why in self.grammar_notes or len(self.grammar_notes) >= 32:
-            return
-        self.grammar_notes.add(why)
-        if Service._unconstrained_said:
-            return
-        Service._unconstrained_said = True
-        print(f"[strata] WARNING: {why}; this reply is read by the text parser, which has no fence, rescue or "
-              f"partial-tag rule left (D-050), so a delimiter it spells can be taken as a call. Unsafe until P7 "
-              f"makes this an error", flush=True)
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -5904,6 +5967,12 @@ def make_handler(svc: Service):
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
+            except grammar_pipeline.GrammarUnavailable as e:
+                # D-030: no reply decodes without a grammar.  `e.status` alone decides the status, so a new reason
+                # never needs a branch here; the Responses route keeps its own error format.
+                print(f"[strata] {e.status} grammar: {e}", flush=True)
+                self._json(e.status, responses_error_body(str(e), e.kind, code=e.code) if path == "/v1/responses"
+                           else {"error": {"type": e.kind, "code": e.code, "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
                 ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}},
@@ -6229,6 +6298,12 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except grammar_pipeline.GrammarUnavailable as e:
+                # `_sse()` has sent the headers already, so the refusal travels as an error event: the same place
+                # the generic ValueError handler below reports one, with `e.code` and the family its status names.
+                err = {"error": {"type": e.kind, "code": e.code, "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
@@ -6293,6 +6368,8 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
+                except grammar_pipeline.GrammarUnavailable as e:
+                    return self._json(e.status, responses_error_body(str(e), e.kind, code=e.code))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -6330,6 +6407,8 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
+            except grammar_pipeline.GrammarUnavailable as e:
+                self._responses_failed(asm, str(e), e.code, send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
@@ -6447,6 +6526,12 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except grammar_pipeline.GrammarUnavailable as e:
+                # The headers are sent, so the refusal is an error event here too; Anthropic has one error type
+                # for both families, and the message says which condition it was.
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
