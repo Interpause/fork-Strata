@@ -715,10 +715,8 @@ struct Options {
     bool vision = false;
     /// --grammar-tokenizer DIR: the tokenizer a `grammar=<file>` request is compiled against.  Unset, it is the
     /// pack's own `<pack>/tokenizer` when that holds a tokenizer - the grammar is the default path, so it is found
-    /// rather than named.  `--grammar-tokenizer off` turns it off for a run.
+    /// rather than named.
     std::string grammar_tokenizer;
-    /// --grammar-tokenizer off: do not look for one beside the pack's weights (the automatic default below).
-    bool grammar_off = false;
     int adapt_swaps = 96;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
@@ -2604,16 +2602,7 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
-        else if (a == "--grammar-tokenizer") {
-            o.grammar_tokenizer = next("--grammar-tokenizer");
-            // The grammar is the default path, so a run turns it off by name: `off`, `none` or `-`.
-            // TEMPORARY(D-030): P7 deletes this spelling with the rest of the escape hatches - the grammar is
-            // compulsory, so a run that cannot load one must fail rather than serve unconstrained.
-            if (o.grammar_tokenizer == "off" || o.grammar_tokenizer == "none" || o.grammar_tokenizer == "-") {
-                o.grammar_tokenizer.clear();
-                o.grammar_off = true;
-            }
-        }
+        else if (a == "--grammar-tokenizer") o.grammar_tokenizer = next("--grammar-tokenizer");
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -10725,26 +10714,33 @@ int main(int argc, char** argv) {
         }
         // Grammar-constrained decoding: the tokenizer and llguidance are loaded once here, before READY, so a
         // missing library or tokenizer is discovered before the first request instead of on one.  The grammar is
-        // the default path, so the tokenizer is *found* rather than named: the pack keeps it beside its weights
-        // (`<pack>/tokenizer`), and `--grammar-tokenizer DIR` only overrides that.  A pack without one beside it
-        // (a native model) leaves the grammar off, and the INFO line then has no grammar=1, which is what tells
-        // the server not to send it a `grammar=<file>` (an unconstrained reply is not a fallback, see
-        // docs/DETAILS.md and tmp/impl-plan/contracts/c3-engine-step.md).
-        // TEMPORARY(D-030): serving on with no grammar is the last unconstrained path; P7 makes a pack without a
-        // tokenizer fatal before READY instead, naming both remedies.
+        // the path a reply is read from, so the tokenizer is *found* rather than named: the pack keeps it beside
+        // its weights (`<pack>/tokenizer`), and `--grammar-tokenizer DIR` only overrides that.  A run that cannot
+        // load one refuses to serve - an unconstrained reply is not a fallback, so there is nothing to fall back to
+        // (D-030, docs/DETAILS.md and tmp/impl-plan/contracts/c3-engine-step.md).
         strata::grammar::Session grammar_session;
         std::string grammar_dir = o.grammar_tokenizer;
-        if (grammar_dir.empty() && !o.grammar_off && !o.pack.empty()) {
+        if (grammar_dir.empty() && !o.pack.empty()) {
             std::error_code fec;
             const std::string beside = o.pack + "/tokenizer";
             if (std::filesystem::is_regular_file(beside + "/vocab.json", fec) &&
                 std::filesystem::is_regular_file(beside + "/token_type.json", fec))
                 grammar_dir = beside;
         }
+        if (grammar_dir.empty()) {
+            const std::string beside = o.pack.empty() ? std::string("<pack>") + "/tokenizer" : o.pack + "/tokenizer";
+            std::fprintf(stderr, "strata serve: no grammar tokenizer: every reply is decoded under a grammar, which "
+                                 "masks the tokens of the pack's vocabulary - put vocab.json and token_type.json in "
+                                 "%s, or name the directory that holds them with --grammar-tokenizer DIR\n",
+                         beside.c_str());
+            return 1;
+        }
         {
             std::string gerr;
-            if (!grammar_dir.empty() && !grammar_session.open(grammar_dir, gerr))
+            if (!grammar_session.open(grammar_dir, gerr)) {
                 std::fprintf(stderr, "strata serve: grammar tokenizer %s: %s\n", grammar_dir.c_str(), gerr.c_str());
+                return 1;
+            }
         }
         // A batch slot can carry a grammar mask only in the serial windows (`piped_groups` is the pipelined path): a
         // group's commit graph keeps every row it launches, so a row that must draw nothing could not stop (see the
