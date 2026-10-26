@@ -247,7 +247,8 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", 
                "<|video_pad|>": "\U000F0E06"}
 # #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
 # (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
-# message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
+# message marks it too (kept_as_special): a client that replays the model's raw call text as *content* gets that text
+# back as text, and the call itself still reaches the model as the real markers the template writes for tool_calls.
 # 0.1.44: `<tool_call>`, `<tool_response>` and `</tool_response>` are type 4 too (ids 248058, 248066, 248070), so a quoted
 # one handed the model the real call / tool-result marker in the same way (found by 47Hunter47 in #2026).  The template
 # writes the tool-result markers around a tool message itself; only the text inside a message is marked.
@@ -256,6 +257,41 @@ TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", 
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+
+
+def kept_as_special(role) -> frozenset[str]:
+    """The tag texts a message of `role` keeps as the tokenizer's special ids; every other one is marked as text.
+
+    The specials a message's text can name come in two classes, and the role decides which class it may keep.
+
+    Control tokens (token type 3: <|im_start|>, <|im_end|>, <|endoftext|>, the tokenizer's other CONTROL literals)
+    are never kept, in any role: one written inside a message forges a turn boundary, and a system prompt an agent
+    pastes is no less a message than a user's question.
+
+    Structural tags (`THINK_TAGS`, `TOOL_LITERAL_TAGS`) are the markers the model reads a reasoning block, a call
+    and a tool result by, so the role differs:
+      - a system message keeps them, because a system prompt that demonstrates a call format or a quoting convention
+        is meant to show the model the markers it will itself write;
+      - user, tool and assistant mark them, so their text can only quote a marker.  An assistant turn is marked in
+        its content and in its reasoning_content alike: the template renders reasoning_content when
+        preserve_thinking is set, and a fenced fake call there came back as the real <tool_call> id (248058) when
+        the conversation was re-submitted.
+
+    `VISION_TAGS` is a third thing and is never kept: those markers are placeholders the template writes *around an
+    image item*, so one in a message's text has no image behind it - keeping it in a system message would let the
+    text claim an image slot that never arrives, which is the embedding-count mismatch the template's own vision
+    path is built to avoid.
+    """
+    if role != "system":
+        return frozenset()
+    return frozenset(THINK_TAGS) | frozenset(TOOL_LITERAL_TAGS)
+
+
+def _role_tags(role, tags: dict[str, str]) -> dict[str, str]:
+    """`tags` without the ones `role` keeps as the tokenizer's own (kept_as_special), i.e. what its text is marked
+    for: a system message is marked for the control tokens only, every other role for all of them."""
+    kept = kept_as_special(role)
+    return tags if not kept else {t: v for t, v in tags.items() if t not in kept}
 
 
 def literal_tags(controls) -> dict[str, str]:
@@ -336,28 +372,37 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
     LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
     whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
-    An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
-    inline) keeps that one block as the model's markers, as before."""
+    Which tags a role's text keeps as the tokenizer's own is `kept_as_special`'s decision: a control token's text is
+    marked in every role, a structural tag only outside a system message.  An assistant message whose content opens
+    with a whole <think>...</think> block (clients that send the reasoning inline) keeps that one block as the model's
+    markers, as before."""
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
-    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
+    mine = {}                                # role -> the tags that role's text is marked for (kept_as_special)
     for m in messages:
         m = dict(m)
         content = m.get("content")
-        mine = own if m.get("role") == "assistant" else tags
+        role = m.get("role")
+        if role not in mine:
+            mine[role] = _role_tags(role, tags)
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, mine)
-        if m.get("role") == "user":
+                m[k] = _mark_deep(v, mine[role])
+        if role == "user":
+            # Exception to "a user message marks every tag": a message that is wholly <tool_response>...</tool_response>
+            # keeps that outer pair, because the template tells a tool result sent as a user turn from a question by
+            # exactly that pair (last_query_index), and only the text inside is marked.
             kept = _keep_tool_result_wrap(content, tags)
             if kept is not None:
                 m["content"] = kept
-        if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
+        if role == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
+            # Exception to "an assistant message marks every tag": a client that sends the reasoning inline opens its
+            # content with the very block the template would have written, so that one block's two markers stay.
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
-                            _mark(content[j + len("</think>"):], own))
+            m["content"] = (content[:i] + _mark(content[i:j], mine[role]) + "</think>" +
+                            _mark(content[j + len("</think>"):], mine[role]))
         out.append(m)
     return out, _mark_deep(tools, tags), True
 
