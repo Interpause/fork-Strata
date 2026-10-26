@@ -9,8 +9,6 @@ decoded unconstrained, so `Refusals` below pins each of the six conditions and `
 sees on the four request shapes.
 """
 import base64
-import contextlib
-import io
 import json
 import os
 import subprocess
@@ -102,41 +100,6 @@ class Key(unittest.TestCase):
     def test_the_key_sits_beside_the_other_keys(self):
         keys = StrataEngine.sampling_keys({"temperature": 0.5, "strata_grammar": "/x/y.gr"})
         self.assertEqual(keys, " temperature=0.5 grammar=" + base64.b64encode(b"/x/y.gr").decode("ascii"))
-
-
-class Capability(unittest.TestCase):
-    """An engine that cannot compile a grammar must not be sent one: it refuses the whole request (C1's engine
-    answers `ERR grammar: no grammar tokenizer was loaded ...`), and a killed request is worse than the
-    unconstrained reply this phase already gives.  `INFO grammar=1` is how the engine says it can."""
-
-    def setUp(self):
-        StrataEngine._no_grammar_said = False
-        self.eng = object.__new__(StrataEngine)          # keys() reads only info
-        self.eng.info = {}
-
-    def test_an_engine_with_grammar_gets_the_key(self):
-        self.eng.info = {"grammar": 1}
-        want = base64.b64encode(b"/dev/shm/g/ab12.gr").decode("ascii")
-        self.assertEqual(self.eng.keys({"strata_grammar": "/dev/shm/g/ab12.gr"}), " grammar=" + want)
-
-    def test_an_engine_without_it_gets_the_other_keys_and_no_grammar(self):
-        keys = self.eng.keys({"temperature": 0.5, "strata_grammar": "/dev/shm/g/ab12.gr"})
-        self.assertEqual(keys, " temperature=0.5")
-
-    def test_the_drop_is_said_once(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.eng.keys({"strata_grammar": "/a.gr"})
-            self.eng.keys({"strata_grammar": "/b.gr"})
-        self.assertEqual(out.getvalue().count("[strata] WARNING:"), 1)
-        self.assertIn("no grammar=1", out.getvalue())
-        self.assertIn("refuses a chat-shaped request", out.getvalue())   # the same condition begin_grammar refuses (D-030)
-
-    def test_a_request_without_a_grammar_says_nothing(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(self.eng.keys({"temperature": 0.5}), " temperature=0.5")
-        self.assertEqual(out.getvalue(), "")
 
 
 class Request(unittest.TestCase):

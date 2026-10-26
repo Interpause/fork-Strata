@@ -1290,8 +1290,6 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
-    _no_grammar_said = False             # the one line about an engine that cannot compile a grammar
-
     def solo_only(self, sampling: dict) -> bool:
         """Whether this request must take the solo path even when the engine runs batch slots.
 
@@ -1304,22 +1302,6 @@ class StrataEngine:
         """
         return (bool((self.info or {}).get("grammar")) and bool((sampling or {}).get("strata_grammar"))
                 and not (self.info or {}).get("gbatch"))
-
-    def keys(self, sampling: dict) -> str:
-        """`sampling_keys` for this engine, with a request's grammar sent only to an engine that reported it can
-        compile one (INFO `grammar=1`, engines with the C1 grammar work).  One that cannot refuses the whole
-        request, so the key is dropped instead of killing it - the reply is then unconstrained, which is said
-        once.  P7 makes a declared shape fail instead of decoding unconstrained (D-027)."""
-        # TEMPORARY(D-030): dropping the key and saying so is the unconstrained reply; P7 turns the same
-        # condition into an error for every chat-shaped request, because the grammar is compulsory.
-        if sampling.get("strata_grammar") and not (self.info or {}).get("grammar"):
-            sampling = {k: v for k, v in sampling.items() if k != "strata_grammar"}
-            if not StrataEngine._no_grammar_said:
-                StrataEngine._no_grammar_said = True
-                print("[strata] WARNING: the engine reported no grammar=1 in its INFO line (no tokenizer was "
-                      "loaded for it): the key is dropped here, and `begin_grammar` refuses a chat-shaped request "
-                      "for the same condition (D-030)", flush=True)
-        return self.sampling_keys(sampling)
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1714,7 +1696,7 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.keys(sampling or {})
+        keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -2105,8 +2087,8 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.keys(sampling or {})}"
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
