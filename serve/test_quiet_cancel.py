@@ -38,8 +38,13 @@ def reader():
             commands.put(line)
     commands.put('QUIT')
 threading.Thread(target=reader, daemon=True).start()
+# D-030: a serve engine that cannot compile a grammar refuses to start, and the server refuses to answer
+# one that reports no `grammar=1` - so the stand-in claims the capability it must have.  Its replies are one
+# token (`T 90`), which ends on the request's cap rather than on `<|im_end|>`, so no closer is needed.
 if batch:
-    print(f'INFO batch_slots={batch}', flush=True)
+    print(f'INFO batch_slots={batch} grammar=1', flush=True)
+else:
+    print('INFO grammar=1', flush=True)
 print('READY 4096 stop', flush=True)
 count = 0
 while True:
