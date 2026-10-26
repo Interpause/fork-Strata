@@ -382,6 +382,37 @@ class Refusals(unittest.TestCase):
         self.assertEqual(e.kind, "invalid_request_error")
         self.assertIn("minProperties > maxProperties", str(e))
 
+    def test_a_repaired_schema_says_which_rung_it_took(self):
+        # D-058's reporting rule: one line per request that relaxed something, naming the rung, the class and the
+        # pointer, so "which schema failed and why" needs no reply to inspect.  The same request without a repair
+        # says nothing at all: a log line per request would bury the ones that matter.
+        try:
+            grammar_matcher.vocabulary(FIXTURE_TOKENIZER)
+        except grammar_matcher.LibraryMissing as e:
+            self.skipTest(f"needs libllguidance ({e})")
+        repairable = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "look", "schema": {"type": "object", "properties": {
+                "a": {"type": "string", "pattern": "(?=a)"}}}}}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            list(self.svc.run(self.svc.prepare([{"role": "user", "content": "hi"}], None,
+                                               {"enable_thinking": False}, req=repairable)[0],
+                              False, None, 8, dict(repairable), threading.Event()))
+        logged = out.getvalue()
+        self.assertIn("[strata] grammar entry_answer_json", logged)
+        self.assertIn("rung 2 unsupported", logged)
+        self.assertIn("/properties/a/pattern", logged)
+        self.assertEqual(len([line for line in logged.splitlines() if "rung " in line]), 1)
+
+        clean = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "look", "schema": {"type": "object"}}}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            list(self.svc.run(self.svc.prepare([{"role": "user", "content": "hi"}], None,
+                                               {"enable_thinking": False}, req=clean)[0],
+                              False, None, 8, dict(clean), threading.Event()))
+        self.assertNotIn("rung ", out.getvalue())
+
 
 class ClientVisible(unittest.TestCase):
     """What the client sees when `begin_grammar` refuses inside a generator that has not yielded yet.

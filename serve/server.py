@@ -4452,6 +4452,14 @@ class Service:
         except grammar_build.GrammarError as e:
             raise grammar_pipeline.GrammarUnavailable(
                 f"the grammar skeleton no longer splices: {e}", status=500) from None
+        if grammar.repairs:
+            # D-058's reporting rule, one line per request that had to relax something: without it "which schema
+            # failed and why" takes a reply to inspect, and the reply may look fine.  A rung is logged with where it
+            # applied, so a `pattern` dropped at `/properties/a/pattern` and a parameter made arbitrary read
+            # differently in the log.
+            print(f"[strata] grammar {grammar.entry} ({grammar.id}): "
+                  + "; ".join(f"rung {step.rung} {step.cls}: {step.note}" for step in grammar.repairs),
+                  flush=True)
         try:
             path = hold_grammar_file(self.pack_dir, grammar.id, grammar.text)   # write and hold, as one step
         except OSError as e:
