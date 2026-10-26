@@ -236,6 +236,20 @@ class Vocabulary:
             raise RuntimeError("llg_new_matcher returned NULL")
         return Matcher(self, ptr)
 
+    def compile_error(self, text: str, kind: str = "lark") -> str | None:
+        """The library's message when `text` does not compile, or None when it does (P7 item 5).
+
+        Compiling is the only way to ask whether a grammar compiles, and a refusal is not an exception: the library
+        returns a matcher in error state ("Always returns a non-null value", `parser/llguidance.h`), so the message is
+        read off that matcher and it is freed at once.  The message is returned verbatim - bounding and classifying
+        it is `ladder.py`'s job (design §5).
+        """
+        matcher = self.new_matcher(text, kind)
+        try:
+            return matcher.error() if matcher.is_error() else None
+        finally:
+            matcher.close()
+
     def close(self) -> None:
         if getattr(self, "_tok_ptr", None):
             self.lib.lib.llg_free_tokenizer(self._tok_ptr)

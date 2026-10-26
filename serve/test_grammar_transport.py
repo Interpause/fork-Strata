@@ -9,6 +9,8 @@ decoded unconstrained, so `Refusals` below pins each of the six conditions and `
 sees on the four request shapes.
 """
 import base64
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -24,8 +26,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import serve.server as server_module  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
+from serve.grammar import matcher as grammar_matcher  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
-from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
+from serve.server import ByteTokenizer, FIXTURE_TOKENIZER, MockEngine, Service, StrataEngine  # noqa: E402
 from serve.server import drop_grammar, grammar_file, hold_grammar, hold_grammar_file  # noqa: E402
 from serve.server import serve, sweep_grammar_dirs  # noqa: E402
 
@@ -363,6 +366,22 @@ class Refusals(unittest.TestCase):
         self.assertEqual(e.status, 500)
         self.assertIn("name is unusable", str(e))
 
+    def test_a_response_schema_the_ladder_cannot_repair_is_the_requests_400(self):
+        # D-065: the ladder is run before the request is admitted, and when it runs out of rungs the client is told
+        # why in the compiler's own words.  Skipped without the library, because only compiling can tell whether a
+        # schema is repairable.  `minProperties` > `maxProperties` is legal JSON Schema (the gate accepts it), the
+        # compiler calls it unsatisfiable, and the message names no property for a rung to widen.
+        try:
+            grammar_matcher.vocabulary(FIXTURE_TOKENIZER)
+        except grammar_matcher.LibraryMissing as e:
+            self.skipTest(f"needs libllguidance ({e})")
+        sampling = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "limits", "schema": {"type": "object", "minProperties": 5, "maxProperties": 2}}}}
+        e = self.refused(sampling=sampling)
+        self.assertEqual(e.status, 400)
+        self.assertEqual(e.kind, "invalid_request_error")
+        self.assertIn("minProperties > maxProperties", str(e))
+
 
 class ClientVisible(unittest.TestCase):
     """What the client sees when `begin_grammar` refuses inside a generator that has not yielded yet.
@@ -548,6 +567,53 @@ class Cleanup(unittest.TestCase):
                 list(svc.run(ids, False, None, 8, {}, threading.Event()))
         self.assertEqual(set(self.pack.iterdir()), before, "the file and its pid directory must both be gone")
         self.assertEqual(server_module._grammar_holds, {}, "and its hold released")
+
+
+class Compiler(unittest.TestCase):
+    """Which vocabulary a `Service` compiles a schema against (D-064).
+
+    A service with a pack directory always gets a compiler; a pack-shaped directory with no tokenizer in it falls
+    back to the committed fixture rather than to no compiler at all.  The compile cases skip without
+    `libllguidance.so` (a `Vocabulary` cannot be built); the missing-library case is the one that must pass without
+    it, because a server has to survive it.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def fixture_ok(self):
+        try:
+            grammar_matcher.vocabulary(FIXTURE_TOKENIZER)
+        except grammar_matcher.LibraryMissing as e:
+            raise unittest.SkipTest(f"needs libllguidance ({e})")
+
+    def test_a_pack_shaped_directory_without_a_tokenizer_uses_the_fixture(self):
+        self.fixture_ok()
+        pack = Path(self.dir.name)
+        (pack / "vocab.json").write_text("{}", encoding="utf-8")     # what `auto_pack_dir` leaves
+        svc, _, _ = service(pack)
+        self.assertEqual(svc.pipeline.compiler.dir, FIXTURE_TOKENIZER.resolve())
+
+    def test_a_complete_tokenizer_directory_is_compiled_against_itself(self):
+        self.fixture_ok()
+        pack = Path(self.dir.name)
+        for name in ("vocab.json", "token_type.json", "merges.txt"):
+            (pack / name).write_bytes((FIXTURE_TOKENIZER / name).read_bytes())
+        svc, _, _ = service(pack)
+        self.assertEqual(svc.pipeline.compiler.dir, pack.resolve())
+
+    def test_a_missing_library_turns_the_ladder_off_instead_of_crashing(self):
+        # The one case that must not stop the server: an engine built without the grammar decoder refuses a chat
+        # request later with its own 503, so the pipeline can exist without a compiler.
+        with unittest.mock.patch.dict(grammar_matcher._VOCABULARIES, clear=True), \
+                unittest.mock.patch.object(grammar_matcher, "Library",
+                                           side_effect=grammar_matcher.LibraryMissing("no libllguidance.so")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                svc, _, _ = service(server_module.auto_pack_dir())
+        self.assertIsNone(svc.pipeline.compiler)
+        self.assertIn("the compile ladder is off", out.getvalue())
 
 
 if __name__ == "__main__":

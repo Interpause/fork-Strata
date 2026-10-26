@@ -67,6 +67,7 @@ from serve import runconfig  # noqa: E402
 from serve.grammar import build as grammar_build  # noqa: E402
 from serve.grammar import entries as grammar_entries  # noqa: E402
 from serve.grammar import guard  # noqa: E402
+from serve.grammar import matcher as grammar_matcher  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
@@ -3311,6 +3312,38 @@ def auto_pack_dir() -> Path:
         return _auto_pack_path
 
 
+#: The committed stand-in tokenizer (`serve/fixtures/tokenizer`, D-064): what a schema is compiled against when the
+#: pack's own tokenizer cannot be used.  The ladder only ever asks "does this grammar compile", a schema-shape
+#: question whose answer does not depend on the ids, so a stand-in is sound where a pack is absent.
+FIXTURE_TOKENIZER = Path(__file__).with_name("fixtures") / "tokenizer"
+
+#: What a directory needs before `matcher.Vocabulary` can be built from it (the pack's own tokenizer, or the fixture).
+COMPILER_FILES = ("vocab.json", "token_type.json", "merges.txt")
+
+
+def grammar_compiler(pack_dir: Path, tok):
+    """The compiler a `Service`'s grammar pipeline checks every schema with, or `None` (D-064).
+
+    The ladder is mandatory: a service that has a pack directory always gets a compiler, and a directory that is
+    pack-shaped but holds no tokenizer (the `auto_pack_dir` a test gets) falls back to the committed fixture rather
+    than to no compiler at all.  The pack's own directory is compiled against the service's own tokenizer, so the
+    vocabulary is the one the engine decodes with; the fixture builds its own.
+
+    A missing `libllguidance.so` is the one case that must not stop the server - an engine built without the grammar
+    decoder already refuses every chat request later (`Service.grammar_ready`) - so it is one log line and no
+    compiler.  Anything else a real tokenizer directory fails on is an installation problem and is left to raise.
+    """
+    directory = Path(pack_dir)
+    try:
+        if all((directory / name).exists() for name in COMPILER_FILES):
+            return grammar_matcher.vocabulary(directory, tok)
+        return grammar_matcher.vocabulary(FIXTURE_TOKENIZER)
+    except grammar_matcher.LibraryMissing as e:
+        print(f"[strata] the compile ladder is off: {e}; a schema is not compiled before the engine gets it",
+              flush=True)
+        return None
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -3325,7 +3358,10 @@ class Service:
         if pack_dir is AUTO_PACK:
             pack_dir = auto_pack_dir()                # so a mock engine can be driven without a pack
         self.pack_dir = Path(pack_dir) if pack_dir is not None else None
-        self.pipeline = grammar_pipeline.Pipeline(tokenizer) if pack_dir is not None else None
+        # D-064: where a pipeline exists it compiles, so a schema the grammar engine cannot express is caught here
+        # rather than by a decode that fails.  `None` still means no pipeline (the tests of that refusal pass it).
+        self.pipeline = (grammar_pipeline.Pipeline(tokenizer, compiler=grammar_compiler(self.pack_dir, tokenizer))
+                         if self.pack_dir is not None else None)
         if self.pack_dir is not None:
             sweep_grammar_dirs(self.pack_dir)         # the pid directories of servers that are gone
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
