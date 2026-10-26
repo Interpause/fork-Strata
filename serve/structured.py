@@ -1,11 +1,16 @@
 """JSON response formats at the HTTP boundary: prompt once, validate before delivery.
 
-The native engine has no grammar decoder. Failed generations are errors, never
-silently retried or returned as successful structured output.
+`jsonschema` is a dependency (requirements.txt), so a declared `json_schema` is always checked against its
+meta-schema before the engine loads: the validity gate is the first rung, and the compile ladder
+(serve/grammar/ladder.py) starts after it.
 
-`jsonschema` is optional (no new hard dependency of the server): json_object needs only the standard library, and
-json_schema is checked against its schema when the package is installed - without it, only that the answer is one
-JSON object, and the server says so once.
+The gate's format assertion is off (`format_checker=None`). Its default asserts the meta-schema's
+`format: regex` on every `pattern` with CPython's `re`, which is neither JSON Schema's ECMA-262 nor the engine's
+`regex-syntax`: `\\p{L}+` compiles in the grammar but Python raises `bad escape \\p`, a false 400. The engine, not
+Python, is the authority on a `pattern`; a malformed `(` is therefore not a validity error and reaches the ladder.
+
+`json_object` needs no schema library - "one JSON object" is the whole contract there - so it keeps `_ObjectOnly`,
+a standard-library validator.
 """
 import json
 import threading
@@ -16,7 +21,11 @@ class StructuredOutputError(RuntimeError):
 
 
 class _ObjectOnly:
-    """The validator for json_object, and for json_schema without jsonschema: one JSON object."""
+    """The validator for `json_object`: one JSON object is the whole contract there, so no schema library is needed.
+
+    `format_schema` deliberately routes `json_object` to the literal `{"type": "object"}`; this is what validates
+    that reply, not a stand-in for a missing `jsonschema`.
+    """
 
     def iter_errors(self, value):
         if not isinstance(value, dict):
@@ -28,27 +37,25 @@ class _ObjectError:
     message = "the answer is not a JSON object"
 
 
-_jsonschema = None                     # (validators, SchemaError, Registry, NoSuchResource), False when not installed
+_jsonschema = None                     # (validators, SchemaError, Registry, NoSuchResource), imported once
 _jsonschema_lock = threading.Lock()
 
 
 def jsonschema_modules():
-    """jsonschema, imported on first use; None when it is not installed (said once, in the server window)."""
+    """`jsonschema` and its helpers (a dependency of every install), imported on first use.
+
+    Imported lazily so a server start does not pay for it; the validity gate calls this when a request declares a
+    `json_schema`.
+    """
     global _jsonschema
     with _jsonschema_lock:
         if _jsonschema is None:
-            try:
-                from jsonschema import validators
-                from jsonschema.exceptions import SchemaError
-                from referencing import Registry
-                from referencing.exceptions import NoSuchResource
-                _jsonschema = (validators, SchemaError, Registry, NoSuchResource)
-            except ImportError:
-                _jsonschema = False
-                print('[strata] response_format json_schema: the Python package jsonschema is not installed, so '
-                      'answers are only checked to be one JSON object (python -m pip install "jsonschema>=4.23,<5")',
-                      flush=True)
-        return _jsonschema or None
+            from jsonschema import validators
+            from jsonschema.exceptions import SchemaError
+            from referencing import Registry
+            from referencing.exceptions import NoSuchResource
+            _jsonschema = (validators, SchemaError, Registry, NoSuchResource)
+        return _jsonschema
 
 
 def _only_objects(node, root, refs=()):
@@ -126,18 +133,22 @@ def prepare_format(response_format, messages, with_tools=False):
     schema = format_schema(response_format)
     if schema is None:
         return messages, None
-    modules = None if response_format.get("type") == "json_object" else jsonschema_modules()
-    if modules is None:
-        validator = _ObjectOnly()
+    if response_format.get("type") == "json_object":
+        validator = _ObjectOnly()          # format_schema sent {"type": "object"}: one JSON object is the contract
     else:
-        validators, SchemaError, Registry, NoSuchResource = modules
+        validators, SchemaError, Registry, NoSuchResource = jsonschema_modules()
 
         def no_remote(uri):
             raise NoSuchResource(ref=uri)
 
         try:
             cls = validators.validator_for(schema)
-            cls.check_schema(schema)
+            # format_checker=None on purpose: the default checker asserts the meta-schema's `format: regex` on
+            # every `pattern` with CPython's `re`, which is neither JSON Schema's ECMA-262 nor the engine's
+            # `regex-syntax`. Measured false 400: `\p{L}+` is a valid pattern for llguidance but Python raises
+            # `bad escape \p`. The engine is the authority on `pattern`, so a malformed `(` is not a validity
+            # error here: it reaches the compile ladder (serve/grammar/ladder.py), which owns it.
+            cls.check_schema(schema, format_checker=None)
             validator = cls(schema, registry=Registry(retrieve=no_remote))
         except SchemaError as exc:
             raise ValueError(f"invalid response_format schema: {exc.message}") from exc

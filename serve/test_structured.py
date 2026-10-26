@@ -10,12 +10,6 @@ from serve.frontend import ChatTemplate
 from serve import structured
 from serve.server import ByteTokenizer, MockEngine, Service, serve
 
-try:
-    import jsonschema  # noqa: F401
-    HAVE_JSONSCHEMA = True
-except ImportError:                  # optional: json_schema answers are then only checked to be one object
-    HAVE_JSONSCHEMA = False
-
 
 STORY = {"title": "Photobooth", "sheet": "A single continuous shot.", "cast": [],
          "boxes": [{"box": 1, "duration_ms": 15000, "new_shot": True, "beat": "Hailee changes poses.",
@@ -86,7 +80,6 @@ class Structured(unittest.TestCase):
         self.assertIn("reasoning_content", raw)
         self.assertIn("data: [DONE]", raw)
 
-    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
     def test_invalid_generation_is_an_error_and_never_streams_content(self):
         for script in ("## Film Plan - Photobooth", '{"title":"Only a title"}',
                        json.dumps({**STORY, "extra": True}),
@@ -122,7 +115,6 @@ class Structured(unittest.TestCase):
             self.assertEqual(self.chat()[0], 502)
             self.assertEqual(generate.call_count, 1)
 
-    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
     def test_invalid_schema_is_400_and_local_refs_work(self):
         for schema in ({"type": "object", "properties": {"x": {"type": "invalid"}}},
                        {"type": "object", "$ref": "https://other.example/schema"}):
@@ -146,16 +138,34 @@ class Structured(unittest.TestCase):
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()
 
-    def test_without_jsonschema_an_object_is_still_required(self):
-        # jsonschema is optional: without it json_schema answers are checked to be one JSON object, json_object
-        # never needs it, and nothing is imported at server start
-        with mock.patch.object(structured, "_jsonschema", False):
-            self.assertEqual(self.chat()[0], 200)
-            for script in ("## Film Plan - Photobooth", "[1, 2]"):
-                code, reply = self.chat(script)
-                self.assertEqual(code, 502, script)
-                self.assertEqual(reply["error"]["code"], "structured_output_failed")
-            self.assertEqual(self.chat('{"answer":4}', response_format={"type": "json_object"})[0], 200)
+    def test_a_pattern_only_the_engine_can_judge_is_not_a_false_400(self):
+        # `\p{L}+` is a valid `regex-syntax` pattern for the grammar, but CPython's `re` refuses it (`bad escape
+        # \p`): the gate's format assertion is off, so a schema the engine compiles is never a 400 here.
+        schema = object_schema({"word": {"type": "string", "pattern": "\\p{L}+"}})
+        fmt = {"type": "json_schema", "json_schema": {"name": "letters", "schema": schema}}
+        messages, validator = structured.prepare_format(fmt, [{"role": "user", "content": "a word"}])
+        self.assertIsNotNone(validator)
+        self.assertIn("\\p{L}+", messages[0]["content"])
+
+    def test_a_malformed_pattern_reaches_the_compile_ladder_not_the_gate(self):
+        # `(` is not a schema-validity error with the format assertion off, so it is not a dead-end 400: it reaches
+        # the compile ladder, which classifies and repairs it (P7 item 5).
+        schema = object_schema({"word": {"type": "string", "pattern": "("}})
+        fmt = {"type": "json_schema", "json_schema": {"name": "broken", "schema": schema}}
+        structured.prepare_format(fmt, [{"role": "user", "content": "a word"}])   # does not raise; the ladder owns it
+
+    def test_the_validity_gate_still_refuses_what_is_not_a_schema(self):
+        # The gate keeps its real job. A non-object root is stopped by format_schema's root rule; an unknown `type`
+        # inside an object, and a `required` that is not a list, are stopped by jsonschema itself.
+        cases = (({"type": "banana"}, "only JSON objects"),
+                 ({"type": "object", "required": "a"}, "invalid response_format schema:"),
+                 ({"type": "object", "properties": {"a": {"type": "banana"}}}, "invalid response_format schema:"))
+        for schema, message in cases:
+            fmt = {"type": "json_schema", "json_schema": {"name": "bad", "schema": schema}}
+            with self.subTest(schema=schema):
+                with self.assertRaises(ValueError) as caught:
+                    structured.prepare_format(fmt, [{"role": "user", "content": "hi"}])
+                self.assertIn(message, str(caught.exception))
 
     def test_root_unions_of_object_shapes_are_accepted(self):
         # A root anyOf of object shapes (sent by apps written against llama.cpp's grammar path) still means

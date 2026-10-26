@@ -455,12 +455,7 @@ class OverHttp(Server):
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": fmt}, "stream": True})
         self.assertEqual([e["delta"] for e in events if e["type"] == "response.output_text.delta"], ["{\"n\":3}"])
         self.assertEqual(events[-1]["type"], "response.completed")
-        # an answer that fails the schema - only jsonschema can tell: it is optional (serve/structured.py), and
-        # without it a json_schema answer is checked to be one JSON object, which {"n": 3} is
-        try:
-            import jsonschema  # noqa: F401
-        except ImportError:
-            return
+        # an answer that fails the schema: jsonschema is a dependency, so the reply check always runs
         bad = {**fmt, "schema": {**fmt["schema"], "properties": {"n": {"type": "string"}}}}
         code, r = self.post({"model": "m", "input": "a number", "text": {"format": bad}})
         self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
@@ -602,10 +597,6 @@ class JsonFormatWithTools(Server):
         self.assertEqual(len([e for e in events if e["type"] == "response.output_text.delta"]), 1)
 
     def test_a_text_answer_that_breaks_the_schema_fails_as_without_tools(self):
-        try:
-            import jsonschema  # noqa: F401
-        except ImportError:
-            self.skipTest("the schema check needs jsonschema")
         self.script_with('</think>\n\n{"outcome": 3}<|im_end|>')
         code, r = self.post(self.request())
         self.assertEqual((code, r["error"]["code"]), (502, "structured_output_failed"))
