@@ -8,6 +8,7 @@ from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve import structured
+from serve import server as server_module
 from serve.server import ByteTokenizer, MockEngine, Service, serve
 
 
@@ -64,6 +65,48 @@ class Structured(unittest.TestCase):
                             {"role": "user", "content": "Photobooth. 15 seconds."}],
                "response_format": FORMAT, "reasoning_effort": "none", **kwargs}
         return self.request("/v1/chat/completions", req)
+
+    def responses(self, **kwargs):
+        req = {"model": "qwen3.8-flash-next", "input": "Photobooth. 15 seconds.",
+               "reasoning": {"effort": "none"}, **kwargs}
+        return self.request("/v1/responses", req)
+
+    def test_the_responses_route_sends_its_schema_to_the_grammar(self):
+        # D-058(a): the request is the sampling dict this route runs with, so `text.format`'s schema has to be
+        # written onto it.  Without that, `begin_grammar` reads None, `resolve_entry` picks `entry_answer_plain`,
+        # and the schema only judges the finished text - which then ends as a 502, not a constrained decode.
+        grammars = []
+        write = server_module.hold_grammar_file
+
+        def spy(pack_dir, name, text):
+            grammars.append(text)
+            return write(pack_dir, name, text)
+
+        with mock.patch.object(server_module, "hold_grammar_file", spy):
+            code, reply = self.responses(text={"format": {"type": "json_schema", "name": "h3_story",
+                                                          "strict": True, "schema": STORY_SCHEMA}})
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["output"][-1]["content"][0]["text"]), STORY)
+        self.assertTrue(grammars, "the route must ask the grammar for a reader")
+        self.assertIn("start: entry_answer_json", grammars[0])
+
+    def test_a_schema_with_tools_is_refused_on_both_routes(self):
+        # The one message, on the route that used to refuse the pair and the one that used to send it anyway
+        # (D-058(b)): `build()` drops the schema when tools are present, so that route only validated afterwards.
+        chat = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+        responses = [{"type": "function", "name": "search", "parameters": {"type": "object"}}]
+        with mock.patch.object(self.svc, "load") as load:
+            code, reply = self.chat(tools=chat)
+            self.assertEqual(code, 400)
+            self.assertEqual(reply["error"]["message"], structured.FORMAT_WITH_TOOLS)
+            code, reply = self.responses(tools=responses, text={"format": {"type": "json_schema", "name": "story",
+                                                                          "schema": STORY_SCHEMA}})
+            self.assertEqual(code, 400, reply)
+            self.assertEqual(reply["error"]["message"], structured.FORMAT_WITH_TOOLS)
+            self.assertEqual(reply["error"]["param"], "text.format")
+            load.assert_not_called()
+        # Without a schema the same tools are fine on the responses route: nothing to conflict with.
+        self.assertEqual(self.responses(tools=responses)[0], 200)
 
     def test_h3_schema_success_and_stream_with_reasoning(self):
         code, reply = self.chat()

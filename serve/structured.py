@@ -129,7 +129,12 @@ def format_schema(response_format):
     return schema
 
 
-def prepare_format(response_format, messages, with_tools=False):
+FORMAT_WITH_TOOLS = ("a response schema with tools is not supported: a reply is one JSON object or a tool call, "
+                     "never both, and the grammar cannot express the two - send the schema without tools, or drop "
+                     "the schema")
+
+
+def prepare_format(response_format, messages):
     schema = format_schema(response_format)
     if schema is None:
         return messages, None
@@ -157,10 +162,6 @@ def prepare_format(response_format, messages, with_tools=False):
                  "Use every required field, correct types, and only allowed fields. "
                  "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n" +
                  json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
-    if with_tools:
-        # /v1/responses (#782): the schema is for the final answer; a turn that calls a tool is not an answer
-        directive += ("\nThis applies only to your final answer. To use a tool, call it as usual; the JSON object is "
-                      "what you write once you are done with the tools.")
     messages = [dict(message) for message in messages]
     if messages and messages[0].get("role") == "system":
         content = messages[0].get("content") or ""

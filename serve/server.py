@@ -70,7 +70,7 @@ from serve.grammar import guard  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import FORMAT_WITH_TOOLS, StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve.structured import format_schema  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -6229,7 +6229,7 @@ def make_handler(svc: Service):
             force = forced_choice(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+                raise ValueError(FORMAT_WITH_TOOLS)
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
@@ -6412,10 +6412,18 @@ def make_handler(svc: Service):
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:
                 raise ResponsesError(str(e), "input") from None
+            fmt = responses_api.text_format(req)            # text.format -> the chat path's response_format
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
+                messages, validator = prepare_format(fmt, messages)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
+            if validator is not None and tools:
+                raise ResponsesError(FORMAT_WITH_TOOLS, "text.format")
+            # D-058(a): the request *is* the sampling dict this route runs with, so its schema has to be on it -
+            # `begin_grammar` reads `sampling["response_format"]`, and without this the route gets `entry_*_plain`
+            # and the schema is only checked against the finished text (which `validated_json` then fails as a 502).
+            if fmt is not None:
+                req = {**req, "response_format": fmt}
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
                 print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
