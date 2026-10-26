@@ -22,6 +22,23 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 MSG = [{"role": "user", "content": "hello"}]
+ANSWER = "Hello."                               # a reply `entry_answer_plain` accepts: the answer, nothing before it
+THINKING = "\n\n</think>\n\n" + ANSWER          # the prompt's tail already wrote `<think>\n`, so the reply is inside it
+
+
+class TwoEntries(MockEngine):
+    """A grammar can only emit what the entry the prompt selected allows, and these requests mix thinking on and off:
+    with thinking on the template's tail ends at `<think>\\n`, so the reply starts inside the reasoning block; with
+    thinking off it starts at the answer and must not close a block it never opened.  So the mock scripts both and
+    picks by the prompt's own tail - the same thing a real engine's grammar would force."""
+
+    def __init__(self, tok):
+        super().__init__(tok, [ANSWER, THINKING], max_context=8192)
+        self.answer, self.thinking = self.scripts       # each already carries its end-of-turn token
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.scripts = [self.thinking if self.tok.decode(ids).rstrip().endswith("<think>") else self.answer]
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
 def level_of(prompt: str) -> str:
@@ -40,7 +57,7 @@ class EffortPaths(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tok = ByteTokenizer()
-        cls.engine = MockEngine(cls.tok, "<think>\nhm\n</think>\n\nok", max_context=8192)
+        cls.engine = TwoEntries(cls.tok)
         cls.svc = Service(cls.engine, cls.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"

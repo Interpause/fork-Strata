@@ -320,13 +320,17 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(msg["strata_mcp"][-1]["text"], "5")
 
     def test_plain_requests_get_no_mcp_tools(self):
-        self.start(call_script("fake__echo", text="x"), "</think>\n\nnever")
+        # A request that declares no tools cannot answer with a call at all: the grammar's answer entry has no
+        # `<tool_call>`, so the mask leaves the model nothing to write one with (D-027).  What this pins is therefore
+        # the prompt - an MCP tool the request did not ask for is never offered, and only a real `strata_mcp: true`
+        # offers them - and that no call runs, which the reply has no room to invent.
+        self.start("</think>\n\nLet me check.", "</think>\n\nnever")
         code, text = self.post({})
         self.assertEqual(code, 200, text)
         self.assertNotIn("fake__echo", self.engine.prompt_text(0))
         cs = self.chunks(text)
         self.assertFalse([c for c in cs if "strata_mcp" in c])
-        self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "tool_calls")   # returned to the client as always
+        self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "stop")   # no call was offered, none came back
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertNotIn('"call"', Path(self.log.name).read_text())    # nothing ran
         for req in ({"strata_mcp": "yes"}, {"strata_mcp": 1}):         # only a real true opts in

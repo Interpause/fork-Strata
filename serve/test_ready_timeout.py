@@ -59,7 +59,12 @@ class ReadyTimeout(unittest.TestCase):
     def service(self, script, extra_args=()):
         eng = StrataEngine(script, list(extra_args), lazy=True)
         self.addCleanup(eng.close)
-        return Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / 'chat_template.jinja'))
+        svc = Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / 'chat_template.jinja'))
+        # The scripted engine prints no INFO line (so it claims no grammar) and answers with a bare token: this
+        # module is about the READY timeout, not the reply, so the reply is read as text (a text-path test: gone
+        # with `OutputParser`).
+        svc.begin_grammar = lambda *a, **k: None
+        return svc
 
     def post(self, base):
         body = {'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 8}

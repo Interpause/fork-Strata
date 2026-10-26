@@ -20,7 +20,7 @@ from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, para
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
-# Every reply is the bytes of "ok, done." then <|im_end|> (ByteTokenizer: 257).
+# Every reply is the bytes of "ok, done." then <|im_end|>, which ByteTokenizer gives the pack's own id.
 FAKE_BATCH = r'''import queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
@@ -43,10 +43,12 @@ print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
+END = 248046               # <|im_end|>: the pack's id, which is what ByteTokenizer emits for it (and what the
+                           # server's EOS_IDS names), not the byte tokenizer's stand-in type index
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
     ids = [int(x) for x in ids]
     long_one = any(ids[i:i + len(LONG)] == LONG for i in range(len(ids)))
-    R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [257]
+    R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [END]
     return R, max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
 def reply(ids):            # the rest of the reply after what the prompt already ends with
     R, k = continued(ids)
@@ -67,11 +69,11 @@ def window():        # one batch window: every active slot one token
             print(f"BDONE {b} {produced} nonfinite 1.0", flush=True)
             del active[b]
             continue
-        t = left.pop(0) if left else 257
+        t = left.pop(0) if left else END
         produced += 1
         print(f"BT {b} {t}", flush=True)
-        if t == 257 or produced >= max_new:
-            fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
+        if t == END or produced >= max_new:
+            fin = 'stop' if t == END else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
             print(f"BDONE {b} {produced} {fin} 1.0", flush=True)
             del active[b]
@@ -169,7 +171,7 @@ while True:
             print(f"T {t}", flush=True)
             out += 1
             time.sleep(STEP)
-        fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
+        fin = "stop" if out and toks[out - 1] == END else ("cancel" if stop.is_set() else "length")
         print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}" +
               (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
         if slot is not None:
@@ -323,6 +325,10 @@ class ParallelService(unittest.TestCase):
             self.engine = StrataEngine("strata", extra)
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        # The fake engine below is byte-level: its reply is its own bytes (`ok, done.` then the byte tokenizer's
+        # end id), not the tokens a grammar constrains, and what this module is about is the slots.  So the reply is
+        # read as text - a text-path test, which goes away with `OutputParser`.
+        self.svc.begin_grammar = lambda *a, **k: None
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -654,7 +660,7 @@ class ParallelService(unittest.TestCase):
         held = [h for h in self.engine.slot_held if h]
         self.assertTrue(held, "a finished slot request keeps what its slot holds")
         # the held tokens are the prompt and every token fed: all of the reply but its last token
-        reply = list(b"ok, done.") + [257]
+        reply = list(b"ok, done.") + [248046]
         mine = [h for h in held if h[-len(reply) + 1:] == reply[:-1] and bytes(x for x in h if x < 256).find(b"conversation A") >= 0]
         self.assertEqual(len(mine), 1, held)
         slot = self.engine.slot_held.index(mine[0])
@@ -741,13 +747,13 @@ class ParallelService(unittest.TestCase):
     def test_a_slot_request_ended_by_its_stop_token_reports_the_slot_leg(self):
         """#1869: the consumer leaves at the stop token, before the BDONE: the request kept the admission's one token and
         its few ms.  Its figures are the slot leg's now (finish=stop was the broken case, finish=length read the BDONE)."""
-        import serve.server as server
         self.start(2, slot_cache=True, reuse=True, more=("--readfield",))
         res = {}
-        with mock.patch.object(server, "EOS_IDS", {257}):          # the fake engine's stop token
-            a = threading.Thread(target=lambda: res.setdefault("a", self.chat("List three primes please", 200)))
-            b = threading.Thread(target=lambda: res.setdefault("b", self.chat("Name two rivers in Germany", 200)))
-            a.start(); b.start(); a.join(30); b.join(30)
+        # The fake engine's stop token is the pack's <|im_end|>, which `EOS_IDS` already names: the consumer leaves
+        # at it, so no patched id set is needed to put it there.
+        a = threading.Thread(target=lambda: res.setdefault("a", self.chat("List three primes please", 200)))
+        b = threading.Thread(target=lambda: res.setdefault("b", self.chat("Name two rivers in Germany", 200)))
+        a.start(); b.start(); a.join(30); b.join(30)
         self.assertEqual(len(self.svc.history), 2)
         for h in self.svc.history:
             self.assertEqual(h["engine_generated"], h["output_tokens"], h)

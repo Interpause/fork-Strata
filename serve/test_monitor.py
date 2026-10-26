@@ -56,7 +56,10 @@ class MonitorOff(unittest.TestCase):
 class Monitor(unittest.TestCase):
     def setUp(self):
         self.tok = ByteTokenizer()
-        self.engine = ReloadableEngine(self.tok, "Thought.</think>\nHello <script>alert(1)</script>.", max_context=16384)
+        # The reply the grammar of a thinking entry can emit: it starts inside the block (the prompt's tail already
+        # wrote `<think>\n`), closes it with the template's two newlines, then answers.
+        self.engine = ReloadableEngine(self.tok, "Thought.\n\n</think>\n\nHello <script>alert(1)</script>.",
+                                       max_context=16384)
         self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.svc.api_monitor = True                       # opt-in ("api_monitor": true / --api-monitor)
         self.httpd = serve(self.svc, port=0)
@@ -224,8 +227,9 @@ class ConversationCacheCard(unittest.TestCase):
 
     def test_metrics(self):
         tok = ByteTokenizer()
-        engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
-        engine.info = {"conversation_cache_mib": 8192, "conversation_cache_slots": 4}
+        engine = MockEngine(tok, "Thought.\n\n</think>\n\nHello.", max_context=4096)
+        # `grammar=1` stays in the INFO line: without it no reply is constrained and the chat request is refused.
+        engine.info = {"grammar": 1, "conversation_cache_mib": 8192, "conversation_cache_slots": 4}
         svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"

@@ -44,7 +44,12 @@ class FatalRecovery(unittest.TestCase):
         e=StrataEngine(str(self.script),['--state',str(self.root/'state'),'--mode',mode])
         self.addCleanup(e.close);return e
     def service(self,e):
-        return Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).parent/'chat_template.jinja'))
+        svc=Service(e,ByteTokenizer(),ChatTemplate(Path(__file__).parent/'chat_template.jinja'))
+        # The scripted engine prints no INFO line, and the requests here are bare ids answered with one token: this
+        # module is about a native ERR killing the process, not about the reply, so it reads the reply as text (a
+        # text-path test: gone with `OutputParser`).
+        svc.begin_grammar=lambda *a,**k:None
+        return svc
     def wait_dead(self,e):
         end=time.monotonic()+2
         while e.alive() and time.monotonic()<end:time.sleep(.01)

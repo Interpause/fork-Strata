@@ -7,6 +7,10 @@ from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
 
 class Tokenizer(ByteTokenizer):
     def token_bytes(self, token):
+        # The delimiters (`<think>`, `</think>`, ...) carry the pack's own ids now, above the stand-in specials:
+        # their bytes come from BY_ID, exactly as `decode` reads them.
+        if token in self.BY_ID:
+            return self.BY_ID[token].encode()
         return self.SPECIALS[token - 256].encode() if token >= 256 else bytes([token])
 
 
@@ -19,7 +23,9 @@ class RecordingEngine(MockEngine):
 
     def generate(self, ids, max_new, sampling, cancel, **kwargs):
         self.calls.append((list(ids), max_new))
-        self.sampling_calls.append(dict(sampling or {}))
+        # Every reply is constrained now, so the server adds the grammar file to the request's sampling.  That key is
+        # transport, not the sampler these tests compare, so the recorded copy leaves it out.
+        self.sampling_calls.append({k: v for k, v in (sampling or {}).items() if k != 'strata_grammar'})
         self.sampling_objects.append(sampling)
         yield from super().generate(ids, max_new, sampling, cancel, **kwargs)
 
@@ -56,7 +62,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
 
     def run_case(self, enabled):
         engine = RecordingEngine(self.tok, [self.loop,
-            'I have verified the solution.\n</think>\nComplete solution.'])
+            'I have verified the solution.\n</think>\n\nComplete solution.'])
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = enabled
@@ -65,7 +71,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
 
     def test_old_explicit_sampler_recovers_without_mutating_request(self):
         engine = RecordingEngine(self.tok, [self.loop,
-            'Verified.\n</think>\nComplete solution.'])
+            'Verified.\n</think>\n\nComplete solution.'])
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
@@ -81,18 +87,20 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(request['presence_penalty'], 0)
 
     def test_frozen_cohort_sampler_is_unchanged_during_recovery(self):
-        engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nComplete solution.'])
+        engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\n\nComplete solution.'])
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         sampler = {'temperature': 1.0, 'top_p': .95, 'top_k': 20, 'presence_penalty': 1.5, 'seed': 2}
         list(service.run(self.ids, True, [], 40000, sampler, threading.Event()))
         self.assertEqual(len(engine.sampling_objects), 2)
+        # The recovery pass is handed the SAME sampler the first pass was (frozen, not rebuilt).  It is a copy of the
+        # caller's dict now that the server adds the grammar file to it, so the values are compared instead.
         self.assertIs(engine.sampling_objects[0], engine.sampling_objects[1])
-        self.assertIs(engine.sampling_objects[1], sampler)
+        self.assertEqual({k: v for k, v in engine.sampling_objects[1].items() if k != 'strata_grammar'}, sampler)
 
     def test_a_lower_top_p_and_top_k_are_never_raised_or_lowered(self):
-        engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\nComplete solution.'])
+        engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\n\nComplete solution.'])
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = "recover"
@@ -165,7 +173,10 @@ class ReasoningLoopRecovery(unittest.TestCase):
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
-        events = list(service.run(self.ids, False, [], 40000, {}, threading.Event()))
+        # `thinking=False` says the reply is the answer, and the grammar follows the prompt's tail, not the flag
+        # (`serve/grammar/entries.py`): the empty think block is what puts the prompt at the answer.
+        ids = self.ids + self.tok.encode('\n</think>\n\n', parse_special=True)
+        events = list(service.run(ids, False, [], 40000, {}, threading.Event()))
         self.assertEqual(len(engine.calls), 1)
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
@@ -174,7 +185,9 @@ class ReasoningLoopRecovery(unittest.TestCase):
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
-        ids = self.tok.encode('<|im_start|>user\nTask<|im_end|>\n', parse_special=True)
+        # A chat prompt ends after the assistant header, at the template's `<think>\n`: the grammar has no entry for
+        # a bare user turn, and the reply is the thinking loop this test hands it.
+        ids = self.tok.encode('<|im_start|>user\nTask<|im_end|>\n<|im_start|>assistant\n<think>\n', parse_special=True)
         events = list(service.run(ids, True, [], 40000, {}, threading.Event()))
         self.assertEqual(len(engine.calls), 1)
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
@@ -195,7 +208,7 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
     def test_batch_status_and_history_record_recovery(self):
-        engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nAnswer.'])
+        engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\n\nAnswer.'])
         engine.batch = 2
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself

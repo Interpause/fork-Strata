@@ -17,7 +17,8 @@ from serve.server import ByteTokenizer, EngineDied, EngineStuck, MockEngine, Ser
 class ResidentEngine(StrataEngine):
     def __init__(self, tok):
         self.reply = MockEngine(tok, "Hello.", max_context=4096)
-        self.max_context, self.info, self.last = 4096, {}, {}
+        # `grammar=1` as a real engine built with the decoder reports it: without it `begin_grammar` refuses a chat.
+        self.max_context, self.info, self.last = 4096, {"grammar": 1}, {}
         self.loaded, self.starts, self.closes = False, 0, 0
         self.unloaded = True
         self.progress = None

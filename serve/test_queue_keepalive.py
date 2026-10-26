@@ -29,6 +29,11 @@ class QueueKeepAlive(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
+    def ids(self):
+        """A prompt the grammar has an entry for: a rendered template, not raw ids.  These two tests pass thinking
+        off, so the prompt ends at the template's empty think block - where the mock's `ok` reply belongs."""
+        return self.svc.prepare([{"role": "user", "content": "hi"}], None, {"enable_thinking": False})[0]
+
     def test_a_queued_stream_gets_keep_alives_then_its_answer(self):
         self.svc.fifo.acquire()                           # another request holds the turn
         c = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=10)
@@ -52,7 +57,7 @@ class QueueKeepAlive(unittest.TestCase):
         self.svc.fifo.acquire()
         self.addCleanup(self.svc.fifo.release)
         cancel = threading.Event()
-        ids = self.svc.tok.encode("hi")
+        ids = self.ids()
         run = self.svc.run(ids, False, None, 8, {}, cancel)
         first = next(run)
         self.assertEqual(first, ("ping", None))
@@ -67,7 +72,7 @@ class QueueKeepAlive(unittest.TestCase):
     def test_closing_a_queued_request_is_no_longer_queued(self):
         self.svc.fifo.acquire()
         self.addCleanup(self.svc.fifo.release)
-        run = self.svc.run(self.svc.tok.encode("hi"), False, None, 8, {}, threading.Event())
+        run = self.svc.run(self.ids(), False, None, 8, {}, threading.Event())
         next(run)
         run.close()
         self.assertEqual(self.svc.status["queued"], 0)

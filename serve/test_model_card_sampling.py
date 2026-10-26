@@ -19,11 +19,21 @@ from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, model_card_sampling, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+ANSWER = "Hello."                               # a reply `entry_answer_plain` accepts: the answer, nothing before it
+THINKING = "\n\n</think>\n\n" + ANSWER          # the prompt's tail already wrote `<think>\n`, so the reply is inside it
 
 
 class Recording(MockEngine):
+    """Records the sampling the server sent.  The requests here are both thinking and not, and a grammar only lets the
+    entry the prompt selected emit its reply, so the reply follows the prompt's own tail."""
+
+    def __init__(self, tok):
+        super().__init__(tok, [ANSWER, THINKING], max_context=8192)
+        self.answer, self.thinking = self.scripts       # each already carries its end-of-turn token
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.sampling = dict(sampling or {})
+        self.scripts = [self.thinking if self.tok.decode(ids).rstrip().endswith("<think>") else self.answer]
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
@@ -31,7 +41,7 @@ class ModelCardSampling(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tok = ByteTokenizer()
-        cls.engine = Recording(cls.tok, "<think>\nhm\n</think>\n\nok", max_context=8192)
+        cls.engine = Recording(cls.tok)
         cls.svc = Service(cls.engine, cls.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
@@ -56,7 +66,10 @@ class ModelCardSampling(unittest.TestCase):
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10).read()
-        return StrataEngine.sampling_keys(self.engine.sampling)
+        # Every constrained request carries its grammar file in `sampling`; what this module is about is the card's
+        # sampling, so the grammar key is left out of the keys compared below (it is not a sampling default).
+        sampling = {k: v for k, v in self.engine.sampling.items() if k != "strata_grammar"}
+        return StrataEngine.sampling_keys(sampling)
 
     def test_tables(self):
         self.assertEqual(model_card_sampling("qwen4exp", True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
