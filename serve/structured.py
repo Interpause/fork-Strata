@@ -13,11 +13,34 @@ Python, is the authority on a `pattern`; a malformed `(` is therefore not a vali
 a standard-library validator.
 """
 import json
+import math
 import threading
 
 
 class StructuredOutputError(RuntimeError):
     pass
+
+
+#: A schema value JSON itself cannot carry.  `json.loads("1e400")` is `inf` in Python, and the grammar text is a
+#: JSON payload, so `json.dumps` would write a bare `Infinity` there and the compiler would report a parse error
+#: about a number the client wrote legally (measured: `failed to parse "%json": expected value at line 1 column
+#: 32`).  Naming the value is the difference between a client fixing its bound and a client reading a parse error.
+NON_FINITE = ("response_format schema: the %s value (%r) is a number JSON cannot write, so it cannot be carried "
+              "into the reply's grammar - send a finite bound")
+
+
+def _non_finite(value, path=""):
+    """The first `(pointer, value)` in a schema that is infinite or NaN, or None."""
+    stack = [(path, value)]
+    while stack:
+        where, node = stack.pop()
+        if isinstance(node, dict):
+            stack.extend((f"{where}/{key}", item) for key, item in node.items())
+        elif isinstance(node, list):
+            stack.extend((f"{where}/{index}", item) for index, item in enumerate(node))
+        elif isinstance(node, float) and not math.isfinite(node):
+            return where or "/", node
+    return None
 
 
 class _ObjectOnly:
@@ -138,6 +161,9 @@ def prepare_format(response_format, messages):
     schema = format_schema(response_format)
     if schema is None:
         return messages, None
+    bad = _non_finite(schema)
+    if bad is not None:
+        raise ValueError(NON_FINITE % bad)
     if response_format.get("type") == "json_object":
         validator = _ObjectOnly()          # format_schema sent {"type": "object"}: one JSON object is the contract
     else:

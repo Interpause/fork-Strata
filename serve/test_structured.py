@@ -108,6 +108,41 @@ class Structured(unittest.TestCase):
         # Without a schema the same tools are fine on the responses route: nothing to conflict with.
         self.assertEqual(self.responses(tools=responses)[0], 200)
 
+    def test_a_number_json_cannot_write_is_named_on_both_routes(self):
+        # `1e400` is a legal JSON number and Python reads it as `inf`; the grammar carries the schema as a JSON
+        # payload, and `json.dumps` writes `Infinity` there, which the compiler rejects as a parse error about a
+        # number the client wrote correctly (measured: `failed to parse "%json": expected value at line 1 column
+        # 32`).  Named at the gate instead, on both routes, so the client is told which bound to fix.
+        schema = {"type": "object", "properties": {"n": {"type": "number", "maximum": 1e400}}}
+        expected = structured.NON_FINITE % ("/properties/n/maximum", float("inf"))
+        with mock.patch.object(self.svc, "load") as load:
+            code, reply = self.chat(response_format={"type": "json_schema",
+                                                     "json_schema": {"name": "n", "schema": schema}})
+            self.assertEqual(code, 400, reply)
+            self.assertEqual(reply["error"]["message"], expected)
+            code, reply = self.responses(text={"format": {"type": "json_schema", "name": "n", "schema": schema}})
+            self.assertEqual(code, 400, reply)
+            # The Responses route names the parameter its client actually sent (`_responses_prepare` rewrites the
+            # chat route's name), so the message is the same one with that one word changed.
+            self.assertEqual(reply["error"]["message"], expected.replace("response_format", "text.format"))
+            self.assertEqual(reply["error"]["param"], "text.format")
+            load.assert_not_called()
+        # A bound JSON *can* write is a different matter from one it cannot: 1e308 is finite, so the gate passes it,
+        # and the compiler then refuses the float range it would have to generate.  Measured on this build -
+        # `Failed to generate regex for float range: min=None, max=Some(1e308)` - and left as a terminal: which of
+        # two bounds to drop is a guess, so the client gets the compiler's words instead (D-065).
+        code, reply = self.chat(response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "n", "schema": {"type": "object", "properties": {
+                "n": {"type": "number", "maximum": 1e308}}}}})
+        self.assertEqual(code, 400, reply)
+        self.assertIn("float range", reply["error"]["message"])
+        # An everyday bound compiles, so the refusal above is about the extreme one and not about `maximum`.
+        self.assertEqual(self.chat(response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "n", "schema": {"type": "object", "properties": {
+                "n": {"type": "number", "maximum": 15000}}}}})[0], 200)
+
     def test_h3_schema_success_and_stream_with_reasoning(self):
         code, reply = self.chat()
         self.assertEqual(code, 200)
