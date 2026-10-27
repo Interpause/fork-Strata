@@ -26,6 +26,10 @@ struct Vocabulary {
     std::vector<uint32_t> lens;
     // The concatenation of every token's bytes; `lens` splits it.
     std::vector<uint8_t> bytes;
+    // Where each id starts in `bytes`: `n + 1` entries, so id `i`'s text is `bytes[offsets[i] .. offsets[i+1])`
+    // and the last entry is `bytes.size()`.  `lens` already says how long each id is; this says where it is,
+    // which is what a caller that has to look at one token's bytes (the fence tracker) needs in O(1).
+    std::vector<uint32_t> offsets;
     // The id the grammar ends a turn on: `<|im_end|>`, which the pack marks special.
     uint32_t eos = 0;
     // Ids whose text is a name the grammar may use, not bytes to be matched.

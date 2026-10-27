@@ -346,6 +346,7 @@ bool load_vocabulary(const std::string& dir, Vocabulary& out, std::string& err) 
     static const ByteAlphabet alphabet;
     const uint32_t n = (uint32_t) texts.size();
     out.lens.assign(n, 0);
+    out.offsets.assign((size_t) n + 1, 0);
     out.bytes.clear();
     size_t total = 0;
     for (uint32_t i = 0; i < n; ++i) total += texts[i].size() + 1;  // +1 for a special's 0xFF
@@ -376,8 +377,11 @@ bool load_vocabulary(const std::string& dir, Vocabulary& out, std::string& err) 
                 out.bytes.push_back((uint8_t) alphabet.to_byte[cp]);
             }
         }
+        // The same pass that fills `lens` fills `offsets`: both are facts about where this id's bytes landed.
+        out.offsets[i] = (uint32_t) before;
         out.lens[i] = (uint32_t) (out.bytes.size() - before);
     }
+    out.offsets[n] = (uint32_t) out.bytes.size();
     if (!have_eos) {
         err = types_path + ": no <|im_end|> token, so there is no end of turn to constrain";
         return false;

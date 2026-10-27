@@ -92,6 +92,9 @@ class Session {
 
     uint32_t vocab_size() const { return vocab_.lens.empty() ? 0u : (uint32_t) vocab_.lens.size(); }
     uint32_t eos() const { return vocab_.eos; }
+    // The ids and bytes llguidance was built with, for the engine's own reads of a token's text (the fence
+    // tracker walks the bytes of every committed token).  Empty until `open()` has succeeded.
+    const Vocabulary& vocabulary() const { return vocab_; }
 
     // Compiles `grammar` (Lark text, as the server splices it) into a fresh state.
     // `kind` is llguidance's grammar format name; only "lark" is used today.
