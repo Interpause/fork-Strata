@@ -488,6 +488,22 @@ class SessionRefused(ValueError):
         return self.STATUS[self.kind]
 
 
+def engine_err(line: str) -> Exception:
+    """The exception an engine's `ERR <message>` line raises, for every reader of those lines.
+
+    The grammar family is a condition the *server* created, never a malformed client request: a mask that allowed an
+    id the engine's matcher refused, a masked request sent down a path that cannot mask, a schema the server's compile
+    ladder could not express, the server's own pack or temporary grammar file.  A 400 would tell the client to fix a
+    request that was fine.  `GrammarUnavailable` carries the family with 500 and `server_error` (D-030), and keeps the
+    engine's text whole (`grammar:` included) so the client can see which family it came from.  Anything else stays
+    the ValueError it always was.
+    """
+    message = line[4:].strip()
+    if message.startswith("grammar:"):
+        return grammar_pipeline.GrammarUnavailable(message, status=500)
+    return ValueError(message)
+
+
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
@@ -1279,6 +1295,8 @@ class StrataEngine:
                 raise EngineDied("the engine ended")
             line = line.strip()
             if line.startswith("ERR"):
+                # Not engine_err(): a VRAM command compiles no grammar, so the grammar family cannot arrive here,
+                # and this is the wording /v1/vram has always answered with.
                 raise ValueError(line[4:].strip() or "the engine refused the VRAM command")
             if line.startswith("VRAM "):
                 out = {}
@@ -1466,7 +1484,7 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise engine_err(line)
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -1871,6 +1889,8 @@ class StrataEngine:
                                 ask()
                                 yield None
                     except ValueError as e:
+                        # A GrammarUnavailable from the same read is not a ValueError: it leaves here unchanged, for
+                        # the HTTP boundary, which answers it with the status its family names (D-030).
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
                         # slot it still holds).  That is not the request's fault and nothing was read: park the slot
                         # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
@@ -2176,7 +2196,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    raise engine_err(line)
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -4806,6 +4826,13 @@ class Service:
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
+                            raise
+                        except grammar_pipeline.GrammarUnavailable as e:
+                            # Not a ValueError, so the handler below does not see it: the request is an error here
+                            # (the history and totals must not call it "length"), and the exception goes on to the
+                            # boundary, which answers the status its family names (D-030).
+                            finish = "error"
+                            print(f"[strata] the engine could not honour the grammar: {e}", flush=True)
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"

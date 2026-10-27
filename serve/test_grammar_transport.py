@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -572,6 +573,118 @@ class ClientVisible(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("response.failed", raw)
         self.assertIn('"grammar_unavailable"', raw)
+
+
+class GrammarErrEngine(MockEngine):
+    """The engine's token loop reports the grammar family's own `ERR` line.
+
+    `server_module.engine_err` is what `StrataEngine.generate` raises for that line, so the exception the boundary
+    sees here is the one a real engine line produces - the same object, not a `GrammarUnavailable` made by a test.
+    """
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        yield None                                   # a PP heartbeat: a streaming request has sent its headers now
+        raise server_module.engine_err(
+            "ERR grammar: refused token 7 (the mask allowed an id the matcher refused)")
+
+
+class EngineErrorFamily(unittest.TestCase):
+    """Triage row 58: an engine `ERR grammar:` line is a condition the *server* created, and answering it with the
+    generic 400 tells the client to resend a request that was fine.  `engine_err` decides the family once, for every
+    reader of the engine's `ERR` lines; the HTTP boundary then answers the status that family names.
+    """
+
+    @staticmethod
+    def engine(lines):
+        """A `StrataEngine` whose process is a mock and whose line queue holds `lines`: enough for the two readers
+        below, both of which stop at the `ERR` line (`test_vram.EngineCommand` builds one the same way)."""
+        e = StrataEngine("missing-executable", [], lazy=True)
+        e.proc = unittest.mock.Mock()
+        e.proc.poll.return_value = None              # alive(): the engine did not end
+        e.proc.stdin = io.StringIO()
+        e.ended = False
+        e.silence_s = 0                              # the watchdog's allowance: the line is there already
+        e.lines = queue.Queue()
+        for line in lines:
+            e.lines.put(line)
+        return e
+
+    def test_a_grammar_line_is_a_500_server_error(self):
+        e = server_module.engine_err("ERR grammar: refused token 7 (the matcher said no)\n")
+        self.assertIsInstance(e, grammar_pipeline.GrammarUnavailable)
+        self.assertEqual((e.status, e.kind, e.code), (500, "server_error", "grammar_unavailable"))
+        self.assertEqual(str(e), "grammar: refused token 7 (the matcher said no)")   # the engine's text, whole
+
+    def test_any_other_err_line_is_the_value_error_it_always_was(self):
+        e = server_module.engine_err("ERR prompt exceeds context\n")
+        self.assertIs(type(e), ValueError)
+        self.assertEqual(str(e), "prompt exceeds context")
+
+    def test_the_control_reader_raises_the_grammar_family(self):
+        # `_control` reads GEN/BGEN replies; the grammar's compile and admission refusals arrive here.
+        e = self.engine(["ERR grammar: a pipelined slot group cannot mask a row\n"])
+        e._ctl_mode = "solo"
+        with self.assertRaises(grammar_pipeline.GrammarUnavailable) as caught:
+            next(e._control(threading.Event(), lambda t: None))
+        self.assertEqual(caught.exception.status, 500)
+        self.assertIn("cannot mask a row", str(caught.exception))
+
+    def test_the_token_loop_raises_the_grammar_family(self):
+        # The mask's refusals arrive while decoding: this is `StrataEngine.generate`'s own read.
+        e = self.engine(["ERR grammar: refused token 7 (the matcher said no)\n"])
+        with self.assertRaises(grammar_pipeline.GrammarUnavailable) as caught:
+            list(e.generate([1, 2, 3], 8, {}, threading.Event()))
+        self.assertEqual((caught.exception.status, caught.exception.kind), (500, "server_error"))
+        self.assertIn("refused token 7", str(caught.exception))
+
+
+class GrammarErrVisible(unittest.TestCase):
+    """The same line end to end: a request whose engine reports `ERR grammar:` is answered 500 `server_error`, and a
+    streaming one gets `server_error` in its SSE error event - never the 400 a generic `ERR` line still gets."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        pack = Path(self.tmp.name)
+        (pack / "vocab.json").write_text("{}", encoding="utf-8")    # a pack-shaped directory: the request is admitted
+        self.tok = ByteTokenizer()
+        self.svc = Service(GrammarErrEngine(self.tok, ANSWER, max_context=CTX), self.tok,
+                           ChatTemplate(ROOT / "serve/chat_template.jinja"), pack_dir=pack)
+        self.httpd = serve(self.svc, port=0)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            response = urllib.request.urlopen(req, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            data = response.read().decode()
+            return response.status, data if "event-stream" in response.headers.get("Content-Type", "") else json.loads(data)
+
+    def test_a_chat_request_whose_engine_reports_a_grammar_err_is_a_500_server_error(self):
+        code, body = self.post("/v1/chat/completions",
+                               {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8})
+        self.assertEqual(code, 500)
+        self.assertEqual((body["error"]["type"], body["error"]["code"]), ("server_error", "grammar_unavailable"))
+        self.assertIn("grammar: refused token 7", body["error"]["message"])
+        self.assertEqual(self.svc.metrics()["requests"][0]["finish"], "error",
+                         "the history calls a refused request an error, not a length stop")
+
+    def test_a_streaming_chat_reports_it_as_a_server_error_event(self):
+        # `_sse()` has sent the headers, so the family travels in the event, which must say `server_error` (the
+        # generic ValueError handler's family would be a 400's).
+        code, raw = self.post("/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, "stream": True})
+        self.assertEqual(code, 200)
+        self.assertIn('"type": "server_error"', raw)
+        self.assertIn('"code": "grammar_unavailable"', raw)
+        self.assertIn("refused token 7", raw)
+        self.assertIn("data: [DONE]", raw)
 
 
 class Routing(unittest.TestCase):

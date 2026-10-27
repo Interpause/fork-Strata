@@ -14966,13 +14966,16 @@ int main(int argc, char** argv) {
             // set from tokens already committed and the matcher is advanced only after the commit, so nothing the
             // grammar has not seen can move its state.
             std::vector<float> gbias;
-            std::vector<int32_t> gbanned;   // a draw the mask allowed and the matcher then refused (a library bug)
+            std::vector<int32_t> gbanned;   // this step's refusal: a draw the mask allowed and the matcher then refused
+                                            // (a library bug); cleared by the next fresh step, kept by its retry
             // the reply's open code fence (D-067), advanced by the same tokens the matcher gets; only touched when the
             // request named `fence_ban=`, so a request without it does exactly the work it did before
             strata::grammar::FenceTracker gfence;
             std::vector<int32_t> gfence_bans;   // `gbanned` + the fence's ids: rebuilt per step, only while a fence is open
-            int gretry = 0;
-            bool gstop = false;             // nothing is allowed here: the reply ends without a draw
+            int gretry = 0;                     // this step's refusals: the second one ends the request
+            int64_t grefused = 0;               // the request's refusals it survived by drawing again (said once, at its end)
+            bool gretry_pass = false;           // this loop pass is the step's retry, so its ban outlives the loop top
+            bool gstop = false;                 // nothing is allowed here: the reply ends without a draw
             auto grammar_mask = [&]() -> bool {
                 uint32_t words = 0;
                 const uint32_t* bits = req_match.mask(words);
@@ -14982,7 +14985,7 @@ int main(int argc, char** argv) {
                 }
                 gbias.resize((size_t) n_vocab);
                 // The fence's ids are a separate list from `gbanned` because a fence opens and closes many times in
-                // one reply: the ban is recomputed every step, `gbanned` never is (it is permanent for the request).
+                // one reply: both are rebuilt per step, and `gbanned` only ever holds this step's own refusal.
                 const bool fence_on = !req_fence.empty() && gfence.open();
                 const std::vector<int32_t>* bans = &gbanned;
                 if (fence_on) {
@@ -15002,6 +15005,13 @@ int main(int argc, char** argv) {
                 return gstop || ver.set_logit_bias(gbias, err);
             };
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                // A refusal's `continue` re-enters this loop as the same step's retry, so the ban it added has to
+                // survive this line; only a fresh step starts with no ban and no refusal counted.
+                if (!gretry_pass) {
+                    gbanned.clear();
+                    gretry = 0;
+                }
+                gretry_pass = false;
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -15153,12 +15163,15 @@ int main(int argc, char** argv) {
                     strata::grammar::Match probe = req_match.clone();
                     if (!probe.consume((uint32_t) outv[0])) {
                         // The mask allowed it, so the library disagrees with its own mask: the step is retried once
-                        // with that id banned, and a second refusal ends the request (C3's failure table).
+                        // with that id banned, and a second refusal in the same step ends the request (C3's failure
+                        // table).  The ban lasts only for that retry, so the id is drawable again in the next step.
                         if (++gretry > 1) {
                             std::printf("ERR grammar: refused token %d (%s)\n", (int) outv[0], req_match.error().c_str());
                             return 1;
                         }
+                        ++grefused;
                         gbanned.push_back((int32_t) outv[0]);
+                        gretry_pass = true;
                         continue;   // the same window, with that id at -inf
                     }
                 }
@@ -15587,6 +15600,11 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "", reused_from);
+            // A library disagreement the reply survived by drawing the step again: a number here is what makes a
+            // recurrence visible (D-049).  Silent when zero, so a reply that never hit it logs exactly what it did.
+            if (grefused > 0)
+                std::fprintf(stderr, "strata serve: grammar: %lld draws the mask allowed and the matcher refused, each "
+                                     "retried with that id banned\n", (long long) grefused);
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
