@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/grammar/fence.hpp"
 #include "strata/grammar/llguidance.hpp"
 #include "strata/grammar/mask_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
@@ -1272,6 +1273,63 @@ static std::string base64_decode(const std::string& in) {
         }
     }
     return out;
+}
+
+// `fence_ban=`'s list: decimal token ids, comma separated, and nothing else.  Unlike `img_keys=`, a list that does not
+// parse is refused rather than emptied: a request that decoded with no bans would show nothing wrong until a reply
+// wrote a delimiter inside a code fence, which is the defect the key exists to close (D-067).
+//
+// `vocab_size` is the grammar tokenizer's size, or 0 when no tokenizer is loaded: then the syntax is checked and the
+// range cannot be.  That is not a gap - a fence ban only ever reaches a mask, so without a grammar it does nothing.
+static bool parse_fence_ban(const char* s, uint32_t vocab_size, std::vector<int32_t>& out, std::string& err) {
+    out.clear();
+    if (s == nullptr || *s == '\0') {
+        err = "the list names no token ids";
+        return false;
+    }
+    const char* p = s;
+    for (;;) {
+        const char* q = p;
+        uint64_t v = 0;
+        for (; *q >= '0' && *q <= '9'; ++q) {
+            v = v * 10 + (uint64_t) (*q - '0');
+            if (v > (uint64_t) INT32_MAX) {   // "is not a token id": no pack has 2^31 of them, so it is a broken list
+                const char* end = q;   // the whole run, not only the digits it took to overflow
+                while (*end >= '0' && *end <= '9') ++end;
+                err = "token id " + std::string(p, (size_t) (end - p)) + " is not a token id";
+                return false;
+            }
+        }
+        if (q == p) {
+            err = *p == '\0' ? "the list ends with an empty id"
+                             : "token id \"" + std::string(p, std::strcspn(p, ",")) + "\" is not a decimal id";
+            return false;
+        }
+        if (vocab_size > 0 && v >= (uint64_t) vocab_size) {
+            err = "token id " + std::to_string(v) + " is outside the vocabulary's " + std::to_string(vocab_size) + " ids";
+            return false;
+        }
+        out.push_back((int32_t) v);
+        if (*q == '\0') return true;
+        if (*q != ',') {
+            err = "token id \"" + std::string(p, std::strcspn(p, ",")) + "\" is not a decimal id";
+            return false;
+        }
+        p = q + 1;
+    }
+}
+
+// One committed token's bytes into the fence tracker, which is how a mask learns whether a code fence is open
+// (D-067).  Called at exactly the statements that hand a token to the matcher, never at a draw, so the ban and the
+// matcher can never disagree about what has been committed.
+//
+// An id outside the vocabulary llguidance was built with is skipped rather than read: the list comes from the server
+// (`fence_ban=`), and a stale one must not walk past the table (`offsets` holds `vocab_size() + 1` entries).
+static void fence_advance(strata::grammar::FenceTracker& fence, const strata::grammar::Session& gs, int32_t id) {
+    const strata::grammar::Vocabulary& v = gs.vocabulary();
+    if (id < 0 || (uint32_t) id >= gs.vocab_size() || (size_t) id + 1 >= v.offsets.size()) return;
+    const size_t from = (size_t) v.offsets[(size_t) id], to = (size_t) v.offsets[(size_t) id + 1];
+    fence.append(v.bytes.data() + from, to - from);
 }
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
@@ -11028,6 +11086,11 @@ int main(int argc, char** argv) {
             // its rows are drawn from the mask this state holds, and it is dropped when the slot ends.  Invalid for
             // a request with no grammar, which is the case every batch window before P4 ran.
             strata::grammar::Match match;
+            // the request's `fence_ban=` ids and whether a code fence is open, advanced by the same tokens the
+            // matcher gets (D-067): they ride with the slot so a row's mask can hide the structural delimiters
+            // while one is open.  The list is empty for every request without the key, and then nothing is tracked.
+            strata::grammar::FenceTracker fence;
+            std::vector<int32_t> fence_ban;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -11228,14 +11291,28 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> ron(strata::kernels::kVerifyMaxT, 0);
         const std::vector<float> no_base;     // a batch admission refuses `logit_bias` (continuous batching): empty
         const std::vector<int32_t> no_bans;
-        auto row_mask = [&](strata::grammar::Match& m, size_t row, int64_t nv, std::string& e) -> int {
+        // `fence`/`fence_ban` are the row's fence state and the ids it hides: row 0's is the slot's own, row 1's the
+        // slot's advanced by the draft (a transient copy).  With a fence open the ids join the row's mask, because a
+        // byte terminal cannot refuse a token id and a delimiter inside a code block is content (D-067).  The list is
+        // rebuilt for every row and never joins `no_bans`: a fence opens and closes many times in one reply.
+        auto row_mask = [&](strata::grammar::Match& m, const strata::grammar::FenceTracker& fence,
+                            const std::vector<int32_t>& fence_ban, size_t row, int64_t nv, std::string& e) -> int {
             // 1 = the row carries a bias, 0 = nothing is legal here (the slot must stop without a draw),
             // -1 = the mask failed (`e` says why)
             uint32_t words = 0;
             const uint32_t* bits = m.mask(words);
             if (bits == nullptr || words == 0) { e = m.error(); return -1; }
-            if (!strata::grammar::mask_to_bias(bits, words, no_base, no_bans, rbias.data() + row * (size_t) nv, nv))
-                return 0;
+            const bool fence_on = !fence_ban.empty() && fence.open();
+            float* out = rbias.data() + row * (size_t) nv;
+            bool drawable = strata::grammar::mask_to_bias(bits, words, no_base, fence_on ? fence_ban : no_bans, out, nv);
+            if (!drawable && fence_on) {
+                // The valve: a fence the tracker wrongly believes open must never dead-end a reply, so a row the fence
+                // bans emptied is asked for once more without them.  It cannot loop (the retry carries no fence ids)
+                // and should never fire: with the delimiters suppressed the measured mask still holds 248,112 ids.
+                std::fprintf(stderr, "strata batch: a fence ban left a row with nothing drawable; drawn without it\n");
+                drawable = strata::grammar::mask_to_bias(bits, words, no_base, no_bans, out, nv);
+            }
+            if (!drawable) return 0;
             ron[row] = 1;
             return 1;
         };
@@ -11263,7 +11340,8 @@ int main(int argc, char** argv) {
                 // A slot with a grammar draws its rows from the matcher's mask.  Row 0 is the state advanced by the
                 // token this window feeds (`x`, which the admission's own step already consumed).
                 if (bs[(size_t) b].match.valid()) {
-                    const int m0 = row_mask(bs[(size_t) b].match, (size_t) S, nv, err);
+                    const int m0 = row_mask(bs[(size_t) b].match, bs[(size_t) b].fence, bs[(size_t) b].fence_ban,
+                                            (size_t) S, nv, err);
                     if (m0 < 0) {
                         std::printf("ERR grammar: %s\n", err.c_str());
                         return false;
@@ -11278,6 +11356,7 @@ int main(int argc, char** argv) {
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // nothing was drawn: its state is whole
                         sl.match = strata::grammar::Match{};
+                        sl.fence.reset();
                         continue;
                     }
                     any_mask = true;
@@ -11306,7 +11385,12 @@ int main(int argc, char** argv) {
                         if (!d.consume((uint32_t) bs[(size_t) b].draft[0])) {
                             draft_ok[a] = false;
                         } else {
-                            const int m1 = row_mask(d, (size_t) S, nv, err);
+                            // Row 1 is the state after the draft, so its fence state is too: the slot's tracker
+                            // advanced by `draft[0]`, copied, used and thrown away - no second persistent tracker.
+                            strata::grammar::FenceTracker f = bs[(size_t) b].fence;
+                            if (!bs[(size_t) b].fence_ban.empty())
+                                fence_advance(f, grammar_session, bs[(size_t) b].draft[0]);
+                            const int m1 = row_mask(d, f, bs[(size_t) b].fence_ban, (size_t) S, nv, err);
                             if (m1 < 0) {
                                 std::printf("ERR grammar: %s\n", err.c_str());
                                 return false;
@@ -11415,6 +11499,7 @@ int main(int argc, char** argv) {
                     sl.cached = false;
                     sl.checks.clear();
                     sl.match = strata::grammar::Match{};
+                    sl.fence.reset();
                     nan_flush = true;
                     continue;
                 }
@@ -11424,18 +11509,24 @@ int main(int argc, char** argv) {
                     // A committed token advances the slot's grammar, so the next window's mask is the state after it.
                     // EOS is never handed to the matcher: it ends the sequence, and a stopped matcher refuses every
                     // token, its own EOS included - the single-request step's rule.
-                    if (sl.match.valid() && !eos && !sl.match.consume((uint32_t) y)) {
-                        // The mask allowed this id, so the library disagrees with its own mask.  A batch row cannot be
-                        // re-drawn, so the single-request step's retry (ban the id, draw the step again) has no
-                        // equivalent here: the slot ends and the token is not emitted.
-                        std::fprintf(stderr, "strata batch: slot %d's grammar refused token %d (%s): the slot ends\n",
-                                     b, (int) y, sl.match.error().c_str());
-                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld stop %.1f\n", b, (long long) sl.produced, ms);
-                        sl.active = false;
-                        sl.cached = false;   // its sessions took the row this token came from
-                        sl.match = strata::grammar::Match{};
-                        break;
+                    if (sl.match.valid() && !eos) {
+                        // The slot's fence state takes the same token at the same point, under the same EOS skip, so
+                        // the next row's ban and the matcher always agree on what has been committed (D-067).
+                        if (!sl.fence_ban.empty()) fence_advance(sl.fence, grammar_session, y);
+                        if (!sl.match.consume((uint32_t) y)) {
+                            // The mask allowed this id, so the library disagrees with its own mask.  A batch row cannot
+                            // be re-drawn, so the single-request step's retry (ban the id, draw the step again) has no
+                            // equivalent here: the slot ends and the token is not emitted.
+                            std::fprintf(stderr, "strata batch: slot %d's grammar refused token %d (%s): the slot ends\n",
+                                         b, (int) y, sl.match.error().c_str());
+                            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                            std::printf("BDONE %d %lld stop %.1f\n", b, (long long) sl.produced, ms);
+                            sl.active = false;
+                            sl.cached = false;   // its sessions took the row this token came from
+                            sl.match = strata::grammar::Match{};
+                            sl.fence.reset();
+                            break;
+                        }
                     }
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
@@ -11448,6 +11539,7 @@ int main(int argc, char** argv) {
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         sl.match = strata::grammar::Match{};   // the slot is free: nothing keeps its grammar
+                        sl.fence.reset();
                         break;
                     }
                     sl.x = y;
@@ -12124,6 +12216,13 @@ int main(int argc, char** argv) {
             // in prompt order.  With them the conversation cache matches a picture by its key and grid, not by its
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
+            // fence_ban=<id>,<id>,...: the token ids the server bans while a Markdown code fence is open - its
+            // structural delimiters, which are content inside a fence but a token id the grammar cannot refuse (D-067).
+            // The engine tracks the fence from the bytes of the tokens it commits and adds these to the mask only
+            // while one is open.  Absent: nothing is tracked and no step changes.  Decimal ids, comma separated; a
+            // list that does not parse refuses the request (`fence_error`, above the grammar compile).
+            std::vector<int32_t> req_fence;
+            std::string fence_error;   // `fence_ban=` did not parse: the request is refused, never decoded with half of it
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -12167,8 +12266,21 @@ int main(int argc, char** argv) {
                             if (*qe != ',' && *qe != '\0') { req_img_keys.clear(); break; }
                         }
                     }
+                    else if (key == "fence_ban") {
+                        // Not the `img_keys=` shape on failure: an empty list there means "no keys", here it would
+                        // mean "decoded unconstrained with a delimiter drawable inside a fence", and nothing would
+                        // say so.  `vocab_size()` is 0 until the grammar tokenizer is loaded, and then only the
+                        // syntax can be checked - which is enough, because a fence ban reaches a mask only with a
+                        // grammar, and the engine reads no id out of range (`fence_advance`).
+                        if (!parse_fence_ban(tok.c_str() + eq + 1, grammar_session.vocab_size(), req_fence, fence_error))
+                            break;
+                    }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            if (!fence_error.empty()) {   // one line per refused reply, as every other refusal in this loop
+                std::printf("ERR fence: %s\n", fence_error.c_str());
+                continue;
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             std::vector<float> req_bias;
@@ -14855,6 +14967,10 @@ int main(int argc, char** argv) {
             // grammar has not seen can move its state.
             std::vector<float> gbias;
             std::vector<int32_t> gbanned;   // a draw the mask allowed and the matcher then refused (a library bug)
+            // the reply's open code fence (D-067), advanced by the same tokens the matcher gets; only touched when the
+            // request named `fence_ban=`, so a request without it does exactly the work it did before
+            strata::grammar::FenceTracker gfence;
+            std::vector<int32_t> gfence_bans;   // `gbanned` + the fence's ids: rebuilt per step, only while a fence is open
             int gretry = 0;
             bool gstop = false;             // nothing is allowed here: the reply ends without a draw
             auto grammar_mask = [&]() -> bool {
@@ -14865,7 +14981,23 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 gbias.resize((size_t) n_vocab);
-                gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, gbanned, gbias.data(), n_vocab);
+                // The fence's ids are a separate list from `gbanned` because a fence opens and closes many times in
+                // one reply: the ban is recomputed every step, `gbanned` never is (it is permanent for the request).
+                const bool fence_on = !req_fence.empty() && gfence.open();
+                const std::vector<int32_t>* bans = &gbanned;
+                if (fence_on) {
+                    gfence_bans.assign(gbanned.begin(), gbanned.end());
+                    gfence_bans.insert(gfence_bans.end(), req_fence.begin(), req_fence.end());
+                    bans = &gfence_bans;
+                }
+                gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, *bans, gbias.data(), n_vocab);
+                if (gstop && fence_on) {
+                    // The valve: a fence the tracker wrongly believes open must never dead-end a reply, so a step the
+                    // fence bans emptied is asked for once more without them.  It cannot loop - the retry carries no
+                    // fence ids - and should never fire: the measured mask keeps 248,112 ids with them suppressed.
+                    std::fprintf(stderr, "strata: a fence ban left no id drawable; the step was drawn without it\n");
+                    gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, gbanned, gbias.data(), n_vocab);
+                }
                 // a fully masked row is not a sampler input: every logit at -inf makes the greedy kernel emit token 0
                 return gstop || ver.set_logit_bias(gbias, err);
             };
@@ -15066,7 +15198,13 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (req_match.valid() && !g_end) req_match.consume((uint32_t) outv[(size_t) a]);   // committed: now the state
+                if (req_match.valid() && !g_end) {
+                    // The fence state takes the token at the statement that hands it to the matcher, so the ban and the
+                    // matcher can never disagree about what has been committed (D-067).  A grammar forces T = 1, so
+                    // `a` is 0 here and `outv[a]` is the row the window committed.
+                    if (!req_fence.empty()) fence_advance(gfence, grammar_session, outv[(size_t) a]);
+                    req_match.consume((uint32_t) outv[(size_t) a]);   // committed: now the state
+                }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
@@ -15355,6 +15493,10 @@ int main(int argc, char** argv) {
                     // The request compiled this grammar for its own first token (the solo `GEN 1` step), which that
                     // step has already consumed: the state is exactly "after `sl.x`", which is what row 0 needs.
                     sl.match = std::move(req_match);
+                    // the same token advanced the fence state beside that consume, so it travels with `match` (D-067);
+                    // a request without `fence_ban=` leaves an empty list and the slot never touches the tracker
+                    sl.fence = gfence;
+                    sl.fence_ban = std::move(req_fence);
                     if (batch_mtp) {
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
                                                                         sl.p - 1, sl.draft.data(), err)) {
