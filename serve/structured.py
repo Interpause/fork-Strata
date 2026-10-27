@@ -38,6 +38,70 @@ TOO_DEEP = ("response_format schema nests too deeply for Python to check: the sc
             "interpreter's recursion limit, and the engine's own ceiling is lower still (64 nested properties), "
             "so it cannot be compiled - send a flatter schema")
 
+#: The most members one schema may hold.  The validity gate's cost is per member, not per byte: `jsonschema`'s
+#: `check_schema` takes ~184 µs per `properties` entry and ~380 µs per `anyOf` branch, linear from 1,000 to 20,000
+#: (tmp/research/check-schema-report.md §3).  At the server's 256 MiB body ceiling that is hours of CPU for one
+#: request.  No real schema needs this many: a tool schema generated for a model is a few hundred members at most.
+#: Measured on the development PC (AMD Ryzen 9 5950X, CPython 3.14.8, jsonschema 4.26.0): `prepare_format` takes
+#: 424 ms for 2,000 properties and 788 ms for 2,000 `anyOf` branches, so the worst case at this ceiling is under
+#: a second.
+MEMBER_CEILING = 2000
+
+#: A schema whose member count is past `MEMBER_CEILING`.  The count is what the walks pay for, so the message names
+#: the units, the ceiling, and the fix.  It names `response_format` as the other messages do, which is also what the
+#: Responses route renames to `text.format`.
+TOO_MANY_MEMBERS = (
+    "response_format schema has more than %d members, the server's ceiling; the check costs per member (one each "
+    "for a property, an anyOf/oneOf/allOf branch, an items schema, a patternProperties entry and a "
+    "$defs/definitions entry) - send a smaller schema" % MEMBER_CEILING)
+
+_MEMBER_KEYS = ("properties", "patternProperties", "$defs", "definitions")
+_COMBINATION_KEYS = ("anyOf", "oneOf", "allOf")
+#: Keywords whose value is data, not schema: a `title` or an `enum` of 50,000 strings holds no members, and the
+#: measured cost of a 989 KB `enum` is 12.9 ms - so the walk must not spend itself on it.
+_DATA_KEYS = ("enum", "const", "default", "examples")
+
+
+def _over_member_ceiling(schema):
+    """True when `schema` holds more than `MEMBER_CEILING` members.
+
+    An explicit stack, never recursion: a `RecursionError` raised here would be caught by `prepare_format` and
+    reported as `TOO_DEEP`, blaming a schema that is wide, not deep.  The walk stops at the first member past the
+    ceiling, so a refused schema is not walked to its end either.
+    """
+    count = 0
+    stack = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _MEMBER_KEYS and isinstance(value, dict):
+                    count += len(value)
+                    if count > MEMBER_CEILING:
+                        return True
+                    stack.extend(value.values())
+                elif key in _COMBINATION_KEYS and isinstance(value, list):
+                    count += len(value)
+                    if count > MEMBER_CEILING:
+                        return True
+                    stack.extend(value)
+                elif key == "items":
+                    if isinstance(value, dict):
+                        count += 1
+                        if count > MEMBER_CEILING:
+                            return True
+                        stack.append(value)
+                    elif isinstance(value, list):
+                        count += len(value)
+                        if count > MEMBER_CEILING:
+                            return True
+                        stack.extend(value)
+                elif key not in _DATA_KEYS and isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
 
 def _non_finite(value, path=""):
     """The first `(pointer, value)` in a schema that is infinite or NaN, or None."""
@@ -173,6 +237,14 @@ def prepare_format(response_format, messages):
     # function, and the first call is `format_schema` itself.  Catching beside `SchemaError` alone would let a
     # deeper `check_refs` or `_only_objects` escape.
     try:
+        # Before `format_schema`: its `_only_objects` and `check_refs` walks, and then `check_schema`, all pay per
+        # member, and one body at the server's 256 MiB ceiling can hold hours of them.  `json_object` ignores any
+        # `json_schema` beside it, so only a declared `json_schema` is counted.
+        if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+            spec = response_format.get("json_schema")
+            declared = spec.get("schema") if isinstance(spec, dict) else None
+            if isinstance(declared, dict) and _over_member_ceiling(declared):
+                raise ValueError(TOO_MANY_MEMBERS)
         schema = format_schema(response_format)
         if schema is None:
             return messages, None

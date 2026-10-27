@@ -6359,9 +6359,13 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = forced_choice(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            # #430 #431 (#1999): the watcher starts before `prepare_format`, which can take long, and the load stays
+            # after it, so a schema refusal is a 400 instead of paying for the model first.
+            cancel = threading.Event()
+            self._watch_client(cancel)
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError(FORMAT_WITH_TOOLS)
+                raise ValueError(FORMAT_WITH_TOOLS)          # still before the load: a refusal is not a model load
             grammar_state = {}                                # D-068: filled by Service.run (see _run)
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
@@ -6380,8 +6384,6 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
-            cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -6450,7 +6452,6 @@ def make_handler(svc: Service):
             if title is not None:
                 return self._responses_ready(req, title)
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             grammar_state = {}                               # D-068: filled by Service.run (see _openai)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
@@ -6541,6 +6542,10 @@ def make_handler(svc: Service):
                 pass
 
         def _responses_prepare(self, req, cancel=None):
+            if cancel is not None:
+                # #430 #431 (#1999): before `prepare_format` below, which can take long; a caller that passes no
+                # event keeps working without a watcher it could not stop.
+                self._watch_client(cancel)
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)

@@ -36,6 +36,17 @@ def nested_schema(depth):
     return node
 
 
+def many_members(count):
+    """`count` schema members, one top-level `properties` entry each: the unit `prepare_format`'s ceiling counts.
+
+    One entry per member keeps the count exact and makes the walk visit every one.  Measured on this build
+    (AMD Ryzen 9 5950X, CPython 3.14.8, jsonschema 4.26.0): `prepare_format` takes 424 ms for 2,000 properties
+    and 788 ms for 2,000 `anyOf` branches, so a schema at the ceiling is under a second and one past it is
+    refused before the expensive walk.
+    """
+    return {"type": "object", "properties": {f"p{i}": {"type": "string"} for i in range(count)}}
+
+
 TEXT = {"type": "string"}
 STORY_SCHEMA = object_schema({
     "title": TEXT, "sheet": TEXT, "cast": {"type": "array", "items": object_schema({"name": TEXT,
@@ -194,6 +205,54 @@ class Structured(unittest.TestCase):
             {"type": "json_schema", "json_schema": {"name": "deep", "schema": nested_schema(60)}},
             [{"role": "user", "content": "Photobooth. 15 seconds."}])
         self.assertIsNotNone(validator)
+
+    def test_a_schema_over_the_member_ceiling_is_named_on_both_routes(self):
+        # One member past `MEMBER_CEILING` is refused before the gate walks the schema, on both routes and before
+        # the engine loads, so a request cannot spend the server's CPU on a count it will not finish.
+        schema = many_members(structured.MEMBER_CEILING + 1)
+        with mock.patch.object(self.svc, "load") as load:
+            code, reply = self.chat(response_format={"type": "json_schema",
+                                                     "json_schema": {"name": "wide", "schema": schema}})
+            self.assertEqual(code, 400, reply)
+            self.assertEqual(reply["error"]["message"], structured.TOO_MANY_MEMBERS)
+            self.assertIn(str(structured.MEMBER_CEILING), reply["error"]["message"])
+            code, reply = self.responses(text={"format": {"type": "json_schema", "name": "wide",
+                                                          "schema": schema}})
+            self.assertEqual(code, 400, reply)
+            # As on the other refusals: `_responses_prepare` renames the field its client actually sent.
+            self.assertEqual(reply["error"]["message"],
+                             structured.TOO_MANY_MEMBERS.replace("response_format", "text.format"))
+            self.assertEqual(reply["error"]["param"], "text.format")
+            load.assert_not_called()
+
+    def test_a_schema_at_the_member_ceiling_still_passes(self):
+        # The ceiling is a boundary, not a blanket refusal: exactly `MEMBER_CEILING` members is accepted (the count
+        # refuses only what is past it) and still yields a validator.
+        messages, validator = structured.prepare_format(
+            {"type": "json_schema", "json_schema": {"name": "wide",
+                                                    "schema": many_members(structured.MEMBER_CEILING)}},
+            [{"role": "user", "content": "Photobooth. 15 seconds."}])
+        self.assertIsNotNone(validator)
+
+    def test_the_schema_gate_runs_after_the_client_watcher(self):
+        # Item 11: `prepare_format` can take long, so a client that hangs up must be noticed first.  The refusal is
+        # the gate's own (a non-object root), and the watcher and the gate are recorded in the order they run.
+        calls = []
+        real_prepare = server_module.prepare_format
+
+        def watch(handler, cancel):
+            calls.append("watch")
+
+        def prepare(fmt, messages):
+            calls.append("prepare")
+            return real_prepare(fmt, messages)
+
+        bad = {"type": "json_schema", "json_schema": {"name": "bad", "schema": {"type": "string"}}}
+        with mock.patch.object(self.httpd.RequestHandlerClass, "_watch_client", watch), \
+                mock.patch.object(server_module, "prepare_format", prepare):
+            code, reply = self.chat(response_format=bad)
+        self.assertEqual(code, 400, reply)
+        self.assertEqual(calls, ["watch", "prepare"])
 
     def test_h3_schema_success_and_stream_with_reasoning(self):
         code, reply = self.chat()
