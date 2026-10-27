@@ -35,6 +35,11 @@ CTX = 4096
 ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (#606: not
 #                                                one token repeated, which the server ends at 256)
 
+# `_run` has one reader (`StructureParser`) and `begin_grammar` never returns None, so a test whose ids are not a
+# template tail supplies the entry itself.  The file name is never read: the mock engine makes no grammar of its own.
+FAKE_ANSWER_GRAMMAR = ("strata-test.lark", "entry_answer", False)
+FAKE_THINK_GRAMMAR = ("strata-test.lark", "entry_think", False)
+
 
 class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
@@ -1883,9 +1888,9 @@ class PcieShare(unittest.TestCase):
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 0",
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20"])       # an older engine
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-        # The text path: this test is about the DONE line's PCIe figures, and its raw prompt is not
-        # template-shaped, so a grammar has no entry for it.  `begin_grammar` -> None is the opt-out.
-        with mock.patch.object(svc, "begin_grammar", return_value=None):
+        # This test is about the DONE line's PCIe figures, and its raw prompt is not template-shaped, so the
+        # reply's entry is supplied directly (its script starts with `</think>`).
+        with mock.patch.object(svc, "begin_grammar", return_value=FAKE_THINK_GRAMMAR):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 for _ in range(3):
                     list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
@@ -1977,9 +1982,9 @@ class RepeatStop(unittest.TestCase):
         if limit is not None:
             svc.repeat_stop_tokens = limit
         ids = tok.encode("hi")
-        # The text path: repeat-stop is a sampling pathology, not a structure question, and this raw prompt is not
-        # template-shaped, so a grammar has no entry for it.  `begin_grammar` -> None is the opt-out.
-        with mock.patch.object(svc, "begin_grammar", return_value=None):
+        # Repeat-stop is a sampling pathology, not a structure question, and this raw prompt is not template-shaped,
+        # so the reply's entry is supplied directly.
+        with mock.patch.object(svc, "begin_grammar", return_value=FAKE_ANSWER_GRAMMAR):
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 done = [x for kind, x in svc.run(ids, False, None, 3000, {}, threading.Event())
                         if kind == "done"][0]
@@ -2037,9 +2042,9 @@ class NonFiniteLogits(unittest.TestCase):
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         ids = tok.encode("hi")
         events, done, error = [], None, None
-        # The text path: the non-finite retry is an engine behaviour, not a structure question, and this raw prompt
-        # is not template-shaped, so a grammar has no entry for it.  `begin_grammar` -> None is the opt-out.
-        with mock.patch.object(svc, "begin_grammar", return_value=None), \
+        # The non-finite retry is an engine behaviour, not a structure question, and this raw prompt is not
+        # template-shaped, so the reply's entry is supplied directly.
+        with mock.patch.object(svc, "begin_grammar", return_value=FAKE_ANSWER_GRAMMAR), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             try:
                 for kind, x in svc.run(ids, False, None, 100, {}, threading.Event()):
@@ -3606,18 +3611,6 @@ class ReplyEndingInsideThinking(unittest.TestCase):
         self.assertFalse(c["message"].get("content"))
         self.assertIn("two plus two is four", c["message"]["reasoning_content"])
 
-    def test_a_reply_that_closed_its_thinking_right_after_a_quote_is_not_touched(self):
-        # #537: that </think> waits for the character after it; the end of the turn makes it the end of the thinking
-        self.engine.THOUGHT = 'two plus two is "4"</think>'
-        # The text path: the reply spells its closer as bytes, and holding it until the next character is the text
-        # reader's rule; with the grammar that text is a delimiter token that ends the thinking at once, so the
-        # question only arises without one.  Returning None is the opt-out.
-        with mock.patch.object(self.svc, "begin_grammar", return_value=None):
-            c = self.chat()
-        self.assertEqual(len(self.engine.prompts), 1)
-        self.assertFalse(c["message"].get("content"))
-        self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
-
 
 class ThinkingBudget(unittest.TestCase):
     """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
@@ -3964,9 +3957,9 @@ class StatusHandover(unittest.TestCase):
         svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
         svc.fifo = SlowRelease()
-        # The text path: this test is about the status handed over between two requests, not reply structure, and
-        # its raw prompt is not template-shaped, so a grammar has no entry for it.  Returning None is the opt-out.
-        svc.begin_grammar = lambda *a, **k: None
+        # This test is about the status handed over between two requests, not reply structure, and its raw prompt is
+        # not template-shaped, so the reply's entry is supplied directly (its script starts with `</think>`).
+        svc.begin_grammar = lambda *a, **k: FAKE_THINK_GRAMMAR
         ids = tok.encode("hi")
         first = svc.run(ids, True, None, 30, {}, threading.Event())
         for _ in range(5):
@@ -4599,9 +4592,9 @@ class LostStep(unittest.TestCase):
                 eng.silence_s = 0.5
                 tok = ByteTokenizer()
                 svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
-                # The text path: this test is about recovering from a silent or stopped engine, not reply
-                # structure, and the fake engine reports no `grammar=1`.  Returning None is the opt-out.
-                svc.begin_grammar = lambda *a, **k: None
+                # This test is about recovering from a silent or stopped engine, not reply structure, and the fake
+                # engine reports no `grammar=1`, so the reply's entry is supplied directly.
+                svc.begin_grammar = lambda *a, **k: FAKE_ANSWER_GRAMMAR
                 httpd = serve(svc, port=0)
                 base = f"http://127.0.0.1:{httpd.server_address[1]}"
                 body = {"model": "m", "max_tokens": 2, "reasoning_effort": "none", "stream": stream,

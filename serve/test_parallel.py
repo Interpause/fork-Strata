@@ -326,9 +326,9 @@ class ParallelService(unittest.TestCase):
         tok = ByteTokenizer()
         self.svc = Service(self.engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         # The fake engine below is byte-level: its reply is its own bytes (`ok, done.` then the byte tokenizer's
-        # end id), not the tokens a grammar constrains, and what this module is about is the slots.  So the reply is
-        # read as text - a text-path test, which goes away with `OutputParser`.
-        self.svc.begin_grammar = lambda *a, **k: None
+        # end id), not the tokens a grammar constrains, and what this module is about is the slots.  The entry the
+        # one reader (`StructureParser`) decodes with is supplied directly.
+        self.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

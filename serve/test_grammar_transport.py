@@ -203,19 +203,6 @@ class FenceBan(unittest.TestCase):
             self.assertTrue(StrataEngine.sampling_keys(sampling).endswith(
                 " fence_ban=248058,248059,248066,248067,248068,248069"))
 
-    def test_a_request_without_a_grammar_sends_none(self):
-        # D-030 refuses a chat-shaped request with no grammar, so the no-grammar path is the one that returns no file
-        # (as `StatusHandover` drives): nothing about that line changes.
-        with tempfile.TemporaryDirectory() as d:
-            pack = Path(d)
-            (pack / "vocab.json").write_text("{}", encoding="utf-8")
-            svc, engine, tok = service(pack, tok=SixTagTokenizer())
-            svc.begin_grammar = lambda *a, **k: None
-            list(svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event()))
-            sampling = engine.calls[0]["sampling"]
-            self.assertNotIn("strata_fence_ban", sampling)
-            self.assertEqual(StrataEngine.sampling_keys(sampling), "")
-
 
 class Request(unittest.TestCase):
     def setUp(self):

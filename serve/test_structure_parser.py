@@ -13,9 +13,8 @@ labels, which are built from the request's tools.  The things checked here are:
   ``</parameter>``, a call that never closed: each is a case the text parser had to guess at, and the structured
   reader reports what the grammar left instead (`Impossible`).
 
-The text reader, `OutputParser`, was the reference until P6.  It no longer reports tool calls at all - a
-`<tool_call>` in a reply it reads reaches the client as the text it is - so the event-by-event parity comparison it
-supported was retired rather than re-pointed at something else.
+P7 deleted the text reader that was the reference for an event-by-event parity comparison up to P6: an
+unconstrained reply is impossible now, so there is no reply left for it to read.
 """
 
 import json

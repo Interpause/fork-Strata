@@ -95,7 +95,7 @@ class ChatTemplate:
             messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
             prompt = render(messages, tools)
             # Instructions include example XML and literal tag names, which are not model output. Parse only
-            # complete calls to our probe functions, using the same body parser as OutputParser.
+            # complete calls to our probe functions, with the same body parser the APIs' replies use.
             bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
                                 prompt, re.S)
             try:
@@ -726,9 +726,6 @@ class Event:
     call: ToolCall | None = None
 
 
-THINK_END = "</think>"
-
-
 PARAM_END = "</parameter>"
 FUNC_END = "</function>"
 
@@ -829,83 +826,13 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
-class OutputParser:
-    """Incremental parser of the model's text. Feed deltas; get events. The one tag held back across deltas is
-    `</think>`, so clients never see `</thi`.  A `<tool_call>` in a reply read here reaches the client as the text it
-    is, because the grammar (`StructureParser`) is what decides a call: this reader reports none."""
-
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
-        self.state = "reasoning" if thinking else "content"
-        self.buf = ""
-        self.lead = False
-        self.schemas = {t.get("name"): t for t in tools or []}
-        # stream_tools: kept so the servers and their tests construct this class unchanged.  The text reader reports
-        # no tool calls any more, so the flag changes nothing here; `StructureParser` still honours it.
-        self.stream_tools = stream_tools
-        # Zero for good under the grammar: a `<tool_call>` token cannot appear inside `thinking`, so nothing is
-        # held back or rescued.  Kept because `serve/server.py` reads them and `StructureParser` mirrors them.
-        self.pending: list = []
-        self.rescued = 0
-        self.refused = 0
-
-    def _hold(self, text: str) -> int:
-        """Length of the longest suffix of `text` that is a prefix of `</think>`.
-
-        The structured reader never needs this: `serve/grammar/decode.py` reports the closer as its own token, so
-        its end is known from the matcher's state.  The text route does, because it bytes the reply into `self.buf`
-        itself: without a hold a `</think>` split across two deltas would be emitted as reasoning before the buffer
-        that recognises it ever forms, and the reply would never leave the reasoning state."""
-        for n in range(min(len(THINK_END) - 1, len(text)), 0, -1):
-            if text.endswith(THINK_END[:n]):
-                return n
-        return 0
-
-    def feed(self, delta: str) -> list[Event]:
-        self.buf += delta
-        out: list[Event] = []
-        if self.state == "reasoning":
-            i = self.buf.find(THINK_END)
-            if i < 0:
-                keep = self._hold(self.buf)
-                if len(self.buf) > keep:
-                    out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
-                    self.buf = self.buf[len(self.buf) - keep:]
-                return out
-            if i:
-                out.append(Event("reasoning", self.buf[:i]))
-            self.buf = self.buf[i + len(THINK_END):]
-            self.state, self.lead = "content", True
-        if self.lead:                                   # newlines right after </think>
-            stripped = self.buf.lstrip("\n")
-            if not stripped:
-                self.buf = ""
-                return out
-            self.buf, self.lead = stripped, False
-        if self.buf:
-            out.append(Event("content", self.buf))
-            self.buf = ""
-        return out
-
-    def finish(self, reason: str | None = None) -> list[Event]:
-        """End of generation: flush whatever is held.  `reason` stays in the signature the servers call: no held
-        state depends on it."""
-        out = []
-        if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
-            self.buf, self.state = "", "content"
-        if self.buf:
-            out.append(Event("reasoning" if self.state == "reasoning" else "content", self.buf))
-            self.buf = ""
-        return out
-
-
 class StructureParser:
-    """The API's events from the grammar's structure (D-042): the same events `OutputParser` reports, for a reply
-    whose structure the grammar decided.
+    """The API's events from the grammar's structure (D-042): the one reader a reply goes through.
 
     Feed it a token at a time - its id and its text - and it yields reasoning, content, tool_start, tool_args and
-    tool_call exactly as the text parser does, because the servers' three APIs key on those.  What it does not do is
-    read structure out of the bytes: `serve/grammar/decode.py` says which token is a delimiter (from the fragment's
-    labels and the pack's special ids) and which is payload.  So a delimiter that is spelled, fenced or quoted is
+    tool_call, which the servers' three APIs key on.  What it does not do is read structure out of the bytes:
+    `serve/grammar/decode.py` says which token is a delimiter (from the fragment's labels and the pack's special ids)
+    and which is payload.  So a delimiter that is spelled, fenced or quoted is
     prose here without a fence tracker, a value may contain a parameter tag unless it alone on its line (D5), and a
     tool_args tail is never fabricated: a call either reached its closing token or it did not.
 
@@ -915,8 +842,7 @@ class StructureParser:
 
     `stream_tools` is the server's setting: report a call while it is written (`tool_start`, then `tool_args`
     pieces) instead of only at its end.  A reasoning block is never a call here - the grammar's THINK_BODY is a
-    text terminal and cannot emit a delimiter token - so rescued/refused stay 0 and pending is always empty, which
-    is what the server reads those for on the text parser.
+    text terminal and cannot emit a delimiter token - so rescued/refused stay 0 and pending is always empty.
     """
 
     def __init__(self, entry: str, tools: list[dict] | None = None, stream_tools: bool = True):
@@ -932,7 +858,7 @@ class StructureParser:
         self.rescued = self.refused = 0
         self.pending: list = []
 
-    # ---------------------------------------------------------------- what the server reads (as on OutputParser)
+    # ---------------------------------------------------------------- what the server reads
     @property
     def state(self) -> str:
         """`reasoning` while the reply is still in the thinking block, `content` after it.  The thinking budget and

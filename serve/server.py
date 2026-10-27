@@ -58,7 +58,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser,
+from serve.frontend import (ChatTemplate, Event,
                             STRUCTURAL_TAGS, StructureParser,  # noqa: E402
                             anthropic_to_messages, forced_choice, images_of, literal_tags, mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
@@ -4591,7 +4591,6 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -4616,7 +4615,6 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
-        opening: list[Event] = []
         answered = False                                # content or a call came out
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -4632,30 +4630,21 @@ class Service:
         gfiles = []                                     # the request's grammar files, dropped in the finally
         try:
             grammar = self.begin_grammar(ids, gtools, force, sampling)
-            gfile, gentry, relaxed = grammar if grammar else (None, None, False)
+            gfile, gentry, relaxed = grammar          # never None: begin_grammar raises instead (D-030)
             if grammar_state is not None:
                 # Set before the first yield: a caller that drains the generator only sees it if it is there when
                 # the reply is checked (D-068).  The dict belongs to the caller, so concurrent --batch requests never
                 # share one.
                 grammar_state["relaxed"] = relaxed
-            if gfile:
-                gfiles.append(gfile)                    # D-045: a continuation pass holds a grammar of its own
-                sampling = {**(sampling or {}), "strata_grammar": gfile}
-                # D-067: with the grammar, the ids a code fence hides.  A tokenizer that resolves none sends none.
-                if self.fence_ban_ids:
-                    sampling = {**sampling, "strata_fence_ban": self.fence_ban_ids}
-            # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
-            # grammar instead of from the bytes.  Only when the engine really applied it - one without the capability
-            # strips the file and decodes unconstrained, and then there is no grammar to read (D-043).
-            structured = bool(gfile) and bool((getattr(self.engine, "info", None) or {}).get("grammar"))
-            if structured:
-                parser = StructureParser(gentry, gtools)
-                opening = parser.opening()
-
-            def feed(t, piece):
-                """One generated token into whichever parser is reading: the grammar's needs the id, the text parser
-                only the bytes."""
-                return parser.feed(t, piece) if structured else parser.feed(piece)
+            gfiles.append(gfile)                        # D-045: a continuation pass holds a grammar of its own
+            sampling = {**(sampling or {}), "strata_grammar": gfile}
+            # D-067: with the grammar, the ids a code fence hides.  A tokenizer that resolves none sends none.
+            if self.fence_ban_ids:
+                sampling = {**sampling, "strata_fence_ban": self.fence_ban_ids}
+            # D-042/D-063: the reply is read from its tokens, and this is the only reader there is - a request
+            # without a grammar is refused by begin_grammar, so no path arrives here without one.
+            parser = StructureParser(gentry, gtools)
+            opening = parser.opening()
             # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
             # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
             # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
@@ -4776,7 +4765,7 @@ class Service:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
-                                evs = cut(feed(t, piece))
+                                evs = cut(parser.feed(t, piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -4911,7 +4900,7 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state == "reasoning"
-                            evs = cut(feed(t, detok.push(t)))
+                            evs = cut(parser.feed(t, detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev

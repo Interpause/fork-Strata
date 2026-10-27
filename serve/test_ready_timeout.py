@@ -61,9 +61,9 @@ class ReadyTimeout(unittest.TestCase):
         self.addCleanup(eng.close)
         svc = Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / 'chat_template.jinja'))
         # The scripted engine prints no INFO line (so it claims no grammar) and answers with a bare token: this
-        # module is about the READY timeout, not the reply, so the reply is read as text (a text-path test: gone
-        # with `OutputParser`).
-        svc.begin_grammar = lambda *a, **k: None
+        # module is about the READY timeout, not the reply, so the entry the one reader (`StructureParser`) decodes
+        # with is supplied directly.
+        svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
         return svc
 
     def post(self, base):

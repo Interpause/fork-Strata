@@ -25,9 +25,9 @@ class ContextOverflow(unittest.TestCase):
         cls.engine = MockEngine(tok, "ok", max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         # `post()` patches `encode_prompt` to an arbitrary number of `x` ids: the prompt this module is about is a
-        # size, not a rendered template, so no grammar entry resolves and none is wanted - the reply is read as text
-        # (a text-path test: gone with `OutputParser`).  The 400 cases never reach `_run`.
-        cls.svc.begin_grammar = lambda *a, **k: None
+        # size, not a rendered template, so no grammar entry resolves and none is wanted - the entry the one reader
+        # (`StructureParser`) decodes with is supplied directly.  The 400 cases never reach `_run`.
+        cls.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 

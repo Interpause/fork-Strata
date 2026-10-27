@@ -161,9 +161,9 @@ class ReplicaService(unittest.TestCase):
         self.engine = ReplicaEngine(engines)
         self.svc = Service(self.engine, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         # The fake engines are byte-level (`test_parallel.FAKE_BATCH`): their reply is their own bytes, not tokens a
-        # grammar constrains, and this module is about routing between replicas.  A text-path test: gone with
-        # `OutputParser`.
-        self.svc.begin_grammar = lambda *a, **k: None
+        # grammar constrains, and this module is about routing between replicas.  The entry the one reader
+        # (`StructureParser`) decodes with is supplied directly.
+        self.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

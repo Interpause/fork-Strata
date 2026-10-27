@@ -1,9 +1,7 @@
 """serve/test_reasoning_tools.py - a `<tool_call>` written inside the reasoning is reasoning text, never a call.
 
-There is no rescue: the text reader reports those bytes as reasoning and never reports a call from them.  It has no
-call handling at all since P6, so a `<tool_call>` anywhere in a reply it reads reaches the client as the text it is.
-The structured reader (`StructureParser`) is what reports calls, and the `OverHttp` test drives that one over both
-APIs' HTTP endpoints.
+`StructureParser` reports a call only from the grammar's delimiter tokens, so a `<tool_call>` spelled in the thinking
+block reaches the client as the text it is.  `OverHttp` drives that reader over both APIs' HTTP endpoints.
 
     python -m unittest serve.test_reasoning_tools -v
 """
@@ -18,66 +16,11 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import ChatTemplate, OutputParser  # noqa: E402
+from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 from serve.test_server import CTX  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-CALL = "<tool_call>\n<function=read_file>\n<parameter=limit>\n120\n</parameter>\n<parameter=path>\nfile.txt\n</parameter>\n</function>\n</tool_call>"
-OTHER = CALL.replace("read_file", "not_declared")
-TOOLS = [{"name": "read_file", "parameters": {"properties": {"limit": {"type": "integer"}, "path": {"type": "string"}}}}]
-
-
-def run(text, width, tools=TOOLS, thinking=True, stream_tools=True):
-    p = OutputParser(thinking=thinking, tools=tools, stream_tools=stream_tools)
-    evs = []
-    for i in range(0, len(text), width):
-        evs += p.feed(text[i:i + width])
-    return evs + p.finish()
-
-
-def joined(evs, kind):
-    return "".join(e.text for e in evs if e.kind == kind)
-
-
-class Parser(unittest.TestCase):
-    def test_an_undeclared_name_stays_reasoning(self):
-        text = "see " + OTHER + " done</think>\n\nanswer"
-        for width in (1, 5, 100_000):
-            with self.subTest(width=width):
-                evs = run(text, width)
-                self.assertFalse([e for e in evs if e.kind == "tool_call"])
-                self.assertEqual(joined(evs, "reasoning"), "see " + OTHER + " done")
-                self.assertEqual(joined(evs, "content"), "answer")
-
-    def test_no_tools_declared_is_unchanged(self):
-        text = "before\n" + CALL + "\n</think>\n\nanswer"
-        for tools in (None, []):
-            for width in (1, 7, 100_000):
-                with self.subTest(tools=tools, width=width):
-                    evs = run(text, width, tools=tools)
-                    self.assertFalse([e for e in evs if e.kind == "tool_call"])
-                    self.assertEqual(joined(evs, "reasoning"), "before\n" + CALL + "\n")
-                    self.assertEqual(joined(evs, "content"), "answer")
-
-    def test_an_unfinished_call_is_never_a_call(self):
-        for text in ("before<tool_call>\n<function=read_file>\n",
-                     "before<tool_call>\n<function=read_file>\n<parameter=path>\nfile.txt\n</parameter>\n"):
-            for width in (1, 100_000):
-                with self.subTest(text=text[-20:], width=width):
-                    evs = run(text, width)
-                    self.assertFalse([e for e in evs if e.kind == "tool_call"])
-                    self.assertEqual(joined(evs, "reasoning"), text)
-
-    def test_the_thinking_ending_inside_a_call_makes_it_text(self):
-        text = "a<tool_call>\n<function=read_file>\nhmm</think>\n\nthe answer"
-        for width in (1, 100_000):
-            with self.subTest(width=width):
-                evs = run(text, width)
-                self.assertFalse([e for e in evs if e.kind == "tool_call"])
-                self.assertEqual(joined(evs, "reasoning"), "a<tool_call>\n<function=read_file>\nhmm")
-                self.assertEqual(joined(evs, "content"), "the answer")
-
 
 PROPS = {"path": {"type": "string"}}
 # The template's own shape: reasoning, the answer, then exactly two newlines and the call.  `answer_tools` in
@@ -87,9 +30,8 @@ SCRIPT = ("Let me look.\n</think>\n\nChecking.\n\n<tool_call>\n<function=write>\
 
 
 class OverHttp(unittest.TestCase):
-    """The structured route over HTTP: `Service.run` picks `StructureParser` from the token ids when the engine
-    reports `grammar=1`, and the two endpoint layers render that one `Event` stream.  The text reader is not the
-    subject - it reports no calls at all since P6, so a reply it reads can never show these blocks."""
+    """The structured route over HTTP: `Service.run` builds `StructureParser` from the token ids, and the two
+    endpoint layers render that one `Event` stream."""
 
     def setUp(self):
         self.pack = tempfile.mkdtemp()      # sweep_grammar_dirs runs on Service.__init__: never reuse a directory
