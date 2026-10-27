@@ -139,7 +139,9 @@ class Structured(unittest.TestCase):
             self.assertEqual(code, 400, reply)
             self.assertEqual(reply["error"]["message"], structured.FORMAT_WITH_TOOLS)
             self.assertEqual(reply["error"]["param"], "text.format")
-            load.assert_not_called()
+            # D-069: a generation route was asked for, so the model is warmed before the schema is judged - one load
+            # per request, both of which end as a refusal.  Warming first is what a second, valid request wants.
+            self.assertEqual(load.call_count, 2)
         # Without a schema the same tools are fine on the responses route: nothing to conflict with.
         self.assertEqual(self.responses(tools=responses)[0], 200)
 
@@ -161,7 +163,8 @@ class Structured(unittest.TestCase):
             # chat route's name), so the message is the same one with that one word changed.
             self.assertEqual(reply["error"]["message"], expected.replace("response_format", "text.format"))
             self.assertEqual(reply["error"]["param"], "text.format")
-            load.assert_not_called()
+            # warm first, then judge (D-069): one load per request, refused or not
+            self.assertEqual(load.call_count, 2)
         # A bound JSON *can* write is a different matter from one it cannot: 1e308 is finite, so the gate passes it,
         # and the compiler then refuses the float range it would have to generate.  Measured on this build -
         # `Failed to generate regex for float range: min=None, max=Some(1e308)` - and left as a terminal: which of
@@ -182,7 +185,8 @@ class Structured(unittest.TestCase):
         # `check_schema` recurses per nesting level (measured: 98 nested `properties` on this build), so a deep
         # enough schema escapes as an unhandled `RecursionError` and the connection is dropped.  150 is well
         # above the measured band, and below where `format_schema`'s own walk fails (499), so the gate is what
-        # trips - on both routes, before the engine is loaded, naming the problem instead of a traceback.
+        # trips - on both routes, naming the problem instead of a traceback.  The model is warmed first (D-069),
+        # so the refusal is a 400 the client can act on rather than a dropped connection.
         schema = nested_schema(150)
         with mock.patch.object(self.svc, "load") as load:
             code, reply = self.chat(response_format={"type": "json_schema",
@@ -196,7 +200,8 @@ class Structured(unittest.TestCase):
             # field the Responses client actually sent, so the sentence is the same with that one word changed.
             self.assertEqual(reply["error"]["message"], structured.TOO_DEEP.replace("response_format", "text.format"))
             self.assertEqual(reply["error"]["param"], "text.format")
-            load.assert_not_called()
+            # warm first, then judge (D-069): one load per request, refused or not
+            self.assertEqual(load.call_count, 2)
 
     def test_a_schema_below_the_depth_ceiling_still_passes(self):
         # The refusal above is a boundary, not a blanket one: 60 nested `properties` is below the measured failing
@@ -207,8 +212,9 @@ class Structured(unittest.TestCase):
         self.assertIsNotNone(validator)
 
     def test_a_schema_over_the_member_ceiling_is_named_on_both_routes(self):
-        # One member past `MEMBER_CEILING` is refused before the gate walks the schema, on both routes and before
-        # the engine loads, so a request cannot spend the server's CPU on a count it will not finish.
+        # One member past `MEMBER_CEILING` is refused before the gate walks the schema, on both routes, so a request
+        # cannot spend the server's CPU on a count it will not finish.  The model is warmed first (D-069): the
+        # ceiling bounds this request's work, it does not decide whether the engine starts.
         schema = many_members(structured.MEMBER_CEILING + 1)
         with mock.patch.object(self.svc, "load") as load:
             code, reply = self.chat(response_format={"type": "json_schema",
@@ -223,7 +229,8 @@ class Structured(unittest.TestCase):
             self.assertEqual(reply["error"]["message"],
                              structured.TOO_MANY_MEMBERS.replace("response_format", "text.format"))
             self.assertEqual(reply["error"]["param"], "text.format")
-            load.assert_not_called()
+            # warm first, then judge (D-069): one load per request, refused or not
+            self.assertEqual(load.call_count, 2)
 
     def test_a_schema_at_the_member_ceiling_still_passes(self):
         # The ceiling is a boundary, not a blanket refusal: exactly `MEMBER_CEILING` members is accepted (the count
@@ -253,6 +260,28 @@ class Structured(unittest.TestCase):
             code, reply = self.chat(response_format=bad)
         self.assertEqual(code, 400, reply)
         self.assertEqual(calls, ["watch", "prepare"])
+
+    def test_the_model_is_warmed_before_the_schema_is_judged(self):
+        # D-069: `svc.load()` is an ensure that costs a timestamp on a server that is already warm, and a request to
+        # either generation route is a request to have the model ready - so it runs first, even when the schema is
+        # about to be refused.  Both routes, in order, so a later move back in front of the load fails here.
+        calls = []
+        real_prepare = server_module.prepare_format
+
+        def load():
+            calls.append("load")
+
+        def prepare(fmt, messages):
+            calls.append("prepare")
+            return real_prepare(fmt, messages)
+
+        bad = {"type": "json_schema", "json_schema": {"name": "bad", "schema": {"type": "string"}}}
+        with mock.patch.object(self.svc, "load", load), \
+                mock.patch.object(server_module, "prepare_format", prepare):
+            self.assertEqual(self.chat(response_format=bad)[0], 400)
+            self.assertEqual(self.responses(text={"format": {"type": "json_schema", "name": "bad",
+                                                             "schema": {"type": "string"}}})[0], 400)
+        self.assertEqual(calls, ["load", "prepare", "load", "prepare"])
 
     def test_h3_schema_success_and_stream_with_reasoning(self):
         code, reply = self.chat()
@@ -339,11 +368,13 @@ class Structured(unittest.TestCase):
         self.assertIn(" at /q:", lines[0])
         self.assertIn("^x(?=y)", lines[0])
 
-    def test_rejected_schema_does_not_load_the_engine_or_retry(self):
+    def test_rejected_schema_warms_the_model_and_does_not_retry(self):
+        # D-069: the refusal comes after the load, so the next request finds the model warm; what must not happen
+        # is a retry - a schema refused before the engine runs is not a failed generation to be attempted again.
         with mock.patch.object(self.svc, "load") as load:
             code, _ = self.chat(response_format={"type": "json_schema"})
             self.assertEqual(code, 400)
-            load.assert_not_called()
+            load.assert_called_once()
         self.engine = self.svc.engine = MockEngine(self.tok, "Markdown is not JSON", max_context=16384)
         with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
             self.assertEqual(self.chat()[0], 502)
@@ -359,7 +390,7 @@ class Structured(unittest.TestCase):
         fmt = {"type": "json_schema", "json_schema": {"name": "local", "schema": schema}}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
 
-    def test_malformed_formats_and_tools_are_rejected_before_loading(self):
+    def test_malformed_formats_and_tools_are_rejected(self):
         formats = ([], {"type": "unsupported"},
                    {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
                    {"type": "json_schema", "json_schema": {"name": "x", "strict": "true", "schema": {"type": "object"}}})
@@ -370,7 +401,10 @@ class Structured(unittest.TestCase):
             self.assertEqual(self.chat(tools=[{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])[0], 400)
             self.assertEqual(self.chat(strata_mcp=True)[0], 400)
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
-            load.assert_not_called()
+            # A 400 is still a 400 whatever the engine did (D-069).  What this pins is the shape check: the body
+            # that is not an object at all is refused by `_post` before the route runs, so the load count is one
+            # per well-formed request and not one per bad payload.
+            self.assertEqual(load.call_count, len(formats) + 2)
 
     def test_a_pattern_only_the_engine_can_judge_is_not_a_false_400(self):
         # `\p{L}+` is a valid `regex-syntax` pattern for the grammar, but CPython's `re` refuses it (`bad escape
@@ -443,7 +477,8 @@ class Structured(unittest.TestCase):
                     code, reply = self.chat(response_format=fmt)
                     self.assertEqual(code, 400)
                     self.assertIn("only JSON objects", reply["error"]["message"])
-            load.assert_not_called()
+            # one load per request, refused or not (D-069)
+            self.assertEqual(load.call_count, len(schemas))
 
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess

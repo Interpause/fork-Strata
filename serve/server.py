@@ -6359,15 +6359,17 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = forced_choice(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
-            # #430 #431 (#1999): the watcher starts before `prepare_format`, which can take long, and the load stays
-            # after it, so a schema refusal is a 400 instead of paying for the model first.
+            # #430 #431 (#1999): the watcher starts before `svc.load()` and the gate below, each of which can take
+            # long, so a client that hung up does not leave the work running.
             cancel = threading.Event()
             self._watch_client(cancel)
+            # A generation route was asked for, so the model warms up first even when this request proves invalid
+            # (D-069): the next request finds it loaded, and on a server that is already warm this is a timestamp.
+            svc.load()
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError(FORMAT_WITH_TOOLS)          # still before the load: a refusal is not a model load
+                raise ValueError(FORMAT_WITH_TOOLS)
             grammar_state = {}                                # D-068: filled by Service.run (see _run)
-            svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -6543,9 +6545,11 @@ def make_handler(svc: Service):
 
         def _responses_prepare(self, req, cancel=None):
             if cancel is not None:
-                # #430 #431 (#1999): before `prepare_format` below, which can take long; a caller that passes no
-                # event keeps working without a watcher it could not stop.
+                # #430 #431 (#1999): before `svc.load()` and `prepare_format` below, each of which can take long; a
+                # caller that passes no event keeps working without a watcher it could not stop.
                 self._watch_client(cancel)
+            # as on the chat route (D-069): the model warms up first, even when this request proves invalid
+            svc.load()
             responses_api.check_request(req)
             messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
@@ -6585,7 +6589,6 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
