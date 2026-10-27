@@ -71,7 +71,7 @@ from serve.grammar import matcher as grammar_matcher  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
-from serve.structured import FORMAT_WITH_TOOLS, StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import FORMAT_WITH_TOOLS, TOO_DEEP, StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve.structured import format_schema  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -6040,6 +6040,15 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except RecursionError:
+                # A schema too deep for Python, on a path that skipped `prepare_format` (whose own catch names it
+                # first): the message is `structured.py`'s, so both entry points say the same thing (D-065's rule
+                # that a client is told why its schema was not supported).
+                print(f"[strata] 400 invalid request: {TOO_DEEP}", flush=True)
+                if path == "/v1/responses":
+                    self._json(400, responses_error_body(TOO_DEEP, param="text.format"))
+                else:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": TOO_DEEP}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:

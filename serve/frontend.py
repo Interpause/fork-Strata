@@ -842,7 +842,7 @@ class StructureParser:
 
     `stream_tools` is the server's setting: report a call while it is written (`tool_start`, then `tool_args`
     pieces) instead of only at its end.  A reasoning block is never a call here - the grammar's THINK_BODY is a
-    text terminal and cannot emit a delimiter token - so rescued/refused stay 0 and pending is always empty.
+    text terminal and cannot emit a delimiter token.
     """
 
     def __init__(self, entry: str, tools: list[dict] | None = None, stream_tools: bool = True):
@@ -855,8 +855,6 @@ class StructureParser:
         self.sval: list[str] = []                # its value, for a type that is not streamed
         self.sfirst = True
         self.sdeclared: dict = {}
-        self.rescued = self.refused = 0
-        self.pending: list = []
 
     # ---------------------------------------------------------------- what the server reads
     @property

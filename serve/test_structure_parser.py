@@ -226,11 +226,10 @@ class Impossible(unittest.TestCase):
         self.assertIn("'think'", str(caught.exception))
 
     def test_a_thinking_reply_has_nothing_to_rescue(self):
-        """Row 50: the server reads these two counts to report rescued calls, and they are zero by
-        construction here rather than by a rule."""
-        events, parser = events_of(["Thinking.", Special("</think>"), "\n\n"] + call(), "entry_think_tools")
+        """Row 50: the grammar's thinking body is a text terminal, so the only call in this reply is the real one -
+        nothing was held, streamed early, or rescued from the reasoning."""
+        events, _ = events_of(["Thinking.", Special("</think>"), "\n\n"] + call(), "entry_think_tools")
         self.assertEqual([e.kind for e in events if e.kind == "tool_call"], ["tool_call"])
-        self.assertEqual((parser.rescued, parser.refused, parser.pending), (0, 0, []))
 
     def test_a_json_body_inside_the_wrapper_is_not_a_production(self):
         """Rows 16 and 29: a JSON answer is one `%json` value with no wrapper.  `<tool_call>` is followed by `\n` and

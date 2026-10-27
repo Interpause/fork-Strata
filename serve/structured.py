@@ -28,6 +28,16 @@ class StructuredOutputError(RuntimeError):
 NON_FINITE = ("response_format schema: the %s value (%r) is a number JSON cannot write, so it cannot be carried "
               "into the reply's grammar - send a finite bound")
 
+#: A schema nested deeper than Python can walk.  `check_schema` and the validator built from it recurse once per
+#: level, as does `format_schema`'s hand-written `check_refs` walk (measured on this build: 98 nested `properties`
+#: for the gate, 499 for the walk).  The engine's own parse limit is lower still (64 nested `properties`, where
+#: serde_json's 128-level limit fires before llguidance sees the payload), so a schema that trips this could not
+#: compile anyway.  The depth Python fails at depends on the stack, and `RecursionError` carries no depth, so the
+#: message states the engine's ceiling rather than a number the client could aim at.
+TOO_DEEP = ("response_format schema nests too deeply for Python to check: the schema is nested past the "
+            "interpreter's recursion limit, and the engine's own ceiling is lower still (64 nested properties), "
+            "so it cannot be compiled - send a flatter schema")
+
 
 def _non_finite(value, path=""):
     """The first `(pointer, value)` in a schema that is infinite or NaN, or None."""
@@ -158,31 +168,38 @@ FORMAT_WITH_TOOLS = ("a response schema with tools is not supported: a reply is 
 
 
 def prepare_format(response_format, messages):
-    schema = format_schema(response_format)
-    if schema is None:
-        return messages, None
-    bad = _non_finite(schema)
-    if bad is not None:
-        raise ValueError(NON_FINITE % bad)
-    if response_format.get("type") == "json_object":
-        validator = _ObjectOnly()          # format_schema sent {"type": "object"}: one JSON object is the contract
-    else:
-        validators, SchemaError, Registry, NoSuchResource = jsonschema_modules()
+    # One catch covers every recursive walk a declared schema passes through - `format_schema`'s `check_refs` and
+    # `_only_objects`, then `check_schema` and the validator built from it - because they all run inside this
+    # function, and the first call is `format_schema` itself.  Catching beside `SchemaError` alone would let a
+    # deeper `check_refs` or `_only_objects` escape.
+    try:
+        schema = format_schema(response_format)
+        if schema is None:
+            return messages, None
+        bad = _non_finite(schema)
+        if bad is not None:
+            raise ValueError(NON_FINITE % bad)
+        if response_format.get("type") == "json_object":
+            validator = _ObjectOnly()      # format_schema sent {"type": "object"}: one JSON object is the contract
+        else:
+            validators, SchemaError, Registry, NoSuchResource = jsonschema_modules()
 
-        def no_remote(uri):
-            raise NoSuchResource(ref=uri)
+            def no_remote(uri):
+                raise NoSuchResource(ref=uri)
 
-        try:
-            cls = validators.validator_for(schema)
-            # format_checker=None on purpose: the default checker asserts the meta-schema's `format: regex` on
-            # every `pattern` with CPython's `re`, which is neither JSON Schema's ECMA-262 nor the engine's
-            # `regex-syntax`. Measured false 400: `\p{L}+` is a valid pattern for llguidance but Python raises
-            # `bad escape \p`. The engine is the authority on `pattern`, so a malformed `(` is not a validity
-            # error here: it reaches the compile ladder (serve/grammar/ladder.py), which owns it.
-            cls.check_schema(schema, format_checker=None)
-            validator = cls(schema, registry=Registry(retrieve=no_remote))
-        except SchemaError as exc:
-            raise ValueError(f"invalid response_format schema: {exc.message}") from exc
+            try:
+                cls = validators.validator_for(schema)
+                # format_checker=None on purpose: the default checker asserts the meta-schema's `format: regex` on
+                # every `pattern` with CPython's `re`, which is neither JSON Schema's ECMA-262 nor the engine's
+                # `regex-syntax`. Measured false 400: `\p{L}+` is a valid pattern for llguidance but Python raises
+                # `bad escape \p`. The engine is the authority on `pattern`, so a malformed `(` is not a validity
+                # error here: it reaches the compile ladder (serve/grammar/ladder.py), which owns it.
+                cls.check_schema(schema, format_checker=None)
+                validator = cls(schema, registry=Registry(retrieve=no_remote))
+            except SchemaError as exc:
+                raise ValueError(f"invalid response_format schema: {exc.message}") from exc
+    except RecursionError as exc:
+        raise ValueError(TOO_DEEP) from exc
     directive = ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
                  "Use every required field, correct types, and only allowed fields. "

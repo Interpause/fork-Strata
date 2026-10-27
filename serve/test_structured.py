@@ -23,6 +23,19 @@ def object_schema(properties):
     return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
 
 
+def nested_schema(depth):
+    """`depth` levels of nested `properties`: the shape that runs the recursive validity gate out of stack.
+
+    Measured on this build (CPython 3.14, `sys.getrecursionlimit()` 1000): `prepare_format` raises `RecursionError`
+    from `jsonschema`'s `check_schema` at 98 nested `properties`, and `format_schema`'s own recursive `check_refs`
+    walk at 499.  The engine's own parse ceiling is lower still (64), so nothing above ~64 can compile anyway.
+    """
+    node = {"type": "object"}
+    for _ in range(depth):
+        node = {"type": "object", "properties": {"p": node}}
+    return node
+
+
 TEXT = {"type": "string"}
 STORY_SCHEMA = object_schema({
     "title": TEXT, "sheet": TEXT, "cast": {"type": "array", "items": object_schema({"name": TEXT,
@@ -153,6 +166,34 @@ class Structured(unittest.TestCase):
             "type": "json_schema",
             "json_schema": {"name": "n", "schema": {"type": "object", "properties": {
                 "n": {"type": "number", "maximum": 15000}}}}})[0], 200)
+
+    def test_a_schema_too_deep_for_python_is_named_on_both_routes(self):
+        # `check_schema` recurses per nesting level (measured: 98 nested `properties` on this build), so a deep
+        # enough schema escapes as an unhandled `RecursionError` and the connection is dropped.  150 is well
+        # above the measured band, and below where `format_schema`'s own walk fails (499), so the gate is what
+        # trips - on both routes, before the engine is loaded, naming the problem instead of a traceback.
+        schema = nested_schema(150)
+        with mock.patch.object(self.svc, "load") as load:
+            code, reply = self.chat(response_format={"type": "json_schema",
+                                                     "json_schema": {"name": "deep", "schema": schema}})
+            self.assertEqual(code, 400, reply)
+            self.assertEqual(reply["error"]["message"], structured.TOO_DEEP)
+            self.assertIn("nested properties", reply["error"]["message"])
+            code, reply = self.responses(text={"format": {"type": "json_schema", "name": "deep", "schema": schema}})
+            self.assertEqual(code, 400, reply)
+            # As with the other messages on this route: `_responses_prepare` renames `response_format` to the
+            # field the Responses client actually sent, so the sentence is the same with that one word changed.
+            self.assertEqual(reply["error"]["message"], structured.TOO_DEEP.replace("response_format", "text.format"))
+            self.assertEqual(reply["error"]["param"], "text.format")
+            load.assert_not_called()
+
+    def test_a_schema_below_the_depth_ceiling_still_passes(self):
+        # The refusal above is a boundary, not a blanket one: 60 nested `properties` is below the measured failing
+        # depth (98) and below the engine's own ceiling (64), so the validity gate accepts it.
+        messages, validator = structured.prepare_format(
+            {"type": "json_schema", "json_schema": {"name": "deep", "schema": nested_schema(60)}},
+            [{"role": "user", "content": "Photobooth. 15 seconds."}])
+        self.assertIsNotNone(validator)
 
     def test_h3_schema_success_and_stream_with_reasoning(self):
         code, reply = self.chat()

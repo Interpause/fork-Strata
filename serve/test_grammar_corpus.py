@@ -50,13 +50,12 @@ class Corpus(unittest.TestCase):
             for width in WIDTHS:
                 for stream in (True, False):
                     with self.subTest(name=specimen["name"], width=width, stream_tools=stream):
-                        events, parser = replay(specimen["input"], tools, width, stream)
+                        events, _ = replay(specimen["input"], tools, width, stream)
                         self.assertEqual([e.kind for e in events if e.kind in ("tool_call", "tool_start")], [])
                         # nothing is lost and nothing turns into an answer: the whole input is the thinking
                         self.assertEqual("".join(e.text for e in events if e.kind == "reasoning"),
                                          specimen["input"])
                         self.assertEqual([e.kind for e in events if e.kind != "reasoning"], [])
-                        self.assertEqual((parser.rescued, parser.refused, parser.pending), (0, 0, []))
                         seen.add("".join(e.text for e in events))
             self.assertEqual(len(seen), 1, f"{specimen['name']}: the split changed what a client reads")
 
