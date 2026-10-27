@@ -5334,11 +5334,14 @@ def _is_json(text: str) -> bool:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    notice = None
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
+        if c.get("strata_schema_relaxed"):         # D-071: the stream's last chunk carries it, the reply gets it
+            notice = c["strata_schema_relaxed"]
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -5360,6 +5363,8 @@ def openai_collect(chunks) -> dict:
         msg["tool_calls"] = calls
     if mcp:
         msg["strata_mcp"] = mcp
+    if notice:
+        msg["strata_schema_relaxed"] = notice
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
@@ -5372,8 +5377,11 @@ def structured_chunks(chunks, validator, relaxed=None):
     """Buffer structured streams so a client never receives unvalidated content.
 
     `relaxed`: passed to `validated_json`, so a reply that misses a schema the ladder had to relax is delivered with
-    one warning instead of a 502 (D-068)."""
+    one warning instead of a 502 (D-068) - and, on the last chunk of the stream, a `strata_schema_relaxed` notice
+    naming the pointer and the violation, which `openai_collect` then carries into the non-streamed reply's message
+    (D-071).  A stream whose answer did fit the schema, or whose schema needed no repair, carries neither."""
     buffered = []
+    notice = {}
     heartbeat = time.monotonic()
     try:
         for chunk in chunks:
@@ -5385,13 +5393,15 @@ def structured_chunks(chunks, validator, relaxed=None):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"], relaxed=relaxed)
+        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"], relaxed=relaxed,
+                                 notice=notice)
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
             delta["reasoning_content"] = choice["message"]["reasoning_content"]
         yield {**buffered[0], "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-        yield buffered[-1]
+        last = buffered[-1]                 # the chunk that carries the finish_reason: the notice rides beside it
+        yield {**last, "strata_schema_relaxed": dict(notice)} if notice else last
     finally:
         chunks.close()
 
@@ -6455,6 +6465,7 @@ def make_handler(svc: Service):
                 return self._responses_ready(req, title)
             cancel = threading.Event()
             grammar_state = {}                               # D-068: filled by Service.run (see _openai)
+            notice = {}                                      # D-071: filled by `check` when it delivers a mismatch
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
             except ClientGone:
@@ -6469,7 +6480,7 @@ def make_handler(svc: Service):
 
             def check(text, finish):
                 return validated_json(text, validator, finish,
-                                      relaxed=lambda: grammar_state.get("relaxed", False))
+                                      relaxed=lambda: grammar_state.get("relaxed", False), notice=notice)
 
             def events():
                 yield from asm.start()
@@ -6482,7 +6493,7 @@ def make_handler(svc: Service):
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
-                    yield from asm.finish(done, check)
+                    yield from asm.finish(done, check, notice=notice)
             items = self._capture(events(), "responses")
             if not req.get("stream"):
                 try:

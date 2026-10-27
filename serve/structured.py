@@ -289,7 +289,7 @@ def prepare_format(response_format, messages):
     return messages, validator
 
 
-def validated_json(text, validator, finish, relaxed=None):
+def validated_json(text, validator, finish, relaxed=None, notice=None):
     """The reply's canonical JSON, or `StructuredOutputError`.
 
     `text` is parsed as it arrived: a schema reply is one `%json` value produced under the grammar, so the text that
@@ -299,6 +299,11 @@ def validated_json(text, validator, finish, relaxed=None):
     was the server's choice and failing the reply would blame the client or the model for it (D-068).  A schema that
     compiled as written keeps its 502, and so does every broken reply: truncation, invalid JSON, duplicate keys,
     a non-finite number and an uncanonicalisable value are not repairs.
+
+    `notice`: an optional dict this fills with `{"at": pointer, "error": why}` when, and only when, it delivers such a
+    reply.  The log line is read by whoever runs the server; the notice is how the *client* finds out that the JSON it
+    is about to use was checked against a wider schema than the one it sent (D-071) - the shape is settled on the
+    server, and the client is the one that can act on the difference.
     """
     def pairs(items):
         obj = {}
@@ -324,6 +329,8 @@ def validated_json(text, validator, finish, relaxed=None):
         if relaxed is not None and relaxed():
             print(f"[strata] structured output does not match the schema at {path}: {error.message}; the grammar "
                   "was relaxed to compile, so the answer is delivered as generated", flush=True)
+            if notice is not None:
+                notice.update(at=path, error=error.message)
             return canonical
         raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
     return canonical

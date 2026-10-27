@@ -643,9 +643,12 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
-    def finish(self, done: dict, validate=None) -> list[dict]:
+    def finish(self, done: dict, validate=None, notice=None) -> list[dict]:
         """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
-        `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
+        `validate(text, finish)` checks a structured answer and returns its text (or raises).
+        `notice`: a dict `validate` fills when it delivers an answer that misses the schema as sent; it is written
+        onto the response, so a client that only reads the finished object learns what the server already logged
+        (D-071)."""
         length = done.get("finish") == "length"
         # a call still open was cut off (its tool_call never came, #211): incomplete, whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
@@ -657,6 +660,8 @@ class Assembler:
                 out += self._release(text)           # beside a tool call: as written (#782)
             else:
                 out += self._release(validate(text, done.get("finish")))
+        if notice:                                   # D-071: one key, only when the schema was honoured relaxed
+            self.response["strata_schema_relaxed"] = dict(notice)
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {

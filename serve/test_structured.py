@@ -287,6 +287,9 @@ class Structured(unittest.TestCase):
         code, reply = self.chat()
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), STORY)
+        # D-071's negative: STORY_SCHEMA compiles as written and the answer fits it, so there is no notice.  The key
+        # means "your schema was honoured in a wider form than you sent", and an absent key is the promise kept.
+        self.assertNotIn("strata_schema_relaxed", reply["choices"][0]["message"])
         prompt = self.tok.decode(self.engine.last_prompt)
         self.assertIn("OUTPUT FORMAT REQUIREMENT", prompt)
         self.assertIn('"duration_ms"', prompt)
@@ -350,6 +353,20 @@ class Structured(unittest.TestCase):
         self.assertEqual(len(lines), 1, out.getvalue())
         self.assertIn(" at /q:", lines[0])                 # the pointer into the reply, and the violation
         self.assertIn("^x(?=y)", lines[0])
+        # D-071: the client is told as well, on the message, where `strata_mcp` already rides.  The log line above is
+        # for whoever runs the server; this is for whoever has to decide what to do with the answer.
+        notice = reply["choices"][0]["message"]["strata_schema_relaxed"]
+        self.assertEqual(notice["at"], "/q")
+        self.assertIn("^x(?=y)", notice["error"])
+        # The same notice reaches a streaming client, on the chunk that carries finish_reason - there is no other
+        # chunk a client is already reading at the end of a reply.
+        _, raw = self.chat('{"q":"xz"}', response_format=LOOKAHEAD_FORMAT, stream=True)
+        chunks = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        noticed = [c for c in chunks if "strata_schema_relaxed" in c]
+        self.assertEqual(len(noticed), 1, raw)             # one chunk carries it
+        self.assertEqual(noticed[0]["strata_schema_relaxed"], notice)      # the same words as the reply's
+        self.assertIsNotNone(noticed[0]["choices"][0]["finish_reason"])
+        self.assertIs(chunks[-1], noticed[0])              # and it rode the last chunk, not a chunk of its own
 
     def test_the_responses_route_delivers_a_relaxed_schema_miss_with_one_line(self):
         # The Responses route reaches the same rule through `_responses`' `check` closure, so it is exercised here
@@ -367,6 +384,17 @@ class Structured(unittest.TestCase):
         self.assertEqual(len(lines), 1, out.getvalue())
         self.assertIn(" at /q:", lines[0])
         self.assertIn("^x(?=y)", lines[0])
+        # D-071: the finished response object carries it too, so a client that never reads the server's log finds out.
+        self.assertEqual(reply["strata_schema_relaxed"]["at"], "/q")
+        self.assertIn("^x(?=y)", reply["strata_schema_relaxed"]["error"])
+        # A streamed reply ends at `response.completed`, whose response object is the one a client of the
+        # non-streamed route is handed, so the notice travels the same way and the key is not duplicated elsewhere.
+        _, raw = self.responses(stream=True, text={"format": {"type": "json_schema", "name": "look", "strict": True,
+                                                             "schema": LOOKAHEAD_SCHEMA}})
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        completed = [e for e in events if e.get("type") == "response.completed"]
+        self.assertEqual(len(completed), 1, raw)
+        self.assertEqual(completed[0]["response"]["strata_schema_relaxed"], reply["strata_schema_relaxed"])
 
     def test_rejected_schema_warms_the_model_and_does_not_retry(self):
         # D-069: the refusal comes after the load, so the next request finds the model warm; what must not happen
