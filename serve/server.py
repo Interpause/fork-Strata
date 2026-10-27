@@ -4148,8 +4148,15 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            # What decides a structured answer's shape is a grammar: the declared schema is spliced into the text the
+            # engine compiles (`serve/grammar/build.py`), so the reply is a mask-shaped value rather than text that is
+            # checked afterwards.  `constrained_decoding` is true of every request this server serves, because D-030
+            # leaves no unconstrained path - a server without a grammar refuses the request instead of falling back.
+            # `stream_buffered` stays true for a declared schema: `structured_chunks` holds the stream so the finished
+            # answer can be validated whole, and a reply that misses a schema the ladder had to relax is delivered
+            # with a `strata_schema_relaxed` notice rather than forwarded unvalidated (D-068, D-071).
+            "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",
+                                  "constrained_decoding": True, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,

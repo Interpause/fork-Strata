@@ -3289,6 +3289,21 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(s["last_timings"]["cache_n"], ClockedEngine.REUSED)
         self.assertIn("at", s["last_timings"])
 
+    def test_v1_status_advertises_grammar_constrained_decoding(self):
+        """P8 item 1 (triage row 49): the three fields described a server that prompted and then checked the text.
+
+        The decoder that decides a structured answer's shape is the grammar the schema is spliced into, and D-030
+        leaves no unconstrained path, so `method` and `constrained_decoding` now say what the code does.  The
+        assertion is here rather than in `test_v1_status` because it pins new fields, not old ones.  `stream_buffered`
+        stays true: a declared schema's stream is held so the finished answer can be validated whole, and a reply
+        that misses a schema the ladder had to relax is delivered with a `strata_schema_relaxed` notice (D-068,
+        D-071) rather than being forwarded unvalidated.
+        """
+        s = json.loads(self.request("/v1/status")[1])
+        self.assertEqual(s["structured_output"],
+                         {"formats": ["json_object", "json_schema"], "method": "grammar",
+                          "constrained_decoding": True, "stream_buffered": True})
+
     def test_no_clock(self):
         """An engine without a clock (MockEngine): no timings, nothing cached."""
         tok = ByteTokenizer()
