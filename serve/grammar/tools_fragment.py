@@ -77,8 +77,19 @@ NO_TOOLS = "tool_dispatch: NEVER_MATCH\nNEVER_MATCH: /[^\\x00-\\xff]/"
 
 def slugify(name: str, idx: int) -> str:
     """A Lark-safe rule component.  The index keeps two tools whose names differ only in punctuation (a.b / a-b)
-    from colliding."""
-    return f"t{idx}_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    from colliding.
+
+    Lowercased because a Lark rule name is `[a-z][_a-z0-9]*`: an uppercase letter ends the name, and the lexer
+    then reports `Expected token ':', found 'TOKEN_NAME'` on the rule that spelled it.  That made every tool with
+    an uppercase letter in its name - an MCP server's `REMEMBER_YOURSELF`, anything camelCase - a request with no
+    grammar at all, and the failure named a rule Strata had written itself, so it read as a bad schema for a bug
+    in the skeleton.  `%json` payloads are unaffected: a parameter's name reaches only a literal, never a rule.
+
+    Folding case cannot collide, because `idx` is the tool's position in the request and no two tools share one:
+    `Foo` then `foo` is `t0_foo` then `t1_foo`.  Everything else `name` holds becomes `_`, and the index keeps a
+    non-ASCII name (`___`) apart from its neighbour.
+    """
+    return f"t{idx}_" + re.sub(r"[^a-z0-9_]", "_", name.lower())
 
 
 def lark_escape(s: str) -> str:

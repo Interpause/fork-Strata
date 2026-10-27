@@ -255,6 +255,25 @@ class Ladder(unittest.TestCase):
         self.assertIn("'q'", g.repairs[0].note)
         self.assertIsNone(self.v.compile_error(g.text))
 
+    def test_a_tool_name_with_an_uppercase_letter_still_has_a_grammar(self):
+        # A Lark rule name ends at its first uppercase letter, so `call_t0_REMEMBER_YOURSELF` did not lex and the
+        # parser asked for a `:` after `call_t0_`.  The request was then refused as an invalid one, naming a line
+        # Strata itself had written - so the property here is that the whole request has a grammar, compiled.
+        p = pl.Pipeline(Stub(), compiler=self.v)
+        for name in ("REMEMBER_YOURSELF", "rememberYourself", "mcp__Fetch"):
+            tool = {"type": "function", "function": {"name": name, "parameters": {
+                "type": "object", "required": ["text"],
+                "properties": {"text": {"type": "string"}, "tags": {"type": "array",
+                                                                    "items": {"type": "string"}}}}}}
+            with self.subTest(name=name):
+                g = p.for_entry("entry_answer_tools", tools=[tool])
+                self.assertEqual(g.repairs, ())                     # nothing to widen: it compiles as written
+                self.assertIsNone(self.v.compile_error(g.text))
+                self.assertIn('"%s>\\n"' % name, g.text)             # the model still writes the declared name
+                # the mid-call entry the prompt's tail resolves to is one this fragment wrote
+                entry = be.resolve_entry(f"<function={name}>\n", tools=[tool])
+                self.assertIn(entry + ":", g.text)
+
     def test_the_request_shape_is_not_mutated_by_a_repair(self):
         # The cache key is the request's own shape, so a repair must not reach back into it.
         p = pl.Pipeline(Stub(), compiler=self.v)

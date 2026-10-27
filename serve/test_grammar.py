@@ -14,6 +14,9 @@ from serve.grammar import entries as be
 from serve.grammar.tools_fragment import compile_tools_fragment, slugify
 
 RULE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*(?:::_)?)\s*:", re.M)
+# What Lark accepts as a rule name.  `RULE` above is deliberately loose (it reads back what any fragment wrote);
+# this one is the language's rule, and it is what a slug has to satisfy before the grammar can compile at all.
+LARK_RULE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 WEATHER = {"type": "function", "function": {
     "name": "get_weather",
@@ -193,6 +196,31 @@ class Fragment(unittest.TestCase):
     def test_two_names_differing_in_punctuation_get_different_slugs(self):
         self.assertNotEqual(slugify("a.b", 0), slugify("a-b", 1))
         self.assertEqual(slugify("a.b", 3), "t3_a_b")
+
+    def test_a_slug_is_a_lark_rule_name_whatever_the_tool_name(self):
+        # A Lark rule name is `[a-z][_a-z0-9]*`: an uppercase letter ends it, and the parser then reports
+        # `Expected token ':', found 'TOKEN_NAME'` on a line Strata wrote itself.  That refusal used to reach the
+        # client as an invalid request, so the fold is the whole fix and is pinned here for every spelling.
+        for name in ("get_weather", "GET_WEATHER", "getWeather", "rememberYourself", "REMEMBER_YOURSELF",
+                     "mcp__Fetch", "a.b", "naïve", "名前"):
+            self.assertRegex(slugify(name, 0), LARK_RULE, name)
+
+    def test_folding_case_cannot_collide_because_the_index_is_the_position(self):
+        # The only thing that keeps two tools apart is their index: `Foo` and `foo` are two positions, so they are
+        # two slugs, and no request can put two tools in one position.
+        self.assertEqual(slugify("Foo", 0), "t0_foo")
+        self.assertEqual(slugify("foo", 1), "t1_foo")
+        self.assertEqual(slugify("GET_WEATHER", 2), "t2_get_weather")
+
+    def test_an_uppercase_tool_name_writes_only_lowercase_rules(self):
+        tool = {"type": "function", "function": {"name": "REMEMBER_YOURSELF", "parameters": {
+            "type": "object", "required": ["note"], "properties": {"note": {"type": "string"}}}}}
+        out = compile_tools_fragment([tool]).text
+        for name in rules(out):
+            self.assertRegex(name, LARK_RULE, name)
+        # The literal the model must write keeps the request's own spelling: only the rule name is folded.
+        self.assertIn('"REMEMBER_YOURSELF>\\n"', out)
+        self.assertIn('"<parameter=note>\\n"', out)
 
     def test_the_fragment_names_no_tool_of_its_own(self):
         out = compile_tools_fragment([WEATHER]).text
