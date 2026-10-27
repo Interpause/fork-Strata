@@ -23,9 +23,11 @@ class RecordingEngine(MockEngine):
 
     def generate(self, ids, max_new, sampling, cancel, **kwargs):
         self.calls.append((list(ids), max_new))
-        # Every reply is constrained now, so the server adds the grammar file to the request's sampling.  That key is
-        # transport, not the sampler these tests compare, so the recorded copy leaves it out.
-        self.sampling_calls.append({k: v for k, v in (sampling or {}).items() if k != 'strata_grammar'})
+        # Every reply is constrained now, so the server adds the grammar file (and the ids a code fence hides) to the
+        # request's sampling.  Those keys are transport, not the sampler these tests compare, so the recorded copy
+        # leaves them out.
+        transport = ('strata_grammar', 'strata_fence_ban')
+        self.sampling_calls.append({k: v for k, v in (sampling or {}).items() if k not in transport})
         self.sampling_objects.append(sampling)
         yield from super().generate(ids, max_new, sampling, cancel, **kwargs)
 
@@ -97,7 +99,8 @@ class ReasoningLoopRecovery(unittest.TestCase):
         # The recovery pass is handed the SAME sampler the first pass was (frozen, not rebuilt).  It is a copy of the
         # caller's dict now that the server adds the grammar file to it, so the values are compared instead.
         self.assertIs(engine.sampling_objects[0], engine.sampling_objects[1])
-        self.assertEqual({k: v for k, v in engine.sampling_objects[1].items() if k != 'strata_grammar'}, sampler)
+        self.assertEqual({k: v for k, v in engine.sampling_objects[1].items()
+                          if k not in ('strata_grammar', 'strata_fence_ban')}, sampler)
 
     def test_a_lower_top_p_and_top_k_are_never_raised_or_lowered(self):
         engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\n\nComplete solution.'])

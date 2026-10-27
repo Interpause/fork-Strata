@@ -254,6 +254,10 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", 
 # writes the tool-result markers around a tool message itself; only the text inside a message is marked.
 TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<tool_response>": "\U000F0E09",
                      "</tool_response>": "\U000F0E0A"}
+# The markers the model reads a reasoning block, a call and a tool result by.  `kept_as_special` keeps them in a
+# system message, and they are exactly the ids a code fence hides from the mask (D-067): one source for the names,
+# so the grammar's rule for a real marker and the engine's ban for a fenced one can never disagree about the set.
+STRUCTURAL_TAGS = frozenset(THINK_TAGS) | frozenset(TOOL_LITERAL_TAGS)
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
@@ -284,7 +288,7 @@ def kept_as_special(role) -> frozenset[str]:
     """
     if role != "system":
         return frozenset()
-    return frozenset(THINK_TAGS) | frozenset(TOOL_LITERAL_TAGS)
+    return STRUCTURAL_TAGS
 
 
 def _role_tags(role, tags: dict[str, str]) -> dict[str, str]:

@@ -60,12 +60,29 @@ class Recorder(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
-def service(pack_dir=None, reply=ANSWER):
+class SixTagTokenizer(ByteTokenizer):
+    """The stand-in with all six structural tags at the pack's own ids.
+
+    `ByteTokenizer` carries the grammar's four delimiters; `<tool_response>` and `</tool_response>` are the two it
+    lacks, and a fence ban names them too (D-067).  Only a whole tag is resolved here, and only for the resolver's
+    own call: the prompt's encoding stays the stand-in's byte-for-byte, so a marker inside a message is still text
+    (which is what `test_mcp`'s prompt assertions read).
+    """
+
+    STRUCTURAL = {"<tool_response>": 248066, "</tool_response>": 248067}
+
+    def encode(self, text, parse_special=False, plain=()):
+        if parse_special and not plain and text in self.STRUCTURAL:
+            return [self.STRUCTURAL[text]]
+        return super().encode(text, parse_special=parse_special, plain=plain)
+
+
+def service(pack_dir=None, reply=ANSWER, tok=None):
     """`reply` is the script the engine replays, so it must be one the grammar of the entry state applied to it can
     actually emit: an answer-only turn for `thinking=False`, a reply that starts inside the thinking block (the
     prompt's tail already ends at `<think>\\n`) for `thinking=True`.  A list gives one script per request, in the
     order they run."""
-    tok = ByteTokenizer()
+    tok = tok or ByteTokenizer()
     engine = Recorder(tok, reply, max_context=CTX)
     # The engine says it compiles a grammar: `begin_grammar` needs `INFO grammar=1` as well as a pipeline (7ee998b5,
     # D-043), because a file it would strip is a file there is nothing to read the reply with.
@@ -103,6 +120,101 @@ class Key(unittest.TestCase):
     def test_the_key_sits_beside_the_other_keys(self):
         keys = StrataEngine.sampling_keys({"temperature": 0.5, "strata_grammar": "/x/y.gr"})
         self.assertEqual(keys, " temperature=0.5 grammar=" + base64.b64encode(b"/x/y.gr").decode("ascii"))
+
+    # D-067: the ids a Markdown code fence hides, in the grammar branch and nowhere else.
+    FENCE_IDS = (248058, 248059, 248066, 248067, 248068, 248069)   # the six, ascending
+
+    def test_a_fence_ban_rides_beside_the_grammar(self):
+        keys = StrataEngine.sampling_keys({"strata_grammar": "/dev/shm/g/ab12.gr",
+                                           "strata_fence_ban": list(self.FENCE_IDS)})
+        want = base64.b64encode(b"/dev/shm/g/ab12.gr").decode("ascii")
+        self.assertEqual(keys, " grammar=" + want
+                         + " fence_ban=248058,248059,248066,248067,248068,248069")
+        self.assertNotIn(" fence_ban= ", keys)                  # never an empty value: the engine refuses one
+        self.assertNotIn(" ", keys.split("fence_ban=")[1])      # decimal ids and commas only
+
+    def test_no_grammar_sends_no_fence_ban(self):
+        # The engine tracks no fence without a grammar, so this line must be byte-identical to the one it sent before.
+        for sampling in ({}, {"strata_fence_ban": list(self.FENCE_IDS)},
+                         {"strata_fence_ban": list(self.FENCE_IDS), "temperature": 0.5}):
+            with self.subTest(sampling=sampling):
+                self.assertNotIn("fence_ban", StrataEngine.sampling_keys(sampling))
+
+    def test_a_list_the_engine_would_refuse_is_not_sent(self):
+        want = " grammar=" + base64.b64encode(b"/x/y.gr").decode("ascii")
+        for empty in ([], (), ["248058"], [True], [-1], [248058, "248059"]):
+            with self.subTest(fence_ban=empty):
+                keys = StrataEngine.sampling_keys({"strata_grammar": "/x/y.gr", "strata_fence_ban": empty})
+                self.assertEqual(keys, want)
+
+    def test_an_unordered_list_is_sent_ascending(self):
+        keys = StrataEngine.sampling_keys({"strata_grammar": "/x/y.gr",
+                                           "strata_fence_ban": [248069, 248058, 248067]})
+        self.assertTrue(keys.endswith(" fence_ban=248058,248067,248069"), keys)
+
+
+class FenceBan(unittest.TestCase):
+    """D-067: which ids the server names, resolved from the pack's tokenizer rather than from a table.
+
+    Six structural tags, never a control token, deterministic (ascending) so the line can be pinned.  A tag the
+    tokenizer cannot give a single id is omitted; a tokenizer that resolves none sends no key at all.
+    """
+
+    IDS = Key.FENCE_IDS
+
+    def test_the_six_structural_tags_resolve_ascending(self):
+        self.assertEqual(server_module.fence_ban_ids(SixTagTokenizer()), self.IDS)
+
+    def test_no_control_token_is_named(self):
+        tok = SixTagTokenizer()
+        banned = set(server_module.fence_ban_ids(tok))
+        for tag in ("<|im_start|>", "<|im_end|>", "<|endoftext|>"):
+            with self.subTest(tag=tag):
+                self.assertNotIn(tok.encode(tag, parse_special=True)[0], banned)
+        # and not the vision markers either: a fenced picture marker is content, not an image slot
+        for tag in ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"):
+            with self.subTest(tag=tag):
+                self.assertNotIn(tok.encode(tag, parse_special=True)[0], banned)
+
+    def test_a_tag_that_does_not_resolve_is_omitted(self):
+        class NoToolResponse(ByteTokenizer):
+            def encode(self, text, parse_special=False, plain=()):
+                if text in ("<tool_response>", "</tool_response>"):
+                    raise KeyError(text)            # a pack that does not know the tag
+                return super().encode(text, parse_special=parse_special, plain=plain)
+
+        self.assertEqual(server_module.fence_ban_ids(NoToolResponse()), (248058, 248059, 248068, 248069))
+
+    def test_a_tag_split_over_several_ids_is_omitted(self):
+        class Bytes(ByteTokenizer):
+            def encode(self, text, parse_special=False, plain=()):
+                return list(text.encode())          # one id per byte: no single id to ban
+
+        self.assertEqual(server_module.fence_ban_ids(Bytes()), ())
+
+    def test_a_request_with_a_grammar_tells_the_engine_the_six(self):
+        with tempfile.TemporaryDirectory() as d:
+            pack = Path(d)
+            (pack / "vocab.json").write_text("{}", encoding="utf-8")   # a pack-shaped directory
+            svc, engine, tok = service(pack, tok=SixTagTokenizer())
+            run(svc, tok)
+            sampling = engine.calls[0]["sampling"]
+            self.assertEqual(sampling.get("strata_fence_ban"), self.IDS)
+            self.assertTrue(StrataEngine.sampling_keys(sampling).endswith(
+                " fence_ban=248058,248059,248066,248067,248068,248069"))
+
+    def test_a_request_without_a_grammar_sends_none(self):
+        # D-030 refuses a chat-shaped request with no grammar, so the no-grammar path is the one that returns no file
+        # (as `StatusHandover` drives): nothing about that line changes.
+        with tempfile.TemporaryDirectory() as d:
+            pack = Path(d)
+            (pack / "vocab.json").write_text("{}", encoding="utf-8")
+            svc, engine, tok = service(pack, tok=SixTagTokenizer())
+            svc.begin_grammar = lambda *a, **k: None
+            list(svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event()))
+            sampling = engine.calls[0]["sampling"]
+            self.assertNotIn("strata_fence_ban", sampling)
+            self.assertEqual(StrataEngine.sampling_keys(sampling), "")
 
 
 class Request(unittest.TestCase):

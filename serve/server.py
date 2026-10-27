@@ -59,7 +59,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser,
-                            StructureParser,  # noqa: E402
+                            STRUCTURAL_TAGS, StructureParser,  # noqa: E402
                             anthropic_to_messages, forced_choice, images_of, literal_tags, mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -1375,6 +1375,14 @@ class StrataEngine:
         g = sampling.get("strata_grammar")
         if isinstance(g, str) and g:
             keys += " grammar=" + base64.b64encode(g.encode("utf-8")).decode("ascii")
+            # D-067: the ids a Markdown code fence hides, only for a request whose grammar the engine masks with -
+            # without a grammar the engine tracks no fence, so the line a request sends is exactly what it sent
+            # before.  `parse_fence_ban` reads decimal ids, comma separated, and nothing else: no spaces, no empty
+            # list (a list it cannot parse refuses the request rather than decoding unconstrained).
+            fb = sampling.get("strata_fence_ban")
+            if isinstance(fb, (list, tuple)) and fb and all(
+                    isinstance(i, int) and not isinstance(i, bool) and i >= 0 for i in fb):
+                keys += " fence_ban=" + ",".join(str(i) for i in sorted(fb))
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")
@@ -3344,6 +3352,25 @@ def grammar_compiler(pack_dir: Path, tok):
         return None
 
 
+def fence_ban_ids(tokenizer) -> tuple[int, ...]:
+    """The token ids a Markdown code fence hides (D-067): the six structural tags, ascending, resolved from the
+    tokenizer the engine decodes with.
+
+    Never a control token.  `<|im_end|>` has to stay drawable: a reply that ends inside a fence is ugly, not a forged
+    turn boundary.  A tag the tokenizer spells as several ids has no single id to ban and is left out; a tokenizer
+    that knows none of them yields an empty tuple, and then no key is sent (the engine refuses an empty list).
+    """
+    ids = set()
+    for tag in sorted(STRUCTURAL_TAGS):
+        try:
+            got = list(tokenizer.encode(tag, parse_special=True))
+        except Exception:                       # noqa: BLE001 - a tag this tokenizer lacks is simply omitted
+            continue
+        if len(got) == 1:
+            ids.add(got[0])
+    return tuple(sorted(ids))
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -3443,6 +3470,9 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # D-067: what a code fence hides.  Resolved once here (not from `guard.DELIMITER_IDS`, which is the grammar's
+        # narrower list and includes the control tokens), and sent only with a grammar.
+        self.fence_ban_ids = fence_ban_ids(tokenizer)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
@@ -4593,6 +4623,9 @@ class Service:
             if gfile:
                 gfiles.append(gfile)                    # D-045: a continuation pass holds a grammar of its own
                 sampling = {**(sampling or {}), "strata_grammar": gfile}
+                # D-067: with the grammar, the ids a code fence hides.  A tokenizer that resolves none sends none.
+                if self.fence_ban_ids:
+                    sampling = {**sampling, "strata_fence_ban": self.fence_ban_ids}
             # D-042: a reply the grammar decided is read from its tokens, so what each token means comes from the
             # grammar instead of from the bytes.  Only when the engine really applied it - one without the capability
             # strips the file and decodes unconstrained, and then there is no grammar to read (D-043).
