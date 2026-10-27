@@ -200,44 +200,17 @@ def prepare_format(response_format, messages):
     return messages, validator
 
 
-def _extract_json(text: str) -> str:
-    s = (text or "").strip()
-    if not s:
-        return ""
-    if s.startswith("```"):
-        first = s.find("\n")
-        if first != -1:
-            end = s.find("```", first + 1)
-            if end != -1:
-                s = s[first + 1:end].strip()
-    start = s.find("{")
-    if start == -1:
-        return s
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(s)):
-        ch = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == "\"":
-                in_str = False
-        else:
-            if ch == "\"":
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return s[start:i + 1]
-    return s[start:]
+def validated_json(text, validator, finish, relaxed=None):
+    """The reply's canonical JSON, or `StructuredOutputError`.
 
-
-def validated_json(text, validator, finish):
+    `text` is parsed as it arrived: a schema reply is one `%json` value produced under the grammar, so the text that
+    arrives *is* the JSON - there is no fence to strip and no first brace to find (D-068).  `relaxed` is an optional
+    zero-argument callable saying whether that grammar was repaired to compile; when it was and the reply still misses
+    the original schema, the mismatch is one `[strata]` warning and the answer is delivered, because the relaxation
+    was the server's choice and failing the reply would blame the client or the model for it (D-068).  A schema that
+    compiled as written keeps its 502, and so does every broken reply: truncation, invalid JSON, duplicate keys,
+    a non-finite number and an uncanonicalisable value are not repairs.
+    """
     def pairs(items):
         obj = {}
         for key, value in items:
@@ -246,13 +219,10 @@ def validated_json(text, validator, finish):
             obj[key] = value
         return obj
 
-    def constant(value):
-        raise ValueError(f"invalid JSON constant: {value}")
-
     if finish != "stop":
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
     try:
-        value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
+        value = json.loads(text, object_pairs_hook=pairs)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, TypeError) as exc:
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
@@ -262,5 +232,9 @@ def validated_json(text, validator, finish):
         raise StructuredOutputError(f"could not validate structured output: {exc}") from exc
     if error is not None:
         path = "/" + "/".join(str(part) for part in error.absolute_path)
+        if relaxed is not None and relaxed():
+            print(f"[strata] structured output does not match the schema at {path}: {error.message}; the grammar "
+                  "was relaxed to compile, so the answer is delivered as generated", flush=True)
+            return canonical
         raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
     return canonical

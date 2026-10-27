@@ -4444,7 +4444,8 @@ class Service:
             Path(path).unlink(missing_ok=True)
 
     def begin_grammar(self, ids, tools, required, sampling):
-        """-> (the file the engine reads, the entry rule it was built for).  Never None: it raises otherwise.
+        """-> (the file the engine reads, the entry rule it was built for, whether the ladder relaxed the schema).
+        Never None: it raises otherwise.
 
         The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
         written to be read back at once and deleted in run()'s `finally`, and writing it this close to the engine call
@@ -4452,6 +4453,10 @@ class Service:
         prose-only branch; with thinking on it is the only thing that says so, since the prompt still ends at the
         reasoning tail.  Nothing is written into the prompt for it: with a grammar the entry already offers the call,
         and a token prefix inside a name (`<function=get`) is a tail no entry resolves (D-044).
+
+        The third element is whether `Grammar.repairs` is non-empty, i.e. whether the ladder had to relax something to
+        make the text compile (D-068).  The reply's conformance check reads it: a relaxed grammar may legitimately
+        accept an answer the original schema rejects, so that mismatch is a warning rather than a 502.
 
         Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
         all there is to return (D-038).
@@ -4498,7 +4503,7 @@ class Service:
         except ValueError as e:
             raise grammar_pipeline.GrammarUnavailable(
                 f"the grammar file name is unusable: {e}", status=500) from None
-        return str(path), grammar.entry
+        return str(path), grammar.entry, bool(grammar.repairs)
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -4539,20 +4544,28 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
-        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, grammar_state=None
+            ) -> Iterator[tuple[str, object]]:
+        """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits.
+
+        `grammar_state`: a dict the caller owns, filled with facts about this request's grammar that the HTTP layer
+        needs to judge the reply (D-068) - see _run.
+        """
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force)
+            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, grammar_state)
         finally:
             if ka is not None:
                 ka.release()
 
-    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, grammar_state=None
+             ) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` is `frontend.forced_choice`'s value, read only by grammar_tools and begin_grammar."""
+        `force` is `frontend.forced_choice`'s value, read only by grammar_tools and begin_grammar.
+        `grammar_state`: a dict the caller owns, filled before the first yield with whether the ladder had to relax
+        this request's schema to make it compile ("relaxed"), which the reply's conformance check reads (D-068)."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -4619,7 +4632,12 @@ class Service:
         gfiles = []                                     # the request's grammar files, dropped in the finally
         try:
             grammar = self.begin_grammar(ids, gtools, force, sampling)
-            gfile, gentry = grammar if grammar else (None, None)
+            gfile, gentry, relaxed = grammar if grammar else (None, None, False)
+            if grammar_state is not None:
+                # Set before the first yield: a caller that drains the generator only sees it if it is there when
+                # the reply is checked (D-068).  The dict belongs to the caller, so concurrent --batch requests never
+                # share one.
+                grammar_state["relaxed"] = relaxed
             if gfile:
                 gfiles.append(gfile)                    # D-045: a continuation pass holds a grammar of its own
                 sampling = {**(sampling or {}), "strata_grammar": gfile}
@@ -4882,6 +4900,11 @@ class Service:
                             if cont:
                                 gfiles.append(cont[0])
                                 sampling = {**sampling, "strata_grammar": cont[0]}
+                                # D-068: the answer is read under this pass's grammar as well, so a repair in either
+                                # pass explains a mismatch with the schema as sent.  (The same shape usually repairs
+                                # the same way - the cache is by shape - but the flag must not depend on that.)
+                                if grammar_state is not None and cont[2]:
+                                    grammar_state["relaxed"] = True
                         print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                               flush=True)
                         for t in extra:
@@ -5097,7 +5120,7 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, grammar_state=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -5105,13 +5128,14 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
-    could not reach the model before the client's). The calls of one round run in parallel (one thread each)."""
+    could not reach the model before the client's). The calls of one round run in parallel (one thread each).
+    `grammar_state`: passed to every Service.run (D-068)."""
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, grammar_state=grammar_state):
             if kind == "done":
                 done = x
                 continue
@@ -5219,9 +5243,11 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None,
+                  grammar_state=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run.
+    `grammar_state`: see Service.run (D-068)."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
@@ -5236,7 +5262,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                                       grammar_state=grammar_state):
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
@@ -5325,8 +5352,11 @@ def openai_collect(chunks) -> dict:
     return out
 
 
-def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
+def structured_chunks(chunks, validator, relaxed=None):
+    """Buffer structured streams so a client never receives unvalidated content.
+
+    `relaxed`: passed to `validated_json`, so a reply that misses a schema the ladder had to relax is delivered with
+    one warning instead of a 502 (D-068)."""
     buffered = []
     heartbeat = time.monotonic()
     try:
@@ -5339,7 +5369,7 @@ def structured_chunks(chunks, validator):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
+        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"], relaxed=relaxed)
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
@@ -6307,6 +6337,7 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError(FORMAT_WITH_TOOLS)
+            grammar_state = {}                                # D-068: filled by Service.run (see _run)
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
@@ -6329,10 +6360,12 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+                               {t["name"] for t in extra}, grammar_state=grammar_state) if use_mcp else None
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force,
+                                   grammar_state=grammar_state)
             if validator is not None:
-                chunks = structured_chunks(chunks, validator)
+                chunks = structured_chunks(chunks, validator,
+                                           relaxed=lambda: grammar_state.get("relaxed", False))
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
@@ -6393,6 +6426,7 @@ def make_handler(svc: Service):
                 return self._responses_ready(req, title)
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            grammar_state = {}                               # D-068: filled by Service.run (see _openai)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
             except ClientGone:
@@ -6406,12 +6440,13 @@ def make_handler(svc: Service):
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 
             def check(text, finish):
-                return validated_json(text, validator, finish)
+                return validated_json(text, validator, finish,
+                                      relaxed=lambda: grammar_state.get("relaxed", False))
 
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, grammar_state=grammar_state):
                     if kind == "ping":
                         yield None
                     elif kind == "event":

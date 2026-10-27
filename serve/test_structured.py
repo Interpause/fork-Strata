@@ -1,4 +1,6 @@
 """Exercise the JSON contract through HTTP, including H3's strict Story shape."""
+import contextlib
+import io
 import json
 import unittest
 import urllib.error
@@ -33,6 +35,15 @@ STORY_SCHEMA = object_schema({
     "suggestions": {"type": "array", "items": object_schema({"what": TEXT, "why": TEXT,
         "boxes": {"type": "array", "items": {"type": "integer"}}, "description": TEXT})}})
 FORMAT = {"type": "json_schema", "json_schema": {"name": "h3_story", "strict": True, "schema": STORY_SCHEMA}}
+
+# A schema llguidance will not compile as written: rung 2 drops the lookahead `pattern` (the ladder's own test pins
+# that repair for `(?=a)`), after which the grammar accepts any string, while jsonschema still enforces the pattern
+# on the finished reply.  That gap is what D-068's relaxed warning exists for.  `"xz"` starts with x but is not
+# followed by y, so it is exactly the answer the repaired grammar allows and the schema as sent rejects.
+LOOKAHEAD_SCHEMA = {"type": "object", "properties": {"q": {"type": "string", "pattern": "^x(?=y)"}},
+                    "required": ["q"]}
+LOOKAHEAD_FORMAT = {"type": "json_schema", "json_schema": {"name": "look", "schema": LOOKAHEAD_SCHEMA}}
+RELAXED_LINE = "was relaxed to compile"
 
 
 class Structured(unittest.TestCase):
@@ -160,29 +171,73 @@ class Structured(unittest.TestCase):
         self.assertIn("data: [DONE]", raw)
 
     def test_invalid_generation_is_an_error_and_never_streams_content(self):
-        for script in ("## Film Plan - Photobooth", '{"title":"Only a title"}',
-                       json.dumps({**STORY, "extra": True}),
-                       json.dumps({**STORY, "boxes": [{**STORY["boxes"][0], "duration_ms": "15000"}]})):
-            with self.subTest(script=script):
-                code, reply = self.chat(script)
-                self.assertEqual(code, 502)
-                self.assertEqual(reply["error"]["code"], "structured_output_failed")
-                _, raw = self.chat(script, stream=True)
-                self.assertIn('"structured_output_failed"', raw)
-                self.assertNotIn('"delta"', raw)
-                self.assertIn("data: [DONE]", raw)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for script in ("## Film Plan - Photobooth", '{"title":"Only a title"}',
+                           json.dumps({**STORY, "extra": True}),
+                           json.dumps({**STORY, "boxes": [{**STORY["boxes"][0], "duration_ms": "15000"}]})):
+                with self.subTest(script=script):
+                    code, reply = self.chat(script)
+                    self.assertEqual(code, 502)
+                    self.assertEqual(reply["error"]["code"], "structured_output_failed")
+                    _, raw = self.chat(script, stream=True)
+                    self.assertIn('"structured_output_failed"', raw)
+                    self.assertNotIn('"delta"', raw)
+                    self.assertIn("data: [DONE]", raw)
+        # D-068's negative half: STORY_SCHEMA compiles as written, so a reply that misses it is still a 502 and no
+        # relaxed warning is printed - the warning is for a mismatch the ladder itself made possible.
+        self.assertNotIn(RELAXED_LINE, out.getvalue())
 
     def test_object_mode_strict_json_and_truncation(self):
         fmt = {"type": "json_object"}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
         for script in ('[]', '{"x":NaN}', '{"x":1,"x":2}', '{"x":1e999}', 'no json at all', '{"x":'):
             self.assertEqual(self.chat(script, response_format=fmt)[0], 502)
-        # #762: the JSON object is taken out of a code fence or the prose around it (the object itself stays strict)
+        # A schema reply is one `%json` value produced under the grammar, so the text that arrives *is* the JSON:
+        # a code fence or prose around it has nothing to be peeled off, and a reply wrapped in either is a 502
+        # (D-068, which deleted the fence-and-brace text reader).
         for script in ('```json\n{}\n```', 'Here it is: {"answer":4} - done'):
-            self.assertEqual(self.chat(script, response_format=fmt)[0], 200, script)
+            self.assertEqual(self.chat(script, response_format=fmt)[0], 502, script)
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt, max_tokens=5)[0], 502)
         # Plain text callers retain normal streaming, without a JSON validation gate.
         self.assertEqual(self.chat("Prose.", response_format={"type": "text"})[0], 200)
+
+    def test_a_reply_that_misses_a_relaxed_schema_is_delivered_with_one_line(self):
+        if self.svc.pipeline is None or self.svc.pipeline.compiler is None:
+            self.skipTest("needs libllguidance for the compile ladder")
+        # Both halves of the rule matter.  First, the grammar this request decodes with really was repaired:
+        # `for_entry` is the same cached shape key `begin_grammar` asks for, so this is that request's grammar.
+        repairs = self.svc.pipeline.for_entry("entry_answer_json", None, LOOKAHEAD_SCHEMA).repairs
+        self.assertEqual([(step.rung, step.cls) for step in repairs], [(2, "unsupported")])
+        # Second, the reply violates the schema as sent, which is what the relaxed grammar lets through.
+        _, validator = structured.prepare_format(LOOKAHEAD_FORMAT, [{"role": "user", "content": "a word"}])
+        self.assertFalse(validator.is_valid({"q": "xz"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, reply = self.chat('{"q":"xz"}', response_format=LOOKAHEAD_FORMAT)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), {"q": "xz"})
+        lines = [line for line in out.getvalue().splitlines() if RELAXED_LINE in line]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        self.assertIn(" at /q:", lines[0])                 # the pointer into the reply, and the violation
+        self.assertIn("^x(?=y)", lines[0])
+
+    def test_the_responses_route_delivers_a_relaxed_schema_miss_with_one_line(self):
+        # The Responses route reaches the same rule through `_responses`' `check` closure, so it is exercised here
+        # rather than assumed from the chat route's test above (D-068).
+        if self.svc.pipeline is None or self.svc.pipeline.compiler is None:
+            self.skipTest("needs libllguidance for the compile ladder")
+        self.engine = self.svc.engine = MockEngine(self.tok, '{"q":"xz"}', max_context=16384)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, reply = self.responses(text={"format": {"type": "json_schema", "name": "look", "strict": True,
+                                                          "schema": LOOKAHEAD_SCHEMA}})
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["output"][-1]["content"][0]["text"]), {"q": "xz"})
+        lines = [line for line in out.getvalue().splitlines() if RELAXED_LINE in line]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        self.assertIn(" at /q:", lines[0])
+        self.assertIn("^x(?=y)", lines[0])
 
     def test_rejected_schema_does_not_load_the_engine_or_retry(self):
         with mock.patch.object(self.svc, "load") as load:
