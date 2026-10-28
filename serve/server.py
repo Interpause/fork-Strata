@@ -4530,7 +4530,7 @@ class Service:
         except ValueError as e:
             raise grammar_pipeline.GrammarUnavailable(
                 f"the grammar file name is unusable: {e}", status=500) from None
-        return str(path), grammar.entry, bool(grammar.repairs)
+        return str(path), grammar.entry, bool(grammar.repairs), grammar.tools
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -4657,7 +4657,7 @@ class Service:
         gfiles = []                                     # the request's grammar files, dropped in the finally
         try:
             grammar = self.begin_grammar(ids, gtools, force, sampling)
-            gfile, gentry, relaxed = grammar          # never None: begin_grammar raises instead (D-030)
+            gfile, gentry, relaxed, decode_tools = grammar  # never None: begin_grammar raises instead (D-030)
             if grammar_state is not None:
                 # Set before the first yield: a caller that drains the generator only sees it if it is there when
                 # the reply is checked (D-068).  The dict belongs to the caller, so concurrent --batch requests never
@@ -4670,7 +4670,7 @@ class Service:
                 sampling = {**sampling, "strata_fence_ban": self.fence_ban_ids}
             # D-042/D-063: the reply is read from its tokens, and this is the only reader there is - a request
             # without a grammar is refused by begin_grammar, so no path arrives here without one.
-            parser = StructureParser(gentry, gtools)
+            parser = StructureParser(gentry, gtools if decode_tools is None else decode_tools)
             opening = parser.opening()
             # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
             # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if

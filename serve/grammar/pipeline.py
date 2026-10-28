@@ -13,7 +13,8 @@ computes.  The key is the shape the **request** declared, never the repaired one
 shape, so two requests that differ only in what had to be relaxed still share the splice of the original.
 
 A `Pipeline` given a `compiler` (`ladder-design.md` §1) compiles before it caches: the compiler's message names a
-tool parameter whose schema the grammar cannot express, that parameter becomes `{}`; then the ladder
+tool parameter whose schema the grammar cannot express, that parameter is widened while retaining its string-vs-JSON
+value encoding; then the ladder
 (`serve/grammar/ladder.py`) relaxes the response schema until it compiles.  A compiler that is `None` is the pure
 splice, unchanged, which is what the tests of the splice itself build.
 """
@@ -77,6 +78,16 @@ class Grammar:
     text: str
     id: str
     repairs: tuple = ()
+    # Tool schemas after compiler-directed widening. The reply reader must use the same schemas as the grammar.
+    _tools: tuple | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "_tools", None if self._tools is None else tuple(copy.deepcopy(self._tools)))
+
+    @property
+    def tools(self) -> tuple | None:
+        """An isolated copy of the effective schemas, so callers cannot mutate the cached grammar."""
+        return None if self._tools is None else tuple(copy.deepcopy(self._tools))
 
 
 def identity(text: str) -> str:
@@ -150,7 +161,7 @@ def _terminal_message(finding: bl.Finding) -> str:
 def _tools_message(finding: bl.Finding) -> str:
     """The same, for a request that declared tools and no schema: the tools are what could not be compiled.
 
-    A parameter whose schema the compiler refuses is already `{}` by the time this can happen (design §6), so a
+    A parameter whose schema the compiler refuses is already widened by the time this can happen (design §6), so a
     refusal here is about the tools as a whole - a count, a name the grammar cannot spell - and the message says
     that rather than blaming a schema the request never sent.
     """
@@ -210,8 +221,9 @@ class Pipeline:
             self.misses += 1
         # Built outside the lock: a splice is a few milliseconds of string work and holding the lock for it would
         # serialise every request behind the slowest one.  A racing duplicate is harmless - the same text.
-        text, repairs = self._text(entry, tools, schema)
-        grammar = Grammar(entry=entry, text=text, id=identity(text), repairs=repairs)
+        text, repairs, effective_tools = self._text(entry, tools, schema)
+        grammar = Grammar(entry=entry, text=text, id=identity(text), repairs=repairs,
+                          _tools=None if effective_tools is None else tuple(effective_tools))
         with self._lock:
             self._shapes[key] = grammar
             while len(self._shapes) > self.max:
@@ -220,8 +232,8 @@ class Pipeline:
 
     # ------------------------------------------------------------------ the ladder, before the splice is cached
     def _text(self, entry: str, tools: list[dict[str, Any]] | None,
-              schema: dict[str, Any] | None) -> tuple[str, tuple]:
-        """`(text, repairs)`: the grammar to compile, with what the ladder did to get there.
+              schema: dict[str, Any] | None) -> tuple[str, tuple, list[dict[str, Any]] | None]:
+        """`(text, repairs, tools)`: compiled text, repairs, and tool schemas after parameter widening.
 
         Without a compiler this is exactly `build.for_entry` and no repairs, so the pure-splice callers and their
         tests are untouched.  With one, the tool parameters come first (a parameter the grammar cannot express must
@@ -229,7 +241,7 @@ class Pipeline:
         whether the request has a grammar at all.
         """
         if self.compiler is None:
-            return bg.for_entry(entry, tools, schema), ()
+            return bg.for_entry(entry, tools, schema), (), tools
         tools, steps = self._repair_parameters(entry, tools)
 
         def compile_text(payload_text: str) -> str | None:
@@ -244,11 +256,11 @@ class Pipeline:
             # "the response schema" then would name something the request does not have.
             message = _tools_message(outcome.terminal) if schema is None else _terminal_message(outcome.terminal)
             raise GrammarUnavailable(message, status=bl.status(outcome.terminal))
-        return bg.for_entry(entry, tools, outcome.schema), tuple(steps) + outcome.steps
+        return bg.for_entry(entry, tools, outcome.schema), tuple(steps) + outcome.steps, tools
 
     def _repair_parameters(self, entry: str, tools: list[dict[str, Any]] | None
                            ) -> tuple[list[dict[str, Any]] | None, list[bl.Step]]:
-        """Every tool parameter whose schema the grammar refuses becomes `{}` (design §6, slice 5e).
+        """Every tool parameter whose schema the grammar refuses is widened to its value encoding (design §6, slice 5e).
 
         The loop is bounded by the parameter count plus one and stops as soon as the message no longer names a
         parameter: a message that points elsewhere (`json_response`, a `params_` rule) is not something guessing can
@@ -273,10 +285,15 @@ class Pipeline:
                 .setdefault("properties", {})
             if properties[name] == {}:          # already relaxed: a second round would change nothing
                 break
-            properties[name] = {}
+            # A widened string remains raw in the template. Preserve that encoding fact for StructureParser:
+            # an untyped schema would make it JSON-decode the unquoted bytes (and stream them with JSON quotes).
+            original = properties[name]
+            params = _function(repaired[index]).get("parameters") or {}
+            defs = params.get("$defs") or params.get("definitions") or {}
+            properties[name] = {"type": "string"} if _declares_string(original, defs) else {}
             finding = bl.classify(message)
             tool_name = _function(repaired[index]).get("name", "?")
-            note = ("tool %r parameter %r became {} (the compiler refused its schema: %s)"
+            note = ("tool %r parameter %r was widened (the compiler refused its schema: %s)"
                     % (tool_name, name, _summary(finding.core)[:200]))
             print(f"[strata] grammar: {note}", flush=True)
             steps.append(bl.Step(2, finding.cls, None, note))
@@ -286,3 +303,16 @@ class Pipeline:
     def stats(self) -> dict[str, int]:
         with self._lock:
             return {"hits": self.hits, "misses": self.misses, "shapes": len(self._shapes), "max": self.max}
+
+
+def _declares_string(schema: Any, defs: dict[str, Any] | None = None) -> bool:
+    """Whether the template's declared value type is a raw string (or the singleton string spelling)."""
+    if not isinstance(schema, dict):
+        return False
+    kind = schema.get("type")
+    if kind == "string" or kind == ["string"]:
+        return True
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        return _declares_string((defs or {}).get(ref.split("/")[-1], {}), {})
+    return False

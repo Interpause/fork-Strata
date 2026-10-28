@@ -793,6 +793,11 @@ def forced_choice(tool_choice, tools: list[dict] | None) -> tuple[str, str | Non
     return None
 
 
+def _raw_string_type(declared) -> bool:
+    """Schema type spellings whose template value is emitted as unquoted string text."""
+    return declared == "string" or declared == ["string"]
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -816,7 +821,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         if value.endswith("\n"):
             value = value[:-1]
         declared = (props.get(pname) or {}).get("type")
-        if declared == "string":
+        if _raw_string_type(declared):
             args[pname] = value
         else:
             try:
@@ -920,7 +925,7 @@ class StructureParser:
         return out
 
     def _streamed(self, name: str) -> bool:
-        return self.stream_tools and self.sdeclared.get(name) == "string"
+        return self.stream_tools and _raw_string_type(self.sdeclared.get(name))
 
     def _open(self, name: str, out: list[Event]) -> None:
         self.scall = ToolCall(name=name, arguments={})
@@ -939,14 +944,14 @@ class StructureParser:
         if self.stream_tools:
             out.append(Event("tool_args", ("" if self.sfirst else ",") + json.dumps(name) + ":", call=self.scall))
             self.sfirst = False
-            if self.sdeclared.get(name) == "string":
+            if _raw_string_type(self.sdeclared.get(name)):
                 out.append(Event("tool_args", '"', call=self.scall))
 
     def _close_param(self, name: str) -> list[Event]:
         out: list[Event] = []
         value = "".join(self.sval)
         self.sval = []
-        if self.sdeclared.get(name) == "string":
+        if _raw_string_type(self.sdeclared.get(name)):
             parsed = value
             if self.stream_tools:
                 out.append(Event("tool_args", '"', call=self.scall))

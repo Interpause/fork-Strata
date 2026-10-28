@@ -123,6 +123,15 @@ class Split(unittest.TestCase):
                     want = shape(events)          # size=0: one token per part, the reference
                 self.assertEqual(shape(events), want)
 
+    def test_singleton_string_type_list_streams_unquoted_value_as_json_string(self):
+        tool = {"name": "capture", "parameters": {"type": "object", "properties": {
+            "value": {"type": ["string"]}}}}
+        events, _ = events_of(call("capture", (("value", "hello"),)) + [Special("<|im_end|>")],
+                              "entry_answer_tools", [tool])
+        out, streamed, calls = shape(events)
+        self.assertEqual(calls[0], ("capture", {"value": "hello"}))
+        self.assertEqual(streamed[0], '{"value":"hello"}')
+
 
 class Differences(unittest.TestCase):
     """What the structured reader reports where the text parser had to guess, and why the grammar's answer is the

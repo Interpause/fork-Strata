@@ -167,6 +167,18 @@ class Fragment(unittest.TestCase):
         self.assertIn('"<parameter=city>\\n" raw_param_end', out)
         self.assertIn('"<parameter=unit>\\n" ("celsius" | "fahrenheit")', out)
 
+    def test_a_singleton_string_type_list_is_raw(self):
+        tool = {"type": "function", "function": {"name": "capture", "parameters": {
+            "type": "object", "properties": {"value": {"type": ["string"]}}}}}
+        out = compile_tools_fragment([tool]).text
+        self.assertIn('"<parameter=value>\\n" raw_param_end', out)
+
+    def test_a_singleton_string_type_list_keeps_its_pattern(self):
+        tool = {"type": "function", "function": {"name": "capture", "parameters": {
+            "type": "object", "properties": {"value": {"type": ["string"], "pattern": "^a+$"}}}}}
+        out = compile_tools_fragment([tool]).text
+        self.assertIn('"<parameter=value>\\n" /(?:a+)/', out)
+
     def test_a_multi_line_raw_value_is_not_restricted_to_one_line(self):
         # raw_param_end is the skeleton's lazy terminal; nothing here narrows it.
         self.assertIn("raw_param_end", compile_tools_fragment([WEATHER]).text)

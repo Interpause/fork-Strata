@@ -110,10 +110,14 @@ def compile_param_value_rule(rule_name: str, param_name: str, prop_schema: dict[
     close_tag = lark_escape(PARAM_CLOSE)
 
     # A `$ref` to a string definition is inlined; anything else is handed to %json, which resolves refs itself.
-    target = prop_schema
+    target = dict(prop_schema)
     if "$ref" in prop_schema and str(prop_schema["$ref"]).startswith("#/$defs/"):
-        target = root_defs.get(str(prop_schema["$ref"]).split("/")[-1], prop_schema)
+        target = dict(root_defs.get(str(prop_schema["$ref"]).split("/")[-1], prop_schema))
     kind = target.get("type")
+    # Normalize the degenerate union before applying string constraints below. This preserves pattern/enum/const
+    # behavior for the accepted singleton spelling while avoiding an empty non-string branch.
+    if kind == ["string"]:
+        target["type"] = kind = "string"
 
     # A pure string is RAW text: the template writes the value with no quotes and no escapes.
     if kind == "string":
@@ -133,6 +137,10 @@ def compile_param_value_rule(rule_name: str, param_name: str, prop_schema: dict[
     # A union containing "string" keeps the raw form as one branch, so a string-typed argument stays unquoted.
     if isinstance(kind, list) and "string" in kind:
         others = [t for t in kind if t != "string"]
+        if not others:
+            # JSON Schema permits ["string"] as a spelling of the simple string type.
+            # There is no JSON-encoded alternative in this union.
+            return f"{rule_name}: {prefix} raw_param_end"
         branch = {**target, "type": others if len(others) > 1 else others[0]}
         if root_defs and "$defs" not in branch and "$ref" in _json_schema(branch):
             branch["$defs"] = root_defs

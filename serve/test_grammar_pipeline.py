@@ -17,6 +17,8 @@ from serve.grammar import build as bg
 from serve.grammar import entries as be
 from serve.grammar import matcher as M
 from serve.grammar import pipeline as pl
+from serve.frontend import StructureParser, parse_tool_call
+from serve.grammar import guard
 
 WEATHER = {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {
     "city": {"type": "string"}}}}}
@@ -91,6 +93,65 @@ class Shapes(unittest.TestCase):
         # The pipeline must not grow a second splice.
         g = self.p.for_request(*request(be.THINKING_OFF_TAIL, tools=[WEATHER]))
         self.assertEqual(g.text, bg.for_entry("entry_answer_tools", [WEATHER], None))
+
+    def test_effective_tools_are_isolated_from_input_and_cache_callers(self):
+        tools = [{"name": "capture", "parameters": {"properties": {"value": {"type": "string"}}}}]
+        grammar = self.p.for_entry("entry_answer_tools", tools=tools)
+        tools[0]["parameters"]["properties"]["value"]["type"] = "integer"
+        exposed = grammar.tools
+        exposed[0]["parameters"]["properties"]["value"]["type"] = "number"
+        self.assertEqual(grammar.tools[0]["parameters"]["properties"]["value"]["type"], "string")
+
+    def test_widened_string_pattern_keeps_raw_string_decoding(self):
+        tool = {"type": "function", "function": {"name": "capture", "parameters": {
+            "type": "object", "properties": {"value": {"type": "string", "pattern": "(?=x)"}}}}}
+        compiler_message = '''at 20(1): invalid regex "(?:(?=x))"
+ 20 | param_t0_t0_capture_0: "<parameter=value>\\n" /(?:(?=x))/ "\\n</parameter>\\n"
+                  ^
+'''
+
+        class Compiler:
+            def compile_error(self, text):
+                return compiler_message if "(?=x)" in text else None
+
+        p = pl.Pipeline(Stub(), compiler=Compiler())
+        grammar = p.for_entry("entry_answer_tools", [tool])
+        self.assertEqual(grammar.tools[0]["function"]["parameters"]["properties"]["value"], {"type": "string"})
+        parser = StructureParser("entry_answer_tools", grammar.tools)
+        events = parser.feed(guard.DELIMITER_IDS["<tool_call>"], "")
+        for piece in ("\n<function=", "capture>\n", "<parameter=value>\n", "hello",
+                      "\n</parameter>\n", "</function>\n"):
+            events += parser.feed(1_000_000, piece)
+        events += parser.feed(guard.DELIMITER_IDS["</tool_call>"], "")
+        calls = [event.call for event in events if event.kind == "tool_call"]
+        streamed = "".join(event.text or "" for event in events if event.kind == "tool_args")
+        self.assertEqual(calls[0].arguments, {"value": "hello"})
+        self.assertEqual(streamed, '{"value":"hello"}')
+
+    def test_widened_non_string_keeps_json_value_decoding(self):
+        tool = {"type": "function", "function": {"name": "capture", "parameters": {
+            "type": "object", "properties": {"value": {"type": "integer", "minimum": 1}}}}}
+        compiler_message = '''at 20(1): unsupported minimum
+ 20 | param_t0_t0_capture_0: "<parameter=value>\\n" %json {"type": "integer", "minimum": 1} "\\n</parameter>\\n"
+                  ^
+'''
+
+        class Compiler:
+            def compile_error(self, text):
+                return compiler_message if '"minimum": 1' in text else None
+
+        grammar = pl.Pipeline(Stub(), compiler=Compiler()).for_entry("entry_answer_tools", [tool])
+        self.assertEqual(grammar.tools[0]["function"]["parameters"]["properties"]["value"], {})
+        parser = StructureParser("entry_answer_tools", grammar.tools)
+        events = parser.feed(guard.DELIMITER_IDS["<tool_call>"], "")
+        for piece in ("\n<function=", "capture>\n", "<parameter=value>\n", "42",
+                      "\n</parameter>\n", "</function>\n"):
+            events += parser.feed(1_000_000, piece)
+        events += parser.feed(guard.DELIMITER_IDS["</tool_call>"], "")
+        calls = [event.call for event in events if event.kind == "tool_call"]
+        streamed = "".join(event.text or "" for event in events if event.kind == "tool_args")
+        self.assertEqual(calls[0].arguments, {"value": 42})
+        self.assertEqual(streamed, '{"value":42}')
 
 
 class Cache(unittest.TestCase):
@@ -246,14 +307,30 @@ class Ladder(unittest.TestCase):
         p = pl.Pipeline(Stub(), compiler=self.v)
         g = p.for_entry("entry_answer_tools", tools=[BAD_TOOL])
         self.assertNotIn("(?=a)", g.text)
-        # `{}` is any JSON value: the parameter keeps its `<parameter=q>` block and the model judges the value.
-        self.assertIn('param_t0_search_0: "<parameter=q>\\n" %json {} "\\n</parameter>\\n"', g.text)
+        # A widened string accepts arbitrary raw text while retaining its parameter block and string encoding.
+        self.assertIn('param_t0_search_0: "<parameter=q>\\n" raw_param_end', g.text)
         self.assertIn('param_t0_search_1: "<parameter=limit>\\n" %json {"type": "integer"}', g.text)
         self.assertEqual(len(g.repairs), 1)
         self.assertEqual((g.repairs[0].rung, g.repairs[0].cls), (2, "unsupported"))
         self.assertIn("search", g.repairs[0].note)
         self.assertIn("'q'", g.repairs[0].note)
         self.assertIsNone(self.v.compile_error(g.text))
+
+    def test_a_repaired_pattern_string_decodes_through_the_structure_parser(self):
+        tool = {"type": "function", "function": {"name": "capture", "parameters": {
+            "type": "object", "properties": {"value": {"type": "string", "pattern": "(?=x)"}}}}}
+        grammar = pl.Pipeline(Stub(), compiler=self.v).for_entry("entry_answer_tools", [tool])
+        self.assertEqual(grammar.tools[0]["function"]["parameters"]["properties"]["value"], {"type": "string"})
+        parser = StructureParser("entry_answer_tools", grammar.tools)
+        events = parser.feed(guard.DELIMITER_IDS["<tool_call>"], "")
+        for piece in ("\n<function=", "capture>\n", "<parameter=value>\n", "hello",
+                      "\n</parameter>\n", "</function>\n"):
+            events += parser.feed(1_000_000, piece)
+        events += parser.feed(guard.DELIMITER_IDS["</tool_call>"], "")
+        call_event = next(event for event in events if event.kind == "tool_call")
+        self.assertEqual(call_event.call.arguments, {"value": "hello"})
+        self.assertEqual("".join(event.text or "" for event in events if event.kind == "tool_args"),
+                         '{"value":"hello"}')
 
     def test_a_tool_name_with_an_uppercase_letter_still_has_a_grammar(self):
         # A Lark rule name ends at its first uppercase letter, so `call_t0_REMEMBER_YOURSELF` did not lex and the
