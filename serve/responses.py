@@ -649,11 +649,15 @@ class Assembler:
         `notice`: a dict `validate` fills when it delivers an answer that misses the schema as sent; it is written
         onto the response, so a client that only reads the finished object learns what the server already logged
         (D-071)."""
-        length = done.get("finish") == "length"
+        finish = done.get("finish")
+        length = finish == "length"
+        cancelled = finish == "cancel"
         # a call still open was cut off (its tool_call never came, #211): incomplete, whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
-        out = self.close("incomplete" if length or unfinished else "completed")
-        if self.json_mode:
+        out = self.close("incomplete" if length or cancelled or unfinished else "completed")
+        # A cancelled schema turn has no complete answer to validate or release. Keep the
+        # partial work marked incomplete and let the response status carry the outcome.
+        if self.json_mode and not cancelled:
             text = "".join(self.json_text)
             self.json_text = []
             if self.called:
@@ -668,9 +672,14 @@ class Assembler:
             "input_tokens": prompt, "input_tokens_details": {"cached_tokens": min(done.get("reused") or 0, prompt)},
             "output_tokens": n, "output_tokens_details": {"reasoning_tokens": done.get("reasoning_tokens", 0)},
             "total_tokens": prompt + n}
-        if length:
+        incomplete = length or cancelled or unfinished
+        if incomplete:
             self.response["status"] = "incomplete"
-            self.response["incomplete_details"] = {"reason": "max_output_tokens"}
+            # Responses only defines max_output_tokens and content_filter as incomplete reasons.
+            # Cancellation and a tool item cut off unexpectedly are incomplete without a reason.
+            self.response["incomplete_details"] = {"reason": "max_output_tokens"} if length else None
+            if cancelled:
+                return out + [self.failed("The response generation was cancelled.", "server_error")]
             return out + [self.event("response.incomplete", response=self.snapshot())]
         self.response["status"] = "completed"
         self.response["completed_at"] = int(time.time())
@@ -692,4 +701,6 @@ def collect(events) -> dict:
     for e in events:
         if e is not None:
             last = e
+    if last is None or last.get("type") not in ("response.completed", "response.incomplete", "response.failed"):
+        raise ValueError("response generation ended without a completion")
     return last["response"]

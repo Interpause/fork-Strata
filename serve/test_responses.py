@@ -32,6 +32,39 @@ TOOLS = [{"type": "function", "name": "exec_command", "description": "Runs a com
 
 # ------------------------------------------------------------------------------------------------ parsing
 class Parsing(unittest.TestCase):
+    def test_cancelled_schema_output_is_incomplete_without_validation_or_release(self):
+        asm = responses.Assembler({}, "m", 3, {}, False, json_mode=True)
+        asm.json_text = ['{"partial":']
+        events = asm.finish({"finish": "cancel", "completion_tokens": 2})
+        final = events[-1]
+        self.assertEqual(final["type"], "response.failed")
+        self.assertEqual(final["response"]["status"], "failed")
+        self.assertEqual(final["response"]["error"]["code"], "server_error")
+        self.assertIsNone(final["response"]["incomplete_details"])
+        self.assertEqual(final["response"]["output"], [])
+        self.assertNotIn("response.completed", [e["type"] for e in events])
+
+    def test_cancelled_open_message_is_closed_as_incomplete(self):
+        asm = responses.Assembler({}, "m", 3, {}, False)
+        events = asm.start()
+        events += asm._open({"id": "msg_x", "type": "message", "status": "in_progress", "role": "assistant",
+                             "content": []})
+        asm.item["content"][0]["text"] = "partial"
+        events += asm.finish({"finish": "cancel", "completion_tokens": 2})
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["status"], "failed")
+        self.assertEqual(events[-1]["response"]["output"][0]["status"], "incomplete")
+
+    def test_tool_item_cut_off_on_engine_stop_is_not_response_completed(self):
+        asm = responses.Assembler({}, "m", 3, {}, False)
+        asm._open({"id": "fc_x", "type": "function_call", "status": "in_progress", "call_id": "c1",
+                   "name": "run", "arguments": "{"})
+        events = asm.finish({"finish": "stop", "completion_tokens": 2})
+        self.assertEqual(events[-1]["type"], "response.incomplete")
+        self.assertEqual(events[-1]["response"]["status"], "incomplete")
+        self.assertIsNone(events[-1]["response"]["incomplete_details"])
+        self.assertEqual(events[-1]["response"]["output"][0]["status"], "incomplete")
+
     def test_a_string_input_is_one_user_message(self):
         self.assertEqual(input_messages({"input": "hi", "instructions": "Be brief."}),
                          [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}])
@@ -331,8 +364,26 @@ class Server(unittest.TestCase):
             c.close()
 
 
+class CancelAfterFirstToken(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        stream = super().generate(ids, max_new, sampling, cancel, embeddings)
+        try:
+            yield next(stream)
+        except StopIteration:
+            return
+        cancel.set()                          # the peer is still connected: the server must send a failure event
+
+
 
 class OverHttp(Server):
+    def test_live_engine_cancellation_ends_with_response_failed(self):
+        self.svc.engine = CancelAfterFirstToken(self.tok, self.script, max_context=16384)
+        code, events = self.post({"model": "m", "input": "hi", "stream": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["status"], "failed")
+        self.assertEqual(events[-1]["response"]["error"]["code"], "server_error")
+
     def test_non_streaming_text_with_reasoning(self):
         code, r = self.post({"model": "m", "input": "hi", "store": False})
         self.assertEqual(code, 200)

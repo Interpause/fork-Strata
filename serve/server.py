@@ -5155,6 +5155,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     `grammar_state`: passed to every Service.run (D-068)."""
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds, done = 0, 0, None
+    activities, terminal = {}, set()
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
@@ -5166,6 +5167,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 ev: Event = x
                 if ev.call is not None and ev.call.name in mcp_names:
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
+                        activities[ev.call.id] = ev.call.name
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
                         calls.append(ev.call)
@@ -5186,6 +5188,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             for c in calls:                              # announced, never run: close them in the client's view
                 yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
                               "chars": 0, "truncated": False, "ms": 0}
+                terminal.add(c.id)
             break
         rounds += 1
         results = []
@@ -5223,6 +5226,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+            terminal.add(c.id)
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -5235,6 +5239,12 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break
+    # A partial tool call or a call whose execution did not return has no result. Close its
+    # activity explicitly so the web client never leaves it looking like a running call.
+    status = "cancelled" if cancel.is_set() or done.get("finish") == "cancel" else "incomplete"
+    for call_id, name in activities.items():
+        if call_id not in terminal:
+            yield "mcp", {"event": status, "id": call_id, "name": name}
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -5317,9 +5327,15 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                                                           "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
                 calls += 1
         else:
+            # A cancellation is not a successful Chat Completion. Usually the peer has
+            # already gone away; if the request is still live, use the HTTP error path.
+            if x["finish"] == "cancel":
+                if cancel.is_set():
+                    return
+                raise ValueError("response generation was cancelled")
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
             whole = calls and streamed.keys() <= finished
-            finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
+            finish = "tool_calls" if whole and x["finish"] == "stop" else x["finish"]
             last = chunk({}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
@@ -5361,6 +5377,8 @@ def openai_collect(chunks) -> dict:
             cur["function"]["arguments"] += fn.get("arguments") or ""
         last = c
     calls = [by_index[i] for i in sorted(by_index)]
+    if last is None or last["choices"][0]["finish_reason"] is None:
+        raise ValueError("response generation ended without a completion")
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg = {"role": "assistant", "content": "".join(content) or None}
@@ -5467,11 +5485,17 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
                     "type": "input_json_delta", "partial_json": json.dumps(ev.call.arguments, ensure_ascii=False)}}
         else:
+            # `end_turn` and `message_stop` mean a completed assistant turn. Cancellation
+            # has no successful Anthropic terminal event. A live request uses its error path.
+            if x["finish"] == "cancel":
+                if cancel.is_set():
+                    return
+                raise ValueError("response generation was cancelled")
             if open_kind is not None:
                 yield close()
             stop = "stop_sequence" if x.get("stop_sequence") is not None else \
                 "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
-                {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
+                {"stop": "end_turn", "length": "max_tokens"}[x["finish"]]
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
             # which is cache_read_input_tokens (message_start could only say the whole prompt).  At least the last
             # prompt token is always read, and Claude Code takes an input_tokens of 0 as "not given" and keeps
@@ -5512,6 +5536,8 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+    if msg is None or msg.get("stop_reason") is None:
+        raise ValueError("response generation ended without a completion")
     msg["content"] = blocks
     return msg
 
@@ -6499,7 +6525,7 @@ def make_handler(svc: Service):
                         yield from asm.feed(x)
                     elif kind == "done":
                         done = x
-                if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                if done is not None:
                     yield from asm.finish(done, check, notice=notice)
             items = self._capture(events(), "responses")
             if not req.get("stream"):

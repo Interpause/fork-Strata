@@ -21,12 +21,12 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import (ChatTemplate, literal_tags, mark_think_literals,  # noqa: E402
+from serve.frontend import (ChatTemplate, Event, literal_tags, mark_think_literals,  # noqa: E402
                             unmark_think_literals)
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
-                          prompt_tokens_seen,
+                          prompt_tokens_seen, anthropic_events, openai_chunks,
                           request_stats, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
@@ -39,6 +39,48 @@ ANSWER = "xy" * 1000                             # longer than the old 1024 fall
 # template tail supplies the entry itself.  The file name is never read: the mock engine makes no grammar of its own.
 FAKE_ANSWER_GRAMMAR = ("strata-test.lark", "entry_answer", False)
 FAKE_THINK_GRAMMAR = ("strata-test.lark", "entry_think", False)
+
+
+class CompletionCancellation(unittest.TestCase):
+    def services(self):
+        sequence = iter([("event", Event("content", "partial")),
+                         ("done", {"finish": "cancel", "completion_tokens": 1, "prompt_tokens": 2})])
+
+        class Svc:
+            def model_for(self, req):
+                return "m"
+
+            def run(self, *args, **kwargs):
+                return iter([("event", Event("content", "partial")),
+                             ("done", {"finish": "cancel", "completion_tokens": 1, "prompt_tokens": 2})])
+
+        return Svc(), sequence
+
+    def test_chat_connected_engine_cancel_raises_for_http_error_handling(self):
+        svc, run = self.services()
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            list(openai_chunks(svc, {}, [1, 2], False, None, 10, threading.Event(), run=run))
+
+    def test_chat_disconnected_cancel_does_not_fabricate_success_finish(self):
+        svc, run = self.services()
+        cancel = threading.Event()
+        cancel.set()
+        chunks = list(openai_chunks(svc, {}, [1, 2], False, None, 10, cancel, run=run))
+        self.assertFalse(any(c["choices"][0]["finish_reason"] is not None for c in chunks))
+
+    def test_anthropic_connected_engine_cancel_raises_for_http_error_handling(self):
+        svc, _ = self.services()
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            list(anthropic_events(svc, {}, [1, 2], False, None, 10, threading.Event()))
+
+    def test_anthropic_disconnected_cancel_has_no_success_terminal_events(self):
+        svc, _ = self.services()
+        cancel = threading.Event()
+        cancel.set()
+        events = list(anthropic_events(svc, {}, [1, 2], False, None, 10, cancel))
+        names = [name for name, _ in events if name is not None]
+        self.assertNotIn("message_delta", names)
+        self.assertNotIn("message_stop", names)
 
 
 class RecordingEngine(MockEngine):

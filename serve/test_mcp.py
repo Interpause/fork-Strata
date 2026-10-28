@@ -306,7 +306,8 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(code, 200, text)
         cs = self.chunks(text)
         mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
-        self.assertEqual([m["event"] for m in mcp], ["start"])        # the web app shows it as "Not run" at the end
+        self.assertEqual([m["event"] for m in mcp], ["start", "incomplete"])
+        self.assertEqual(mcp[-1]["id"], mcp[0]["id"])
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertNotIn('"call"', Path(self.log.name).read_text())    # nothing ran
         self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "stop")

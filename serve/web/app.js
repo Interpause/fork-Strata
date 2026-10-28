@@ -673,6 +673,8 @@ function onTool(m, x) {
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
+  } else if (x.event === "cancelled" || x.event === "incomplete") {
+    Object.assign(t, {state: x.event});
   }
 }
 function updateAssistant(el, m, streaming) {
