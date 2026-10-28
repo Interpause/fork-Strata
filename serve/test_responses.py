@@ -335,18 +335,29 @@ class NoLeakedSampler(unittest.TestCase):
 
     def test_server_close_ends_the_sampler(self):
         import threading
-        import time
+        from unittest.mock import patch
         tok = ByteTokenizer()
-        before = sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)"))
-        httpd = serve(Service(MockEngine(tok, ANSWER, max_context=16384), tok, TEMPLATE), port=0)
-        self.assertEqual(sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")), before + 1)
-        httpd.shutdown()
-        httpd.server_close()
-        for _ in range(50):
-            if sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")) == before:
-                break
-            time.sleep(0.1)
-        self.assertEqual(sum(1 for t in threading.enumerate() if t.name.endswith("(_loop)")), before)
+        started = []
+        original_start = threading.Thread.start
+
+        def record_start(thread, *args, **kwargs):
+            if getattr(thread._target, "__name__", None) == "_loop":
+                started.append(thread)
+            return original_start(thread, *args, **kwargs)
+
+        httpd = None
+        try:
+            with patch.object(threading.Thread, "start", record_start):
+                httpd = serve(Service(MockEngine(tok, ANSWER, max_context=16384), tok, TEMPLATE), port=0)
+            self.assertEqual(len(started), 1)
+            sampler = started[0]
+            self.assertTrue(sampler.is_alive())
+        finally:
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+        sampler.join(timeout=5)
+        self.assertFalse(sampler.is_alive(), "this server's telemetry sampler did not stop")
 
 
 # ------------------------------------------------------------------------------------------------ over HTTP
@@ -421,8 +432,9 @@ class OverHttp(Server):
         self.assertEqual(msg["type"], "message")
         self.assertEqual(msg["content"][0]["text"], "The file says before.")
         u = r["usage"]
-        self.assertEqual(u["output_tokens"], len(self.tok.encode(ANSWER)) + 1)        # + the end-of-turn token
-        self.assertEqual(u["output_tokens_details"]["reasoning_tokens"], len("Read it.\n</think>"))
+        self.assertEqual(u["output_tokens"], len(self.tok.encode(ANSWER, parse_special=True)) + 1)  # + end-of-turn
+        self.assertEqual(u["output_tokens_details"]["reasoning_tokens"],
+                         len(self.tok.encode("Read it.\n</think>", parse_special=True)))
         self.assertEqual(u["total_tokens"], u["input_tokens"] + u["output_tokens"])
         self.assertEqual(r["store"], False)
 
@@ -590,11 +602,10 @@ class ToolRoundTrip(Server):
         self.assertIn("<tool_response>\nbefore\n</tool_response>", second_prompt)
         self.assertEqual(r["output"][-1]["content"][0]["text"], "The file says before.")
 
-    def test_namespace_call_written_with_double_underscore(self):
-        # Qwen writes Codex's MCP tools in their flat `mcp__server__tool` form; Codex only
-        # runs the call when it comes back with its namespace.
+    def test_namespace_call_uses_declared_flat_name(self):
+        # The grammar constrains calls to declared names; the Responses adapter then restores the namespace.
         self.engine.scripts = [self.tok.encode(
-            "</think>\n\n<tool_call>\n<function=mcp__websearch__web_search>\n<parameter=query>\nstrata\n"
+            "</think>\n\n<tool_call>\n<function=mcp__websearch.web_search>\n<parameter=query>\nstrata\n"
             "</parameter>\n</function>\n</tool_call><|im_end|>", parse_special=True)]
         self.engine.script = self.engine.scripts[0]
         tools = [{"type": "namespace", "name": "mcp__websearch", "description": "Search.", "tools": [
@@ -717,7 +728,7 @@ class ThreadTitle(Server):
 
 
 class CodexCompactionOverHttp(Server):
-    # the compaction answer is tool calls the conversation's tools would make a namespace call and a custom call
+    # The first turn calls declared tools; the follow-up compaction has no tools and answers with ordinary text.
     script = [CALL, "</think>\n\n<tool_call>\n<function=multi_agent_v1.spawn_agent>\n<parameter=message>\nhi\n"
                     "</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n"
                     "*** Begin Patch\n</parameter>\n</function>\n</tool_call>"]
@@ -739,7 +750,10 @@ class CodexCompactionOverHttp(Server):
 
     def compaction(self, meta, output="before", between=None, **extra):
         """Codex's turn, (`between`,) then its compaction request: (the compaction prompt, its status and response)."""
-        self.engine.turns, self.engine.script = 0, self.engine.scripts[0]
+        self.engine.scripts = [self.engine.scripts[0],
+                               self.tok.encode("</think>\n\nCompacted notes.", parse_special=True) +
+                               self.tok.encode("<|im_end|>", parse_special=True)]
+        self.engine.turns = 0
         user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "what is in a.txt?"}]}
         turn = {"model": "m", "instructions": "You are a coding agent.", "input": [user], "tools": self.tools,
                 "include": ["reasoning.encrypted_content"], "client_metadata": codex_meta("turn")}
@@ -762,10 +776,9 @@ class CodexCompactionOverHttp(Server):
         self.assertIn("multi_agent_v1.spawn_agent", prompt[:prompt.index("<|im_end|>")])
         self.assertEqual(self.parser_tools[-1], None)    # the parser gets the request's tools: none
         self.assertEqual(r["tools"], [])
-        # the calls come back as for any request without tools: no namespace, no custom tool
-        outputs = [(o["type"], o["name"], o.get("namespace")) for o in r["output"]]
-        self.assertEqual(outputs, [("function_call", "multi_agent_v1.spawn_agent", None),
-                                   ("function_call", "apply_patch", None)])
+        # the tool-free compaction response is ordinary text, with no fabricated tool calls
+        outputs = [(o["type"], o.get("name")) for o in r["output"]]
+        self.assertEqual(outputs, [("message", None)])
         # the same request without Codex's metadata (upstream's behaviour): the same answer, but its prompt starts
         # differently, so the engine reads it from the start
         plain, code, r2 = self.compaction({})
@@ -773,7 +786,7 @@ class CodexCompactionOverHttp(Server):
         self.assertFalse(plain.startswith(self.first_prompt))
         self.assertNotIn("multi_agent_v1.spawn_agent", plain[:plain.index("<|im_end|>")])
         self.assertEqual(self.parser_tools[-1], None)
-        self.assertEqual([(o["type"], o["name"], o.get("namespace")) for o in r2["output"]], outputs)
+        self.assertEqual([(o["type"], o.get("name")) for o in r2["output"]], outputs)
 
     def test_a_compaction_too_long_with_the_kept_tools_is_rendered_as_sent(self):
         long = "before\n" * 300                         # a long tool output: the turn fits, its compaction barely
