@@ -129,11 +129,12 @@ public:
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
         sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
+        sampling_.logit_bias_stride = 0;
         if (next_) next_->set_sampling(sp);
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
-    /// Per-row vocabulary biases for the NEXT batch window, consumed by it: `bias` holds `S` rows of `n_vocab` floats,
+    /// Per-row vocabulary biases for the NEXT solo or batch window, consumed by it: `bias` holds `S` rows of `n_vocab` floats,
     /// row t being WINDOW row t (a compacted slot list - row t is not slot t), and `biased[t] != 0` marks the rows that
     /// carry one.  A null `bias` (or `S <= 0`) cancels.  Only the rows marked in `biased` are read, so the caller keeps
     /// one buffer of the widest window (`kVerifyMaxT` rows) and passes `S` rows of it - no per-window copy.
@@ -143,7 +144,7 @@ public:
     /// same way).  Every other row is untouched - same struct, same skip, same argmax - which is what keeps an
     /// unconstrained window byte-identical.
     ///
-    /// One-shot: `sample_rows` clears it after the window, so a mask cannot reach the next window's rows by accident.
+    /// One-shot: the solo or batch sampler clears it after the window, so a mask cannot reach later rows by accident.
     /// Uploaded on the final stage's device (the stage that owns the head), forwarded to `next_` first, exactly as
     /// set_logit_bias does.  A row whose entries are all -inf must NOT be passed in: it makes the greedy kernel emit
     /// token 0, so the caller stops that slot instead (`grammar::mask_to_bias` returns false for it).
@@ -464,7 +465,7 @@ private:
 #endif
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
-    // set_row_bias: S rows of n_vocab floats on the device, valid for the next window only (sample_rows consumes them)
+    // set_row_bias: S rows of n_vocab floats on the device, valid for the next window only (sampling consumes them)
     float* row_bias_device_ = nullptr;
     size_t row_bias_cap_ = 0;              ///< floats row_bias_device_ holds (a larger window neither shrinks nor misses)
     int row_bias_rows_ = 0;                ///< rows the next window may take; 0 = no row bias at all

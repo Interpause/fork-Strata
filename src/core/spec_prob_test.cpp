@@ -309,6 +309,64 @@ int main() {
         report(nm, chi_square(cnt, prob, (double) N));
     }
 
+    // ---- constrained Markov prefix: q retains probability on grammar-illegal ids.
+    // Each target row is already normalized over its grammar-legal support. The drafter remains unconstrained,
+    // so q has substantial mass outside that support. Rejection must return a legal residual token with the same
+    // joint target distribution, and an accepted first row conditions row 1 on that now-legal prefix.
+    {
+        auto list = [](std::vector<int32_t> ids, std::vector<double> probs) {
+            List x;
+            x.id = std::move(ids);
+            x.p = std::move(probs);
+            for (double p : x.p) x.q.push_back((float) p);
+            return x;
+        };
+        const List P0 = list({0, 1}, {0.35, 0.65});
+        const List Q0 = list({0, 1, 2, 3}, {0.15, 0.15, 0.50, 0.20});  // grammar forbids 2,3
+        const std::vector<List> P1 = {list({0, 1}, {0.80, 0.20}), list({2, 3}, {0.25, 0.75})};
+        const std::vector<List> Q1 = {list({0, 1, 2, 3}, {0.20, 0.10, 0.30, 0.40}),
+                                      list({0, 1, 2, 3}, {0.20, 0.20, 0.20, 0.40})};
+        std::vector<double> count((size_t) V * V, 0.0), prob((size_t) V * V, 0.0);
+        for (size_t i = 0; i < P0.id.size(); ++i)
+            for (size_t j = 0; j < P1[(size_t) P0.id[i]].id.size(); ++j)
+                prob[(size_t) P0.id[i] * V + (size_t) P1[(size_t) P0.id[i]].id[j] ] =
+                    P0.p[i] * P1[(size_t) P0.id[i]].p[j];
+        long long illegal_drafts = 0, bad_outputs = 0, row0_accepts = 0;
+        const int trials = 500000;
+        for (int t = 0; t < trials; ++t) {
+            const int32_t d0 = draw(Q0, uni(g));
+            const SpecP s0{P0.id.data(), P0.p.data(), (int) P0.id.size()};
+            const SpecQ q0{Q0.id.data(), Q0.q.data(), (int) Q0.id.size()};
+            const SpecResult r0 = spec_verify_row(s0, d0, q0, uni(g), uni(g));
+            const int32_t x0 = r0.token;
+            illegal_drafts += d0 >= 2;
+            if (x0 < 0 || x0 > 1) { ++bad_outputs; continue; }
+            bad_outputs += r0.accepted && d0 != x0;
+            int32_t x1;
+            if (r0.accepted) {
+                ++row0_accepts;
+                const List& q = Q1[(size_t) x0];
+                const int32_t d1 = draw(q, uni(g));
+                const List& p = P1[(size_t) x0];
+                x1 = spec_verify_row(SpecP{p.id.data(), p.p.data(), (int) p.id.size()}, d1,
+                                     SpecQ{q.id.data(), q.q.data(), (int) q.id.size()}, uni(g), uni(g)).token;
+            } else {
+                x1 = draw(P1[(size_t) x0], uni(g));  // rejection starts the next target row from the actual x0
+            }
+            const List& legal_next = P1[(size_t) x0];
+            bool x1_legal = false;
+            for (int32_t id : legal_next.id) x1_legal = x1_legal || id == x1;
+            bad_outputs += !x1_legal;
+            count[(size_t) x0 * V + (size_t) x1] += 1.0;
+        }
+        ++g_cases;
+        const Chi c = chi_square(count, prob, (double) trials);
+        const bool ok = c.stat < c.crit && illegal_drafts > trials / 2 && row0_accepts < trials / 2 && bad_outputs == 0;
+        if (!ok) ++g_fail;
+        std::printf("  %-4s constrained Markov with illegal-q mass: chi2 %.2f / %.2f, illegal drafts %lld, row0 accepts %lld, bad outputs %lld\n",
+                    ok ? "ok" : "FAIL", c.stat, c.crit, illegal_drafts, row0_accepts, bad_outputs);
+    }
+
     // ---- truncation regressions
     {
         std::printf("truncation regressions\n");

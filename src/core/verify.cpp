@@ -630,6 +630,7 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     }
     logit_bias_host_ = bias;
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    sampling_.logit_bias_stride = 0;
     return true;
 }
 
@@ -663,7 +664,19 @@ bool Verifier::set_row_bias(const float* bias, int S, const uint8_t* biased, std
         }
         row_bias_cap_ = rows;
     }
-    if (cudaMemcpy(row_bias_device_, bias, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    const bool all_rows = std::all_of(biased, biased + S, [](uint8_t x) { return x != 0; });
+    std::vector<float> staged;
+    const float* upload = bias;
+    if (!all_rows) {
+        staged.assign(bias, bias + rows);
+        for (int t = 0; t < S; ++t) if (biased[t] == 0) {
+            float* row = staged.data() + (size_t) t * (size_t) n_vocab_;
+            if (logit_bias_host_.empty()) std::fill(row, row + n_vocab_, 0.0f);
+            else std::copy(logit_bias_host_.begin(), logit_bias_host_.end(), row);
+        }
+        upload = staged.data();
+    }
+    if (cudaMemcpy(row_bias_device_, upload, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         err = "cannot upload the row biases"; return false;
     }
     row_bias_on_.assign(biased, biased + S);
@@ -2711,6 +2724,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     (void) user;
     return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
 #endif
+    // These inputs belong to one run. Take ownership before any validation/launch can return early, so an
+    // abandoned window cannot apply its grammar masks or draft distributions to the following one.
+    const int32_t* const run_spec_q = spec_q_;
+    const int run_spec_nq = spec_nq_;
+    spec_q_ = nullptr;
+    spec_nq_ = 0;
+    const int run_row_bias_rows = row_bias_rows_;
+    std::vector<uint8_t> run_row_bias_on = std::move(row_bias_on_);
+    row_bias_rows_ = 0;
+    row_bias_on_.clear();
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
@@ -2989,12 +3012,21 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+    const bool row_biased = row_bias_device_ != nullptr && run_row_bias_rows >= T &&
+                            std::any_of(run_row_bias_on.begin(), run_row_bias_on.begin() + T,
+                                        [](uint8_t x) { return x != 0; });
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr || row_biased)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
+        // Solo grammar windows carry one composed dense bias per target row. The row stride is opt-in; ordinary
+        // requests retain the shared-bias path and its existing sampler kernels/results.
+        if (row_biased) {
+            sp.logit_bias = row_bias_device_;
+            sp.logit_bias_stride = (int) n_vocab_;
+        }
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
         bool judged = false;
-        if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= kVerifyMaxT) {
+        if (sampled && run_spec_q != nullptr && run_spec_nq > 0 && T > 1 && T <= kVerifyMaxT) {
             if (d_spec_ == nullptr &&
                 cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
                     cudaSuccess) {
@@ -3002,18 +3034,16 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 d_spec_ = nullptr;
             }
             if (d_spec_ != nullptr) {
-                const int nq = std::min(spec_nq_, T - 1);
+                const int nq = std::min(run_spec_nq, T - 1);
                 int32_t* d_q = d_spec_ + kVerifyMaxT;
                 if (cudaMemcpyAsync(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) ==
                         cudaSuccess &&
-                    cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
+                    cudaMemcpyAsync(d_q, run_spec_q, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
                                     cudaMemcpyHostToDevice, cs_) == cudaSuccess)
                     judged = sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, nq,
                                                 m_out_, cs_);
             }
         }
-        spec_q_ = nullptr;
-        spec_nq_ = 0;
         if (judged) ++spec_windows;
         else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
@@ -3766,7 +3796,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
         const float* row_bias = t < biased && row_bias_on_[(size_t) t] != 0 && row_bias_device_ != nullptr
                                     ? row_bias_device_ + (size_t) t * (size_t) n_vocab_ : nullptr;
         if ((sp.greedy || sp.temperature <= 0.0f) && row_bias == nullptr) continue;
-        if (row_bias != nullptr) sp.logit_bias = row_bias;   // the mask's row already carries the request's own bias
+        if (row_bias != nullptr) { sp.logit_bias = row_bias; sp.logit_bias_stride = 0; } // composed mask for this row
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         sp.penalty_last_n = 0;
         strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,

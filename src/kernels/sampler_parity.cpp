@@ -9,6 +9,7 @@
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
+#include "strata/core/spec_prob.hpp"
 
 #include <cuda_runtime.h>
 
@@ -128,6 +129,93 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
     cudaFree(d_l);
     cudaFree(d_o);
     if (d_h) cudaFree(d_h);
+    return bad;
+}
+
+float host_philox_uniform(uint64_t seed, uint64_t counter);
+
+int row_bias_spec_checks() {
+    constexpr int nv = 4, T = 2;
+    const float neg = -std::numeric_limits<float>::infinity();
+    const std::vector<float> logits = {1, 1, 7, 6, 1, 2, 9, 8};
+    const std::vector<float> bias = {0, 0, neg, neg, neg, neg, 0, 0};
+    float *dl = nullptr, *db = nullptr;
+    int *out = nullptr, *dt = nullptr, *dq = nullptr;
+    check(cudaMalloc(&dl, logits.size() * sizeof(float)), "row bias logits");
+    check(cudaMalloc(&db, bias.size() * sizeof(float)), "row bias matrix");
+    check(cudaMalloc(&out, T * sizeof(int)), "row bias output");
+    check(cudaMalloc(&dt, sizeof(int)), "spec draft token");
+    check(cudaMalloc(&dq, strata::core::kSpecQStride * sizeof(int)), "spec q row");
+    check(cudaMemcpy(dl, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "row bias logits copy");
+    check(cudaMemcpy(db, bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice), "row bias matrix copy");
+    int bad = 0;
+    strata::kernels::SamplerParams p;
+    p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.seed = 19; p.counter = 41;
+    p.logit_bias = db; p.logit_bias_stride = nv;
+    p.greedy = true;
+    strata::kernels::sample_tokens(dl, T, nv, nullptr, 0, p, out, nullptr);
+    int got[T] = {-1, -1};
+    check(cudaMemcpy(got, out, sizeof(got), cudaMemcpyDeviceToHost), "row bias greedy back");
+    const bool greedy_ok = got[0] == 0 && got[1] == 2;
+    std::printf("  %-34s %s (got %d,%d; expected 0,2)\n", "row bias: greedy per-row masks",
+                greedy_ok ? "matches" : "*** WRONG ***", got[0], got[1]);
+    bad += !greedy_ok;
+
+    p.greedy = false;
+    strata::kernels::sample_tokens(dl, T, nv, nullptr, 0, p, out, nullptr);
+    check(cudaMemcpy(got, out, sizeof(got), cudaMemcpyDeviceToHost), "row bias sampled back");
+    const bool sampled_ok = (got[0] == 0 || got[0] == 1) && (got[1] == 2 || got[1] == 3);
+    std::printf("  %-34s %s (sampled outputs %d,%d)\n", "row bias: sampled masks before filters",
+                sampled_ok ? "legal" : "*** WRONG ***", got[0], got[1]);
+    bad += !sampled_ok;
+    const int illegal_draft = 2;
+    check(cudaMemcpy(dt, &illegal_draft, sizeof(int), cudaMemcpyHostToDevice), "illegal draft copy");
+    std::vector<int> qrow((size_t) strata::core::kSpecQStride, -1);
+    qrow[0] = 2;
+    qrow[(size_t) strata::core::kSpecQEntries] = (int) [] { float f = 1.0f; int x; std::memcpy(&x, &f, 4); return x; }();
+    check(cudaMemcpy(dq, qrow.data(), qrow.size() * sizeof(int), cudaMemcpyHostToDevice), "illegal q copy");
+    const char* old = std::getenv("STRATA_OLD_SAMPLER");
+    const char* one = std::getenv("STRATA_SAMPLER_ONE_BLOCK");
+    const bool split = !(old && *old && std::strcmp(old, "0") != 0) && !(one && *one && std::strcmp(one, "0") != 0);
+    if (split) {
+        const bool judged = strata::kernels::sample_tokens_spec(dl, T, nv, nullptr, 0, p, dt, dq, 1, out, nullptr);
+        check(judged ? cudaSuccess : cudaErrorUnknown, "spec sampler unavailable on split path");
+        check(cudaMemcpy(got, out, sizeof(got), cudaMemcpyDeviceToHost), "spec rows back");
+        const bool illegal_ok = (got[0] == 0 || got[0] == 1) && (got[1] == 2 || got[1] == 3);
+        std::printf("  %-34s %s (illegal proposal 2, outputs %d,%d)\n", "row bias: illegal q residual + bonus",
+                    illegal_ok ? "legal" : "*** WRONG ***", got[0], got[1]);
+        bad += !illegal_ok;
+        qrow.assign((size_t) strata::core::kSpecQStride, -1);
+        qrow[0] = 0;
+        qrow[(size_t) strata::core::kSpecQEntries] = (int) [] { float f = 1.0f; int x; std::memcpy(&x, &f, 4); return x; }();
+        check(cudaMemcpy(dq, qrow.data(), qrow.size() * sizeof(int), cudaMemcpyHostToDevice), "legal q copy");
+        const int legal_draft = 0;
+        check(cudaMemcpy(dt, &legal_draft, sizeof(int), cudaMemcpyHostToDevice), "legal draft copy");
+        // Equal target logits make p(0)=1/2. Pick a deterministic seed whose acceptance draw rejects, so
+        // the result must be the residual token 1 and exercises max(0,p-q) normalization.
+        for (p.seed = 0; host_philox_uniform(p.seed, p.counter | strata::core::kSpecCtrAccept) <= 0.5f; ++p.seed) {}
+        strata::kernels::sample_tokens_spec(dl, T, nv, nullptr, 0, p, dt, dq, 1, out, nullptr);
+        check(cudaMemcpy(got, out, sizeof(got), cudaMemcpyDeviceToHost), "legal spec rows back");
+        const bool legal_ok = got[0] == 1 && (got[1] == 2 || got[1] == 3);
+        std::printf("  %-34s %s (legal proposal 0, outputs %d,%d)\n", "row bias: legal q + bonus",
+                    legal_ok ? "legal" : "*** WRONG ***", got[0], got[1]);
+        bad += !legal_ok;
+
+        // A grammar-constrained window of one row must reproduce the ordinary constrained sampler at the same position.
+        strata::kernels::sample_tokens(dl, 1, nv, nullptr, 0, p, out, nullptr);
+        int plain = -1;
+        check(cudaMemcpy(&plain, out, sizeof(int), cudaMemcpyDeviceToHost), "ordinary T1 back");
+        const bool t1_judged = strata::kernels::sample_tokens_spec(dl, 1, nv, nullptr, 0, p, dt, dq, 0, out, nullptr);
+        check(t1_judged ? cudaSuccess : cudaErrorUnknown, "spec T1 sampler unavailable");
+        check(cudaMemcpy(got, out, sizeof(int), cudaMemcpyDeviceToHost), "spec T1 back");
+        const bool t1_ok = got[0] == plain;
+        std::printf("  %-34s %s (ordinary %d, spec %d)\n", "row bias: T=1 parity",
+                    t1_ok ? "matches" : "*** WRONG ***", plain, got[0]);
+        bad += !t1_ok;
+    } else {
+        std::printf("  %-34s skipped (spec rejection sampler requires split path)\n", "row bias: q residual + bonus");
+    }
+    cudaFree(dl); cudaFree(db); cudaFree(out); cudaFree(dt); cudaFree(dq);
     return bad;
 }
 
@@ -482,6 +570,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     int bad = 0;
+    bad += row_bias_spec_checks();
     const int NV = 512, NT = 4;
 
     // Request bias affects every target row, including greedy; omission leaves logits and the default pick intact.

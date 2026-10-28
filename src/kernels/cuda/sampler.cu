@@ -36,6 +36,11 @@
 namespace strata::kernels {
 namespace {
 
+__device__ __forceinline__ const float* row_bias(const SamplerParams& p, int row) {
+    return p.logit_bias == nullptr ? nullptr
+                                  : p.logit_bias + (p.logit_bias_stride > 0 ? (size_t) row * p.logit_bias_stride : 0);
+}
+
 // Philox 4x32-10, the counter-based generator the phase asks for.  Counter-based matters because it makes the
 // stream a function of (seed, position) rather than of how many draws came before - so a batch can be sampled
 // in any order and a run is reproducible.
@@ -121,6 +126,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
                                       int pmin, int plen, int* __restrict__ out) {
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
+    const float* bias = row_bias(p, t);
     (void) pmin;
     const int* hrow = history ? history + (size_t) t * history_len : nullptr;
     int hlen = 0;
@@ -158,7 +164,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     float bv = __int_as_float(0xff800000);   // -inf
     int best = n_vocab;
     for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-        const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+        const float s = apply_penalties(bias ? l[v] + bias[v] : l[v], hit_count(v), p);
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -299,6 +305,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     const float* l = logits + (size_t) t * n_vocab;
+    const float* bias = row_bias(p, t);
 
     // Temperature is needed by BOTH stages below, so it is computed here; the chain still APPLIES it after
     // the truncation filters - the survivors are chosen on the raw logits and only then scaled.
@@ -355,7 +362,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
             bool taken = false;
             for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
             if (taken) continue;
-            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+            const float s = apply_penalties(bias ? l[v] + bias[v] : l[v], hit_count(v), p);
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -563,6 +570,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
                          int history_len, const SamplerParams p, int* __restrict__ out) {
     const int t = blockIdx.x;
     const float* l = logits + (size_t) t * n_vocab;
+    const float* bias = row_bias(p, t);
 
     // the penalty window and its membership bitmap, exactly as in `sampler_kernel`
     const int* hrow = history ? history + (size_t) t * history_len : nullptr;
@@ -601,7 +609,7 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
         float bv = __int_as_float(0xff800000);   // -inf
         int best = n_vocab;
         for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+            const float s = apply_penalties(bias ? l[v] + bias[v] : l[v], hit_count(v), p);
             if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -698,6 +706,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
                           int history_len, const SamplerParams p, int k, int n_blocks, int2* __restrict__ cand) {
     const int t = blockIdx.y;
     const float* l = logits + (size_t) t * n_vocab;
+    const float* bias = row_bias(p, t);
     const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
     const int blo = (int) blockIdx.x * kSplitBlockSpan;
 
@@ -730,7 +739,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
 #pragma unroll
     for (int j = 0; j < kSplitPerLane; ++j) {
         const int v = lo + 32 * j + lane;
-        s[j] = v < n_vocab ? (p.logit_bias ? l[v] + p.logit_bias[v] : l[v]) : __int_as_float(0xff800000);
+        s[j] = v < n_vocab ? (bias ? l[v] + bias[v] : l[v]) : __int_as_float(0xff800000);
     }
     if (use_bits) {
 #pragma unroll

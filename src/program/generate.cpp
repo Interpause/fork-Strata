@@ -11377,7 +11377,7 @@ int main(int argc, char** argv) {
                     pos[S] = bs[(size_t) b].p + 1;
                     // Row 1 is the state advanced by the draft, because a draft row only counts when the target
                     // itself picked that token (`outb[0] == tok[1]`): `draft[0]` is then the token row 0 emitted.
-                    // A draft the grammar refuses is not an error - the drafter is unconstrained (P4-b biases it) -
+                    // A draft the grammar refuses is not an error: the drafter is unconstrained.
                     // it just cannot be kept, so the row only needs a mask when the draft is legal.
                     draft_ok[a] = true;
                     if (bs[(size_t) b].match.valid()) {
@@ -14130,7 +14130,7 @@ int main(int argc, char** argv) {
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
-                if (req_match.valid()) return -1;   // a grammar step is one row: no prompt rows share its bias
+                if (req_match.valid()) return -1;   // prompt rows do not advance the reply's grammar
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
@@ -14313,7 +14313,7 @@ int main(int argc, char** argv) {
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr
-                                  : req_match.valid() ? "a grammar (a masked step is one row)"
+                                  : req_match.valid() ? "grammar masks require serial verification"
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
@@ -14960,12 +14960,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
-            // ---- the grammar's step (contract C3): mask -> one dense bias -> draw -> validate on a clone ->
-            // commit -> advance.  A masked step is one row, so the single `float[n_vocab]` SamplerParams carries is
-            // exactly that row's mask: allowed ids keep the request's own bias, refused ones go to -inf.  The bias is
-            // set from tokens already committed and the matcher is advanced only after the commit, so nothing the
-            // grammar has not seen can move its state.
+            // The drafter stays unconstrained. Target rows get masks from a clone walked over the draft prefix;
+            // only the accepted outputs advance the request's matcher and fence after the model commit.
             std::vector<float> gbias;
+            std::vector<uint8_t> grow_on;
             std::vector<int32_t> gbanned;   // this step's refusal: a draw the mask allowed and the matcher then refused
                                             // (a library bug); cleared by the next fresh step, kept by its retry
             // the reply's open code fence (D-067), advanced by the same tokens the matcher gets; only touched when the
@@ -14976,33 +14974,80 @@ int main(int argc, char** argv) {
             int64_t grefused = 0;               // the request's refusals it survived by drawing again (said once, at its end)
             bool gretry_pass = false;           // this loop pass is the step's retry, so its ban outlives the loop top
             bool gstop = false;                 // nothing is allowed here: the reply ends without a draw
-            auto grammar_mask = [&]() -> bool {
+            int gterminal = -1;                 // a legal draft prefix with no drawable continuation
+            auto grammar_end = [&](int32_t id) {
+                return id == (int32_t) grammar_session.eos() ||
+                       std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) id) != o.eos_ids.end();
+            };
+            auto grammar_mask_row = [&](strata::grammar::Match& match,
+                                        const strata::grammar::FenceTracker& fence, float* bias) -> bool {
                 uint32_t words = 0;
-                const uint32_t* bits = req_match.mask(words);
+                const uint32_t* bits = match.mask(words);
                 if (bits == nullptr || words == 0) {
-                    std::printf("ERR grammar: %s\n", req_match.error().c_str());
+                    std::printf("ERR grammar: %s\n", match.error().c_str());
                     return false;
                 }
-                gbias.resize((size_t) n_vocab);
                 // The fence's ids are a separate list from `gbanned` because a fence opens and closes many times in
                 // one reply: both are rebuilt per step, and `gbanned` only ever holds this step's own refusal.
-                const bool fence_on = !req_fence.empty() && gfence.open();
+                const bool fence_on = !req_fence.empty() && fence.open();
                 const std::vector<int32_t>* bans = &gbanned;
                 if (fence_on) {
                     gfence_bans.assign(gbanned.begin(), gbanned.end());
                     gfence_bans.insert(gfence_bans.end(), req_fence.begin(), req_fence.end());
                     bans = &gfence_bans;
                 }
-                gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, *bans, gbias.data(), n_vocab);
+                gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, *bans, bias, n_vocab);
                 if (gstop && fence_on) {
                     // The valve: a fence the tracker wrongly believes open must never dead-end a reply, so a step the
                     // fence bans emptied is asked for once more without them.  It cannot loop - the retry carries no
                     // fence ids - and should never fire: the measured mask keeps 248,112 ids with them suppressed.
                     std::fprintf(stderr, "strata: a fence ban left no id drawable; the step was drawn without it\n");
-                    gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, gbanned, gbias.data(), n_vocab);
+                    gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, gbanned, bias, n_vocab);
                 }
                 // a fully masked row is not a sampler input: every logit at -inf makes the greedy kernel emit token 0
-                return gstop || ver.set_logit_bias(gbias, err);
+                return true;
+            };
+            auto grammar_masks = [&](int& T) -> bool {
+                auto match = req_match.clone();
+                auto fence = gfence;
+                gbias.resize((size_t) T * (size_t) n_vocab);
+                gterminal = -1;
+                for (int t = 0; t < T; ++t) {
+                    float* row = gbias.data() + (size_t) t * (size_t) n_vocab;
+                    if (!grammar_mask_row(match, fence, row)) return false;
+                    if (gstop) {
+                        if (t == 0) return true;
+                        // The preceding draft is legal, but there is nothing to sample after it. This dummy row
+                        // is never emitted; if the draft is accepted, the request stops at that prefix.
+                        gterminal = t;
+                        T = t + 1;
+                        std::copy_n(row - n_vocab, n_vocab, row);
+                        gstop = false;
+                        break;
+                    }
+                    if (t + 1 == T) break;
+                    const int32_t d = window[(size_t) t + 1];
+                    const bool allowed = d >= 0 && d < n_vocab &&
+                                         row[d] != -std::numeric_limits<float>::infinity();
+                    if (!allowed || grammar_end(d)) {
+                        // Keep the invalid proposal and its original q: the target must reject it using the
+                        // masked p-q residual. Dropping q and drawing plain p here would bias spec-prob output.
+                        // Its following row is unreachable, so reuse a nonempty mask without consuming the draft.
+                        T = t + 2;
+                        std::copy_n(row, n_vocab, row + n_vocab);
+                        break;
+                    }
+                    if (!match.consume((uint32_t) d)) {
+                        // A proposal is not an emitted token. Leave its target row to the sampler; if that draw
+                        // also hits the inconsistent id, the normal output validation below retries or fails closed.
+                        T = t + 2;
+                        std::copy_n(row, n_vocab, row + n_vocab);
+                        break;
+                    }
+                    if (!req_fence.empty()) fence_advance(fence, grammar_session, d);
+                }
+                grow_on.assign((size_t) T, 1);
+                return ver.set_row_bias(gbias.data(), T, grow_on.data(), err);
             };
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 // A refusal's `continue` re-enters this loop as the same step's retry, so the ban it added has to
@@ -15018,9 +15063,12 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = merge_T > 0 ? merge_T : 1;
-                // A grammar step is one row: the mask is that row's, and a merged window's other rows are prompt
-                // tokens whose own logits a single bias cannot speak for.  Last, so no draft raises it again.
-                if (req_match.valid()) T = 1;
+                // Prompt rows are not grammar output. Subsequent windows may verify unconstrained MTP drafts.
+                if (req_match.valid()) {
+                    T = first_window ? 1 : (int) std::min<int64_t>(T, max_new - produced_n);
+                    T = (int) std::min<int64_t>(T, o.max_context - p);
+                    if (T < 1) break;
+                }
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
@@ -15049,19 +15097,22 @@ int main(int argc, char** argv) {
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
                 }
-                const int T_mtp = T;
+                int T_mtp = T;
                 T += chain_n;
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
-                if (req_match.valid() && !grammar_mask()) return 1;
-                if (gstop) { finish = "stop"; break; }   // the grammar allows nothing here: no draw, no token
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
                     window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
                                          : from_sfx ? sbuf[(size_t) i - 1]
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                if (req_match.valid()) {
+                    if (!grammar_masks(T)) return 1;
+                    if (gstop) { finish = "stop"; break; }
+                    T_mtp = T;   // grammar windows exclude suffix/lookup drafts
+                }
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -15152,28 +15203,45 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
-                // EOS ends the sequence, so it is never handed to the matcher: once the grammar accepts the text so
-                // far the matcher is stopped, and a stopped matcher refuses every token - its own EOS included.  The
-                // mask allows it because accepting is what ending here means; the reply's own end marker check below
-                // then closes the request exactly as an unconstrained reply does.
-                const bool g_end = req_match.valid() &&
-                                   (outv[0] == (int32_t) grammar_session.eos() ||
-                                    std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[0]) != o.eos_ids.end());
-                if (req_match.valid() && !g_end) {   // a clone, so a refusal cannot move the state the accepted tokens made
-                    strata::grammar::Match probe = req_match.clone();
-                    if (!probe.consume((uint32_t) outv[0])) {
-                        // The mask allowed it, so the library disagrees with its own mask: the step is retried once
-                        // with that id banned, and a second refusal in the same step ends the request (C3's failure
-                        // table).  The ban lasts only for that retry, so the id is drawable again in the next step.
-                        if (++gretry > 1) {
-                            std::printf("ERR grammar: refused token %d (%s)\n", (int) outv[0], req_match.error().c_str());
-                            return 1;
+                int a = merged ? T - 1 : 0;
+                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a] &&
+                       !(req_match.valid() && grammar_end(outv[(size_t) a]))) ++a;
+                const bool terminal_prefix = req_match.valid() && gterminal >= 0 && a >= gterminal;
+                if (terminal_prefix) a = gterminal - 1;   // no output exists for the empty-mask row
+                bool g_end = false;
+                strata::grammar::Match accepted_match;
+                auto accepted_fence = gfence;
+                if (req_match.valid()) {
+                    accepted_match = req_match.clone();
+                    bool retry = false;
+                    for (int i = 0; i <= a; ++i) {
+                        const int32_t y = outv[(size_t) i];
+                        if (grammar_end(y)) {
+                            // EOS is drawable only at an accepting row. Do not consume it: llguidance can already
+                            // be stopped there, and consumes on a stopped matcher fail even for its own EOS.
+                            if (!accepted_match.allows((uint32_t) y)) {
+                                std::printf("ERR grammar: premature end token %d\n", y);
+                                return 1;
+                            }
+                            g_end = true;
+                            a = i;
+                            break;
                         }
-                        ++grefused;
-                        gbanned.push_back((int32_t) outv[0]);
-                        gretry_pass = true;
-                        continue;   // the same window, with that id at -inf
+                        if (!accepted_match.consume((uint32_t) y)) {
+                            // Retain the existing one-step retry for a row-zero library inconsistency. Later-row
+                            // inconsistencies fail closed: banning a token at a different prefix is not a valid retry.
+                            if (i != 0 || ++gretry > 1) {
+                                std::printf("ERR grammar: refused token %d (%s)\n", y, accepted_match.error().c_str());
+                                return 1;
+                            }
+                            ++grefused;
+                            gbanned.push_back(y);
+                            gretry_pass = retry = true;
+                            break;
+                        }
+                        if (!req_fence.empty()) fence_advance(accepted_fence, grammar_session, y);
                     }
+                    if (retry) continue;
                 }
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
@@ -15190,8 +15258,6 @@ int main(int argc, char** argv) {
                         if (f) std::fclose(f);
                     }
                 }
-                int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
-                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -15211,12 +15277,9 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                if (req_match.valid() && !g_end) {
-                    // The fence state takes the token at the statement that hands it to the matcher, so the ban and the
-                    // matcher can never disagree about what has been committed (D-067).  A grammar forces T = 1, so
-                    // `a` is 0 here and `outv[a]` is the row the window committed.
-                    if (!req_fence.empty()) fence_advance(gfence, grammar_session, outv[(size_t) a]);
-                    req_match.consume((uint32_t) outv[(size_t) a]);   // committed: now the state
+                if (req_match.valid()) {
+                    req_match = std::move(accepted_match);
+                    gfence = accepted_fence;
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -15249,7 +15312,7 @@ int main(int argc, char** argv) {
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
-                if (g_end) eos = true;   // the grammar's end is the reply's end, even when a request's own list omits it
+                if (g_end || terminal_prefix) eos = true;   // no bonus is emitted for an empty grammar row
                 std::fflush(stdout);
                 ++rounds;
                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
