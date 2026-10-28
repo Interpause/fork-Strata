@@ -912,18 +912,15 @@ print(r.choices[0].message.content)
   with no `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
   `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
   helper calls (a session title in a few dozen tokens) need; its real turns ask for thinking when it is on there.
-- **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
-  (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
+- **Streaming.** With `"stream": true` thinking, answer text and tool-call fields arrive as they are made. Tool
+  arguments arrive in pieces. If generation ends inside a tool call, the partial call is not reported as a completed
+  call. A response cut off by its output limit remains partial (`length` for Chat Completions, `max_tokens` for
+  Anthropic, or `incomplete` for Responses); Strata does not add closing JSON or tool-call delimiters. If a schema
+  had to be widened to compile, the final response carries a `strata_schema_relaxed` notice listing the repairs.
+  While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
-- **Tool calls in other forms (opt-in).** `"tool_call_recovery": true` in `strata-<model>.json` reads a call of a
-  tool the request declared also when the model writes it as `<parameter=NAME>` instead of `<function=NAME>`, as JSON
-  (`{"name": ..., "arguments": ...}`) inside `<tool_call>`, as a `<function=NAME>` block at the start of a line
-  without `<tool_call>` (outside code), or as a second call inside the same `<tool_call>` (without the switch the
-  second call's parameters merge into the first). Anything else in those forms stays the text it is. Measured on
-  1,462 agent turns (Qwen3.8 under Claude Code, from signalnine/q27's drift corpus): 98.3% read as intended with it,
-  92.9% without. Off by default, so what a client gets back is unchanged unless you turn it on.
 - **opencode's environment block in the user turn (opt-in).** opencode writes an `<env>` block (working directory,
   today's date) near the start of its system message, ahead of ~40K characters of instructions and tool definitions that
   are the same in every session. The prefix cache only reuses a prompt's start, so every new folder and every new day
@@ -1522,7 +1519,7 @@ are refused with an error that says so.
 | `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort` (0.1.44.1; 0.1.44 ignored it here), else the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
-| `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
+| `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) |
 | `thread_source` `thread_title` in `client_metadata["x-codex-turn-metadata"]` | Codex's thread-title request (opt-in: `"codex_thread_titles": true` in `strata-<model>.json`, off by default), sent beside each user turn from another session with `tools: []`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}`, so the conversation keeps the prompt cache. The title is the user's line, not one the model wrote |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
 
@@ -2275,19 +2272,32 @@ The schema must accept only JSON objects at its root: `"type":"object"`, or an `
 object schemas (an `allOf` with an object member, or a local `$ref` to one, also counts), as apps written for
 llama.cpp's `json_schema` send. A root that also allows an array, string, number, boolean or null is refused. Local
 `#` references work; remote references are refused.
-`json_schema` is checked with the Python package `jsonschema` when it is installed (`python -m pip install
-"jsonschema>=4.23,<5"`; setup does not add it); without it the answer is only checked to be one JSON object, and the
-server says so once.
+The schema constrains generation through the mandatory reply grammar. If the grammar compiler cannot represent a
+schema feature, Strata may widen the effective grammar schema and reports each repair as `strata_schema_relaxed`;
+complete JSON output is also checked against the original schema using the required Python `jsonschema` package.
+Complete output with invalid JSON or a violation of an unrelaxed response schema returns **502** with
+`error.code: structured_output_failed`. A violation allowed by a compiler repair is delivered with a notice.
+An output limit preserves the generated prefix and uses the API's incomplete outcome instead of adding closing
+JSON or returning a successful complete object. Invalid request schemas return **400**. JSON response formats can be
+combined with tools: a tool-free final answer follows the response
+schema, while a tool turn follows the declared tool schemas. A tool turn may start directly with a call. If it has
+prose before a call, that prose must begin with a visible character other than `{` so the grammar can distinguish
+the prose branch from a JSON value.
 
-This is **schema prompting followed by server validation**, not grammar-constrained decoding. One generation
-is made per request, with no hidden retry. Successful responses contain a validated JSON object. Malformed JSON,
-duplicate keys, non-finite numbers, schema violations and incomplete generations return **502** with
-`error.code: structured_output_failed`; invalid request schemas return **400**. JSON formats combined with
-tools/MCP are refused explicitly. Without `response_format`, ordinary text and tool behavior stays the same.
+Streaming JSON output is forwarded as generated rather than buffered until validation. A complete response is
+validated at the end; an incomplete response stays partial. If compiler repairs widened the effective schema,
+`strata_schema_relaxed` appears in the terminal Chat Completions message/chunk, Anthropic message/event, or
+Responses object/event. `/v1/status.structured_output` reports grammar constrained decoding and unbuffered
+streaming.
 
-Structured SSE buffers the answer while sending keep-alive comments. It emits content only after validation,
-then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas.
-`/v1/status.structured_output` advertises the formats, validation method and buffered streaming behavior.
+The grammar is mandatory for ordinary replies as well as structured outputs. MTP drafts remain unmasked; each
+draft position is checked against the grammar's current row, and only row-verified drafts can be accepted.
+
+Tool parameter strings currently use Strata's raw XML-style parameter encoding. A string containing the exact
+standalone `\n</parameter>\n` delimiter cannot be represented without ambiguity. Union schemas that allow both
+strings and non-string JSON values can also be ambiguous when the raw string looks like JSON (for example `42`).
+The current decoder can lose the string type of such a JSON-looking union value. An explicit parameter encoding
+that handles these collisions remains future work.
 
 ### API request monitor
 

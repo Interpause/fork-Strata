@@ -3,13 +3,13 @@
 // Why the engine needs this at all: inside a fence a structural delimiter such as `<tool_call>` is content, not
 // structure, but a byte terminal cannot forbid a *token id* - llguidance's skeleton says special tokens "must never
 // be named inside a terminal" - so the ban belongs in the sampler's mask, and the mask needs one fact the grammar
-// does not carry: is a fence open right now (D-067, tmp/impl-plan/fence-ban.md).
+// does not carry: is a fence open right now (see src/grammar/fence_test.cpp).
 //
-// W1 in the plan: an FSM over bytes rather than a precomputed token-transition table, and the FSM carries all of its
+// An FSM over bytes rather than a precomputed token-transition table carries all of its
 // own state, so there is no byte tail to buffer.  A few bytes per slot and trivially copyable: a batch row that
 // validates a draft copies the slot's tracker and advances the copy by the draft's first token.
 //
-// Recognition is the plan's, with two deliberate departures from CommonMark, both because the rule is "err toward
+// Recognition has two deliberate departures from CommonMark, both because the rule is "err toward
 // re-allowing early": a closing run needs only three of the opening character, however long the opening run was
 // (a model that opens with four and closes with three is doing what it thinks is right); and a backtick inside an
 // info string still opens, so ` ```foo``` ` on one line is an opener and not inline code.

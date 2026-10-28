@@ -7,18 +7,18 @@ literals it wrote and what each one is - so it cannot describe a grammar other t
 
 Why the labels can be trusted, and why the bytes alone cannot be:
 
-* A delimiter's ordinary-text pieces are legal *inside* a value and inside prose (`</`, `parameter`, `>`, spelled as
-  separate BPE pieces, are just text), so nothing about a byte says "structure".
-* A **special token id** cannot appear in a text terminal.  Measured with the real pack vocabulary: a free-text
-  regex offers 0 of the 33 special ids at the start mask and only EOS afterwards
-  (`tmp/grammar-explore/toy/freetext/report.md` §V2, `v2-run.txt`, `v4-run.txt` V4.1; reason in
-  `tmp/grammar-explore/HANDOVER.md` §11 A10).  So a special id is structure, exactly and only.
-* A parameter value closes only at a standalone `"\\n</parameter>\\n"` line (`tmp/grammar-explore/HANDOVER.md` §2 D5,
-  §11 A7/X1), which is what `skeleton.lark`'s `raw_param_end` encodes and what the template writes.
+* Ordinary delimiter bytes are payload inside prose and values; the decoder recognizes structural delimiters by
+  special token id. The exact standalone `"\\n</parameter>\\n"` byte sequence is the exception: it closes a
+  parameter value and cannot also be represented as its contents.
+* A **special token id** cannot appear in a text terminal, so the delimiter id identifies structure.
+* A parameter value closes only at a standalone `"\\n</parameter>\\n"` line, as encoded by `raw_param_end` in
+  `skeleton.lark` and emitted by the template.
 
-The decoder works on **tokens**, so a delimiter split across two tokens is not a case it can get wrong, and there is
-no "streamed versus whole" question to test: one code path, fed the same ids.  `feed` takes the id and the token's
-text; a delimiter id is recognised by id and its text is ignored.
+The decoder works on **tokens**. Splitting a special delimiter id from neighboring payload across token boundaries
+does not change the result. Ordinary parameter headers and the raw-text closer are accumulated across token text
+chunks; the exact closer remains ambiguous with string contents. There is no separate streamed-versus-whole path:
+both feed the same ids. `feed` takes the id and the token's text; a special delimiter id is recognized by id and its
+text is ignored.
 
 What it does not do: it does not build the `tool_args` JSON, and it does not decide what prose looks like for
 display (fences, inline code).  It reports structure - `call_open`, `param`, `param_end`, `call_end` - and
