@@ -59,15 +59,13 @@ def _splice(text: str, begin: str, end: str, replacement: str) -> str:
 def build(tools: list[dict[str, Any]] | None = None, schema: dict[str, Any] | None = None) -> str:
     """The grammar for one request, still starting at `entry_select`.
 
-    `schema` is used only when no tools are declared: the template lets a reply be tool calls or one JSON object,
-    never both, so with tools present the schema is not applied (`HANDOVER.md` D10).
+    With tools and a schema, a tool-free final answer must match the schema; a tool turn may contain prose and calls.
+    The selected entry rule provides those alternatives. With tools and no schema, the old tool grammar stays intact.
     """
     from .tools_fragment import compile_tools_fragment
 
     text = skeleton()
     text = _splice(text, TOOLS_BEGIN, TOOLS_END, compile_tools_fragment(tools or []).text)
-    if tools:
-        schema = None             # tool calls or one JSON object, never both: the tools win
     rule = DEFAULT_JSON_RULE if schema is None else "json_response: %json " + json.dumps(schema)
     return _splice(text, JSON_BEGIN, JSON_END, rule)
 

@@ -81,7 +81,7 @@ class Skeleton(unittest.TestCase):
     def test_every_static_entry_rule_is_present(self):
         present = rules(bg.skeleton())
         for phase in ("think", "answer"):
-            for kind in ("plain", "tools", "tools_required", "json"):
+            for kind in ("plain", "tools", "tools_required", "json", "json_tools"):
                 self.assertIn(f"entry_{phase}_{kind}", present)
         for mid in ("entry_call_name",):
             self.assertIn(mid, present)
@@ -124,10 +124,16 @@ class Splices(unittest.TestCase):
     def test_no_tools_keeps_the_never_matching_placeholder(self):
         self.assertIn(compile_tools_fragment([]).text, bg.build())
 
-    def test_a_schema_is_not_applied_when_tools_are_declared(self):
-        # The template allows tool calls or one JSON object, never both, so tools win.
+    def test_a_schema_is_applied_to_tool_free_answers_when_tools_are_declared(self):
         out = bg.build(tools=[WEATHER], schema=SCHEMA)
-        self.assertIn(bg.DEFAULT_JSON_RULE, out)
+        self.assertIn("json_response: %json " + json.dumps(SCHEMA), out)
+        self.assertIn("answer_json_tools: json_response", out)
+        self.assertIn("| PROSE_BEFORE_JSON_TOOLS tool_calls", out)
+
+    def test_tool_only_request_keeps_the_existing_entry(self):
+        self.assertEqual(be.resolve_entry("<think>\n", tools=[WEATHER]), "entry_think_tools")
+        self.assertEqual(be.resolve_entry("<think>\n\n</think>\n\n", tools=[WEATHER]),
+                         "entry_answer_tools")
 
     def test_every_json_payload_parses(self):
         # The library parses these with serde_json; a payload that does not parse is a grammar that cannot compile,
@@ -140,7 +146,7 @@ class Splices(unittest.TestCase):
                 }}}},
         ], schema=SCHEMA)
         payloads = json_payloads(out)
-        self.assertEqual(len(payloads), 2)          # the integer parameter, plus the always-present json_response
+        self.assertEqual(len(payloads), 2)          # the integer parameter plus response schema
         for payload in payloads:
             json.loads(payload)
 
@@ -247,6 +253,8 @@ class Entries(unittest.TestCase):
         self.assertEqual(be.resolve_entry("<|im_start|>assistant\n<think>\n", tools=[WEATHER], required=True),
                          "entry_think_tools_required")
         self.assertEqual(be.resolve_entry("<|im_start|>assistant\n<think>\n", schema=SCHEMA), "entry_think_json")
+        self.assertEqual(be.resolve_entry("<|im_start|>assistant\n<think>\n", tools=[WEATHER], schema=SCHEMA),
+                         "entry_think_json_tools")
 
     def test_thinking_off_starts_at_the_answer(self):
         # The template writes the empty reasoning block into the PROMPT, so the reply begins at the answer.
@@ -255,11 +263,13 @@ class Entries(unittest.TestCase):
         self.assertEqual(be.resolve_entry(tail, tools=[WEATHER]), "entry_answer_tools")
         self.assertEqual(be.resolve_entry(tail, tools=[WEATHER], required=True), "entry_answer_tools_required")
         self.assertEqual(be.resolve_entry(tail, schema=SCHEMA), "entry_answer_json")
+        self.assertEqual(be.resolve_entry(tail, tools=[WEATHER], schema=SCHEMA), "entry_answer_json_tools")
 
     def test_thinking_off_never_selects_a_thinking_entry(self):
         # Both tails contain <think>; only the bytes after it may decide.
         for tools, schema, required in (([], None, False), ([WEATHER], None, False),
-                                        ([WEATHER], None, True), ([], SCHEMA, False)):
+                                        ([WEATHER], None, True), ([], SCHEMA, False),
+                                        ([WEATHER], SCHEMA, False)):
             entry = be.resolve_entry("<think>\n\n</think>\n\n", tools=tools, schema=schema, required=required)
             self.assertTrue(entry.startswith("entry_answer_"), entry)
 
@@ -321,6 +331,7 @@ class Entries(unittest.TestCase):
         cases = [
             ({}, None, False), ({"tools": [WEATHER, NO_ARGS]}, None, False),
             ({"tools": [WEATHER]}, None, True), ({}, SCHEMA, False),
+            ({"tools": [WEATHER]}, SCHEMA, False),
         ]
         tails = ["<think>\n", "<think>\n\n</think>\n\n", "<tool_call>\n<function=",
                  "<tool_call>\n<function=get_weather>\n"]

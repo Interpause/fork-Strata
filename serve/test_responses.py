@@ -672,7 +672,9 @@ class JsonFormatWithTools(Server):
                          {"outcome": "allow", "rationale": "read only"})
         code, events = self.post(self.request(stream=True))
         self.assertEqual(events[-1]["type"], "response.completed")
-        self.assertEqual(len([e for e in events if e["type"] == "response.output_text.delta"]), 1)
+        deltas = [e["delta"] for e in events if e["type"] == "response.output_text.delta"]
+        self.assertGreater(len(deltas), 1)
+        self.assertEqual("".join(deltas), '{"outcome": "allow", "rationale": "read only"}')
 
     def test_a_text_answer_that_breaks_the_schema_fails_as_without_tools(self):
         self.script_with('</think>\n\n{"outcome": 3}<|im_end|>')

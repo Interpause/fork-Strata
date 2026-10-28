@@ -247,11 +247,53 @@ class Tools(unittest.TestCase):
         self.assertTrue(m.consume([self.v.special["</tool_call>"]]))
         m.close()
 
-    def test_json_mode_is_not_applied_when_tools_are_declared(self):
-        # the schema's property is not required here: the tools' shape is the only structure
-        m = self.open("entry_answer_tools", tools=[WEATHER], schema=SCHEMA)
-        self.assertIn(self.v.special["<tool_call>"], m.mask()[0])
+    def test_json_schema_with_tools_accepts_a_final_object_or_prose_and_a_call(self):
+        m = self.open("entry_answer_json_tools", tools=[WEATHER], schema=SCHEMA)
+        self.assertNotIn(self.v.eos, m.mask()[0])
+        self.assertTrue(m.consume(self.v.ids('{"answer":"yes"}')))
+        self.assertTrue(m.consume([self.v.eos]))
+        self.assertTrue(m.is_accepting())
         m.close()
+
+        bad = self.open("entry_answer_json_tools", tools=[WEATHER], schema=SCHEMA)
+        self.assertFalse(bad.consume(self.v.ids('{"other":"no"}')))
+        bad.close()
+
+        call = self.v.ids('<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n'
+                          '</function>\n</tool_call>')
+        for prefix in ("", "I will check that now.\n\n"):
+            with self.subTest(prefix=prefix):
+                tool_turn = self.open("entry_answer_json_tools", tools=[WEATHER], schema=SCHEMA)
+                self.assertTrue(tool_turn.consume(self.v.ids(prefix) + call), prefix)
+                self.assertTrue(tool_turn.consume([self.v.eos]))
+                self.assertTrue(tool_turn.is_accepting())
+                tool_turn.close()
+
+    def test_json_schema_with_tools_handles_thinking_and_required_choice(self):
+        thinking = self.open("entry_think_json_tools", tools=[WEATHER], schema=SCHEMA)
+        self.assertNotIn(self.v.eos, thinking.mask()[0])
+        self.assertNotIn(self.v.special["<tool_call>"], thinking.mask()[0])
+        self.assertTrue(thinking.consume(self.v.ids("I should check this first.\n")))
+        self.assertTrue(thinking.consume([self.v.special["</think>"]]))
+        self.assertTrue(thinking.consume(self.v.ids("\n\n{" + '"answer":"yes"}')))
+        self.assertTrue(thinking.consume([self.v.eos]))
+        self.assertTrue(thinking.is_accepting())
+        thinking.close()
+
+        required = self.open("entry_answer_tools_required", tools=[WEATHER])
+        self.assertNotIn(self.v.eos, required.mask()[0])
+        self.assertTrue(required.consume(self.v.ids('{"answer":"yes"}')))
+        self.assertFalse(required.consume([self.v.eos]), "the required-call path cannot finish with schema prose")
+        required.close()
+
+        required_thinking = self.open("entry_think_tools_required", tools=[WEATHER])
+        self.assertNotIn(self.v.eos, required_thinking.mask()[0])
+        self.assertNotIn(self.v.special["<tool_call>"], required_thinking.mask()[0])
+        self.assertTrue(required_thinking.consume(self.v.ids("Need to check.\n")))
+        self.assertTrue(required_thinking.consume([self.v.special["</think>"]]))
+        self.assertTrue(required_thinking.consume(self.v.ids("\n\n")))
+        self.assertIn(self.v.special["<tool_call>"], required_thinking.mask()[0])
+        required_thinking.close()
 
 
 class Validation(unittest.TestCase):

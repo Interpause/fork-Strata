@@ -72,7 +72,7 @@ from serve.grammar import matcher as grammar_matcher  # noqa: E402
 from serve.grammar import pipeline as grammar_pipeline  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
-from serve.structured import FORMAT_WITH_TOOLS, TOO_DEEP, StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import TOO_DEEP, StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve.structured import format_schema  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -148,8 +148,7 @@ def write_temporary(path: Path, parts: list) -> None:
 def grammar_file(pack_dir: Path, name: str, text: str) -> Path:
     """Where one request's grammar goes: `<dir>/<16-hex>.gr`, the same reasoning as combined_embeddings_path (in
     /dev/shm when it has room, since the engine reads it back at once, otherwise next to the model).  The directory
-    carries the process id so two servers never share a name; the file's own name is the grammar's identity, which is
-    what the engine caches by (tmp/impl-plan/contracts/c1-grammar-transport.md)."""
+    carries the process id so two servers never share a name; the file's own name is the grammar text's identity."""
     directory = Path(pack_dir)
     shm = SHM_DIR
     if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
@@ -1387,10 +1386,9 @@ class StrataEngine:
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
                                                for k in ik):
             keys += " img_keys=" + ",".join(ik)
-        # The request's grammar: a file the server wrote (C1 in tmp/impl-plan/contracts).  The engine reads it at
-        # admission; one that does not know the key skips it and decodes unconstrained.  Base64, always: the key
-        # parser ends a token at a space, and a model directory with a space in its name (a Windows profile) would
-        # otherwise be dropped here and decode unconstrained with nothing said.
+        # The request's grammar is a server-written file, identified by its digest. The engine reads and compiles it
+        # at admission; base64 keeps paths intact when the model directory contains spaces. Grammar capability is
+        # checked before admission, so a missing decoder is refused instead of silently decoding unconstrained.
         g = sampling.get("strata_grammar")
         if isinstance(g, str) and g:
             keys += " grammar=" + base64.b64encode(g.encode("utf-8")).decode("ascii")
@@ -3399,7 +3397,7 @@ def _append_grammar_repairs(state, repairs):
         item = asdict(step)
         if item not in recorded:
             recorded.append(item)
-    state["relaxed"] = bool(recorded)
+    state["relaxed"] = any(step.get("scope", "response") == "response" for step in recorded)
 
 
 class Service:
@@ -3407,17 +3405,17 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, pack_dir: Path | None | object = AUTO_PACK):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        # The request's grammar (contracts C1/C2 in tmp/impl-plan/contracts): spliced once per shape and handed to
-        # the engine as a file, which is the only thing that compiles it - so nothing is cached on this side, and a
-        # cache would be a second place where a grammar's identity is decided (D-038).  The pack's tokenizer is what
-        # a decode is constrained by; a stand-in (the tests' byte tokenizer) is enough to build and write the file,
+        # The request's grammar is spliced and preflight-compiled by the server pipeline, then handed to the engine
+        # as a file named by its digest. The pipeline caches by request shape; the engine compiles a request matcher
+        # from the same text at admission. The pack's tokenizer is what a decode is constrained by; a stand-in (the tests' byte
+        # tokenizer) is enough to build and write the file,
         # which is what a mock engine is driven with.  Without any directory there is no pipeline, and
         # `begin_grammar` refuses every chat-shaped request (D-030).  `None` is that state, explicitly.
         if pack_dir is AUTO_PACK:
             pack_dir = auto_pack_dir()                # so a mock engine can be driven without a pack
         self.pack_dir = Path(pack_dir) if pack_dir is not None else None
-        # D-064: where a pipeline exists it compiles, so a schema the grammar engine cannot express is caught here
-        # rather than by a decode that fails.  `None` still means no pipeline (the tests of that refusal pass it).
+        # D-064: where a pipeline exists it preflight-compiles and caches each grammar, so an unsupported schema is
+        # caught before decode. `None` still means no pipeline (the tests of that refusal pass it).
         self.pipeline = (grammar_pipeline.Pipeline(tokenizer, compiler=grammar_compiler(self.pack_dir, tokenizer))
                          if self.pack_dir is not None else None)
         if self.pack_dir is not None:
@@ -4492,11 +4490,11 @@ class Service:
         and a token prefix inside a name (`<function=get`) is a tail no entry resolves (D-044).
 
         The third element is `Grammar.repairs`: the exact steps the ladder applied to make the text compile (D-068).
-        The reply's conformance check reads whether it is non-empty, and the response carries the steps so clients
-        know which constraints were widened.
+        The reply's conformance check reads the response-scoped steps, and response metadata carries all steps so
+        clients know which constraints were widened.
 
-        Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
-        all there is to return (D-038).
+        The pipeline builds and preflight-compiles the request grammar, caching by request shape. This method writes
+        the checked text to a held file named by its digest; the engine compiles its own matcher from it at admission.
 
         A reply with no grammar has no reader left (D-030), so every condition that used to send none raises
         `grammar_pipeline.GrammarUnavailable` with a message of its own and the status that names whose condition it
@@ -5412,13 +5410,14 @@ def openai_collect(chunks) -> dict:
 
 
 def structured_chunks(chunks, validator, relaxed=None, cancelled=None):
-    """Forward schema-constrained JSON as generated and validate its full text at the terminal chunk.
+    """Forward schema-constrained JSON and validate a tool-free final answer at its terminal chunk.
 
     `relaxed`: passed to `validated_json`, so a reply that misses a schema the ladder had to relax is delivered with
     one warning instead of a 502 (D-068) - and, on the last chunk of the stream, a `strata_schema_relaxed` notice
     with the actual repair steps and, on a mismatch, its pointer and violation; `openai_collect` carries it into the
     non-streamed reply's message (D-071). Only the final chunk is held for validation; content chunks retain their
-    original bytes and are sent before generation finishes."""
+    original bytes and are sent before generation finishes. A tool-call turn keeps its own output and is not checked
+    against the final-answer schema."""
     buffered = []
     notice = {}
     terminal = None
@@ -5441,7 +5440,7 @@ def structured_chunks(chunks, validator, relaxed=None, cancelled=None):
         existing = choice["message"].get("strata_schema_relaxed")
         if existing:
             notice.update(existing)
-        if choice["finish_reason"] != "length":
+        if choice["finish_reason"] not in ("length", "tool_calls"):
             validated_json(choice["message"]["content"], validator, choice["finish_reason"], relaxed=relaxed,
                            notice=notice)
         if notice:
@@ -6435,9 +6434,9 @@ def make_handler(svc: Service):
             # A generation route was asked for, so the model warms up first even when this request proves invalid
             # (D-069): the next request finds it loaded, and on a server that is already warm this is a timestamp.
             svc.load()
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError(FORMAT_WITH_TOOLS)
+            messages, validator = prepare_format(req.get("response_format"), messages,
+                                                with_tools=bool(tools) or
+                                                (req.get("strata_mcp") is True and svc.mcp is not None))
             grammar_state = {}                                # D-068: filled by Service.run (see _run)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
@@ -6633,11 +6632,9 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "input") from None
             fmt = responses_api.text_format(req)            # text.format -> the chat path's response_format
             try:
-                messages, validator = prepare_format(fmt, messages)
+                messages, validator = prepare_format(fmt, messages, with_tools=bool(tools))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            if validator is not None and tools:
-                raise ResponsesError(FORMAT_WITH_TOOLS, "text.format")
             # D-058(a): the request *is* the sampling dict this route runs with, so its schema has to be on it -
             # `begin_grammar` reads `sampling["response_format"]`, and without this the route gets `entry_*_plain`
             # and the schema is only checked against the finished text (which `validated_json` then fails as a 502).

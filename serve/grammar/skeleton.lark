@@ -66,6 +66,8 @@ entry_think_tools: thinking answer_tools
 // from that tool alone, so only that name can be generated.
 entry_think_tools_required: thinking answer_tools_required
 entry_think_json:  thinking answer_json
+entry_think_json_tools: thinking answer_json_tools
+entry_answer_json_tools: answer_json_tools
 
 entry_answer_plain: answer_plain
 entry_answer_tools: answer_tools
@@ -124,6 +126,14 @@ answer_tools_required: tool_calls  <|im_end|>
 // object, so the only deterministic encoding is the schema value alone.
 answer_json: json_response   <|im_end|>
 
+// Tools plus a response schema have two end states: a tool-free answer is one
+// schema-matching JSON object; a turn that calls a tool may contain prose (or
+// start with a call) and follows the ordinary tool-call shape. Its prose branch
+// has a disjoint opening byte so the matcher can keep the JSON path through EOS.
+answer_json_tools: json_response   <|im_end|>
+                 | tool_calls   <|im_end|>
+                 | PROSE_BEFORE_JSON_TOOLS tool_calls   <|im_end|>
+
 // One or more calls. Every call opens with the   <tool_call> SPECIAL token,
 // then "\n<function=", the name + parameters (the FRAGMENT's tool_dispatch),
 // then "</function>\n", then the   </tool_call> SPECIAL token.
@@ -146,6 +156,13 @@ THINK_BODY: /(?s:.*)\n/
 // two newlines must also be a non-newline.  The separator is therefore exactly
 // two newlines.  This is stricter than a bare /(?s:.+)\n\n/, which accepts three.
 PROSE_BEFORE_TOOLS: /(?s:[^\n](.*[^\n])?)\n\n/
+
+// The combined JSON/tools entry must choose between a `%json` object and prose
+// without backtracking across two greedy lexemes. JSON objects start with `{`;
+// require tool-turn prose to start with a visible non-space, non-`{` byte. This
+// keeps schema-valid objects on the JSON branch through EOS while retaining the
+// ordinary prose-before-call form.
+PROSE_BEFORE_JSON_TOOLS: /(?s:[^\s{](.*[^\n])?)\n\n/
 
 // Answer text: empty, or text whose FIRST byte is not a newline.  The leading
 // non-newline is what makes the two newlines the template writes before

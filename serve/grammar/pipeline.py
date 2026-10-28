@@ -69,8 +69,8 @@ class GrammarUnavailable(RuntimeError):
 class Grammar:
     """What one request decodes with.  `id` is the 16-hex basename of the file the engine reads.
 
-    `repairs` is what the ladder changed to make the text compile: its `Step`s, one per rung at the response
-    schema, plus one per tool parameter that became `{}`.  Empty for a schema that compiled as written, which is
+    `repairs` is what the ladder changed to make the text compile: its scoped `Step`s, one per rung at the response
+    schema, plus one per widened tool parameter. Empty for a schema that compiled as written, which is
     also every `Grammar` built without a compiler.
     """
 
@@ -296,7 +296,7 @@ class Pipeline:
             note = ("tool %r parameter %r was widened (the compiler refused its schema: %s)"
                     % (tool_name, name, _summary(finding.core)[:200]))
             print(f"[strata] grammar: {note}", flush=True)
-            steps.append(bl.Step(2, finding.cls, None, note))
+            steps.append(bl.Step(2, finding.cls, None, note, scope="tool_parameter"))
         return repaired, steps
 
     # ------------------------------------------------------------------ counters, for the exit deliverable

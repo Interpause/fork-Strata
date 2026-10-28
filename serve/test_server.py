@@ -51,8 +51,10 @@ class CompletionCancellation(unittest.TestCase):
         _append_grammar_repairs(state, [first, second])
         self.assertTrue(state["relaxed"])
         self.assertEqual(state["repairs"], [
-            {"rung": 2, "cls": "unsupported", "pointer": "/properties/q/pattern", "note": "dropped pattern"},
-            {"rung": 3, "cls": "unsupported", "pointer": "/properties/n/minimum", "note": "dropped minimum"},
+            {"rung": 2, "cls": "unsupported", "pointer": "/properties/q/pattern", "note": "dropped pattern",
+             "scope": "response"},
+            {"rung": 3, "cls": "unsupported", "pointer": "/properties/n/minimum", "note": "dropped minimum",
+             "scope": "response"},
         ])
 
     def services(self):

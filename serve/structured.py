@@ -40,7 +40,7 @@ TOO_DEEP = ("response_format schema nests too deeply for Python to check: the sc
 
 #: The most members one schema may hold.  The validity gate's cost is per member, not per byte: `jsonschema`'s
 #: `check_schema` takes ~184 µs per `properties` entry and ~380 µs per `anyOf` branch, linear from 1,000 to 20,000
-#: (tmp/research/check-schema-report.md §3).  At the server's 256 MiB body ceiling that is hours of CPU for one
+#: At the server's 256 MiB body ceiling that is hours of CPU for one
 #: request.  No real schema needs this many: a tool schema generated for a model is a few hundred members at most.
 #: Measured on the development PC (AMD Ryzen 9 5950X, CPython 3.14.8, jsonschema 4.26.0): `prepare_format` takes
 #: 424 ms for 2,000 properties and 788 ms for 2,000 `anyOf` branches, so the worst case at this ceiling is under
@@ -226,12 +226,7 @@ def format_schema(response_format):
     return schema
 
 
-FORMAT_WITH_TOOLS = ("a response schema with tools is not supported: a reply is one JSON object or a tool call, "
-                     "never both, and the grammar cannot express the two - send the schema without tools, or drop "
-                     "the schema")
-
-
-def prepare_format(response_format, messages):
+def prepare_format(response_format, messages, with_tools=False):
     # One catch covers every recursive walk a declared schema passes through - `format_schema`'s `check_refs` and
     # `_only_objects`, then `check_schema` and the validator built from it - because they all run inside this
     # function, and the first call is `format_schema` itself.  Catching beside `SchemaError` alone would let a
@@ -272,11 +267,18 @@ def prepare_format(response_format, messages):
                 raise ValueError(f"invalid response_format schema: {exc.message}") from exc
     except RecursionError as exc:
         raise ValueError(TOO_DEEP) from exc
-    directive = ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
-                 "No Markdown, headings, code fences, commentary, or text outside the JSON. "
-                 "Use every required field, correct types, and only allowed fields. "
-                 "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n" +
-                 json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+    instruction = (("OUTPUT FORMAT REQUIREMENT: If you answer without calling a tool, return exactly one JSON object "
+                  "matching the JSON Schema below. Do not add Markdown, headings, code fences, commentary, or text "
+                  "outside that JSON. Use every required field, correct types, and only allowed fields. Put all "
+                  "requested writing inside the appropriate JSON string fields. If the task requires a tool, make "
+                  "the tool call normally and start directly with it. If you add brief prose first, begin with a "
+                  "visible character other than `{`; do not start a tool turn with a JSON prefix. This schema applies "
+                  "only to your final answer when you make no tool call.\nJSON Schema:\n") if with_tools else
+                 ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
+                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
+                  "Use every required field, correct types, and only allowed fields. "
+                  "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n"))
+    directive = instruction + json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     messages = [dict(message) for message in messages]
     if messages and messages[0].get("role") == "system":
         content = messages[0].get("content") or ""

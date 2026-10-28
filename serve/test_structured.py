@@ -1,5 +1,6 @@
 """Exercise the JSON contract through HTTP, including H3's strict Story shape."""
 import contextlib
+from dataclasses import asdict
 import io
 import json
 import unittest
@@ -133,6 +134,19 @@ class StructuredStreamUnit(unittest.TestCase):
 
 
 class Structured(unittest.TestCase):
+    def test_schema_only_prompt_directive_is_unchanged_and_combined_directive_is_explicit(self):
+        fmt = {"type": "json_object"}
+        old, _ = structured.prepare_format(fmt, [{"role": "user", "content": "x"}])
+        combined, _ = structured.prepare_format(fmt, [{"role": "user", "content": "x"}], with_tools=True)
+        legacy = ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
+                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
+                  "Use every required field, correct types, and only allowed fields. "
+                  "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n"
+                  '{"type":"object"}')
+        self.assertEqual(old[0]["content"], legacy)
+        self.assertIn("start directly with it", combined[0]["content"])
+        self.assertIn("visible character other than `{`", combined[0]["content"])
+
     def request(self, path, body=None, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json", **(headers or {})})
@@ -187,25 +201,31 @@ class Structured(unittest.TestCase):
         self.assertTrue(grammars, "the route must ask the grammar for a reader")
         self.assertIn("start: entry_answer_json", grammars[0])
 
-    def test_a_schema_with_tools_is_refused_on_both_routes(self):
-        # The one message, on the route that used to refuse the pair and the one that used to send it anyway
-        # (D-058(b)): `build()` drops the schema when tools are present, so that route only validated afterwards.
-        chat = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
-        responses = [{"type": "function", "name": "search", "parameters": {"type": "object"}}]
-        with mock.patch.object(self.svc, "load") as load:
-            code, reply = self.chat(tools=chat)
-            self.assertEqual(code, 400)
-            self.assertEqual(reply["error"]["message"], structured.FORMAT_WITH_TOOLS)
-            code, reply = self.responses(tools=responses, text={"format": {"type": "json_schema", "name": "story",
-                                                                          "schema": STORY_SCHEMA}})
-            self.assertEqual(code, 400, reply)
-            self.assertEqual(reply["error"]["message"], structured.FORMAT_WITH_TOOLS)
-            self.assertEqual(reply["error"]["param"], "text.format")
-            # D-069: a generation route was asked for, so the model is warmed before the schema is judged - one load
-            # per request, both of which end as a refusal.  Warming first is what a second, valid request wants.
-            self.assertEqual(load.call_count, 2)
-        # Without a schema the same tools are fine on the responses route: nothing to conflict with.
-        self.assertEqual(self.responses(tools=responses)[0], 200)
+    def test_schema_with_tools_checks_tool_free_answers_but_allows_tool_turns(self):
+        chat_tools = [{"type": "function", "function": {"name": "search", "parameters": {
+            "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+        response_tools = [{"type": "function", "name": "search", "parameters": {
+            "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}]
+        fmt = {"type": "json_schema", "json_schema": {"name": "outcome", "schema": {
+            "type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}}}
+        self.engine = self.svc.engine = MockEngine(self.tok, '{"answer":"done"}', max_context=16384)
+        code, reply = self.chat(response_format=fmt, tools=chat_tools)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), {"answer": "done"})
+
+        script = ("Checking the forecast.\n\n<tool_call>\n<function=search>\n<parameter=query>\nweather\n"
+                  "</parameter>\n</function>\n</tool_call>")
+        self.engine = self.svc.engine = MockEngine(self.tok, script, max_context=16384)
+        code, reply = self.chat(response_format=fmt, tools=chat_tools)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(reply["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "search")
+        self.assertEqual(reply["choices"][0]["message"]["content"], "Checking the forecast.")
+        self.engine = self.svc.engine = MockEngine(self.tok, script, max_context=16384)
+        code, response = self.responses(tools=response_tools,
+                                        text={"format": {"type": "json_schema", **fmt["json_schema"]}})
+        self.assertEqual(code, 200, response)
+        self.assertEqual(response["output"][-1]["type"], "function_call")
 
     def test_a_number_json_cannot_write_is_named_on_both_routes(self):
         # `1e400` is a legal JSON number and Python reads it as `inf`; the grammar carries the schema as a JSON
@@ -312,9 +332,9 @@ class Structured(unittest.TestCase):
         def watch(handler, cancel):
             calls.append("watch")
 
-        def prepare(fmt, messages):
+        def prepare(fmt, messages, **kwargs):
             calls.append("prepare")
-            return real_prepare(fmt, messages)
+            return real_prepare(fmt, messages, **kwargs)
 
         bad = {"type": "json_schema", "json_schema": {"name": "bad", "schema": {"type": "string"}}}
         with mock.patch.object(self.httpd.RequestHandlerClass, "_watch_client", watch), \
@@ -333,9 +353,9 @@ class Structured(unittest.TestCase):
         def load():
             calls.append("load")
 
-        def prepare(fmt, messages):
+        def prepare(fmt, messages, **kwargs):
             calls.append("prepare")
-            return real_prepare(fmt, messages)
+            return real_prepare(fmt, messages, **kwargs)
 
         bad = {"type": "json_schema", "json_schema": {"name": "bad", "schema": {"type": "string"}}}
         with mock.patch.object(self.svc, "load", load), \
@@ -433,10 +453,7 @@ class Structured(unittest.TestCase):
         notice = reply["choices"][0]["message"]["strata_schema_relaxed"]
         self.assertEqual(notice["at"], "/q")
         self.assertIn("^x(?=y)", notice["error"])
-        expected_repairs = [
-            {"rung": step.rung, "cls": step.cls, "pointer": step.pointer, "note": step.note}
-            for step in repairs
-        ]
+        expected_repairs = [asdict(step) for step in repairs]
         self.assertEqual(notice["repairs"], expected_repairs)
         # The same notice reaches a streaming client, on the chunk that carries finish_reason - there is no other
         # chunk a client is already reading at the end of a reply.
@@ -492,8 +509,7 @@ class Structured(unittest.TestCase):
         notice = reply["choices"][0]["message"]["strata_schema_relaxed"]
         repairs = self.svc.pipeline.for_entry("entry_answer_json", None, LOOKAHEAD_SCHEMA).repairs
         self.assertEqual(notice["repairs"], [
-            {"rung": step.rung, "cls": step.cls, "pointer": step.pointer, "note": step.note}
-            for step in repairs
+            asdict(step) for step in repairs
         ])
         self.assertNotIn("at", notice)
         self.assertNotIn("error", notice)
@@ -512,9 +528,36 @@ class Structured(unittest.TestCase):
         normalized, _, _ = server_module.responses_api.request_tools({"tools": tools})
         repairs = self.svc.pipeline.for_entry("entry_answer_tools", normalized, None).repairs
         self.assertEqual(reply["strata_schema_relaxed"]["repairs"], [
-            {"rung": step.rung, "cls": step.cls, "pointer": step.pointer, "note": step.note}
-            for step in repairs
+            asdict(step) for step in repairs
         ])
+
+    def test_tool_parameter_repair_does_not_relax_combined_response_schema(self):
+        if self.svc.pipeline is None or self.svc.pipeline.compiler is None:
+            self.skipTest("needs libllguidance for the compile ladder")
+        tool = {"type": "function", "name": "capture", "parameters": LOOKAHEAD_SCHEMA}
+        fmt = {"type": "json_schema", "json_schema": {"name": "outcome", "schema": {
+            "type": "object", "properties": {"outcome": {"type": "string", "enum": ["allow", "deny"]}},
+            "required": ["outcome"], "additionalProperties": False}}}
+
+        self.engine = self.svc.engine = MockEngine(self.tok, '{"outcome":"allow"}', max_context=16384)
+        responses_fmt = {"type": "json_schema", **fmt["json_schema"]}
+        code, reply = self.responses(tools=[tool], text={"format": responses_fmt})
+        self.assertEqual(code, 200, reply)
+        repairs = reply["strata_schema_relaxed"]["repairs"]
+        self.assertTrue(repairs)
+        self.assertTrue(all(step["scope"] == "tool_parameter" for step in repairs), repairs)
+        self.assertEqual(json.loads(reply["output"][-1]["content"][0]["text"]), {"outcome": "allow"})
+
+        self.engine = self.svc.engine = MockEngine(self.tok, '{"outcome":"other"}', max_context=16384)
+        code, error = self.responses(tools=[tool], text={"format": responses_fmt})
+        self.assertEqual((code, error["error"]["code"]), (502, "structured_output_failed"), error)
+
+        self.engine = self.svc.engine = MockEngine(self.tok, '{"outcome":"other"}', max_context=16384)
+        code, raw = self.responses(tools=[tool], text={"format": responses_fmt}, stream=True)
+        self.assertEqual(code, 200)
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: ")]
+        self.assertEqual(events[-1]["type"], "response.failed", raw)
+        self.assertEqual(events[-1]["response"]["error"]["code"], "structured_output_failed")
 
     def test_rejected_schema_warms_the_model_and_does_not_retry(self):
         # D-069: the refusal comes after the load, so the next request finds the model warm; what must not happen
@@ -538,7 +581,7 @@ class Structured(unittest.TestCase):
         fmt = {"type": "json_schema", "json_schema": {"name": "local", "schema": schema}}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
 
-    def test_malformed_formats_and_tools_are_rejected(self):
+    def test_malformed_formats_are_rejected_and_tool_only_requests_remain_valid(self):
         formats = ([], {"type": "unsupported"},
                    {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
                    {"type": "json_schema", "json_schema": {"name": "x", "strict": "true", "schema": {"type": "object"}}})
@@ -546,8 +589,8 @@ class Structured(unittest.TestCase):
             for fmt in formats:
                 with self.subTest(fmt=fmt):
                     self.assertEqual(self.chat(response_format=fmt)[0], 400)
-            self.assertEqual(self.chat(tools=[{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])[0], 400)
-            self.assertEqual(self.chat(strata_mcp=True)[0], 400)
+            self.assertEqual(self.chat(tools=[{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}])[0], 200)
+            self.assertEqual(self.chat(strata_mcp=True)[0], 200)
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             # A 400 is still a 400 whatever the engine did (D-069).  What this pins is the shape check: the body
             # that is not an object at all is refused by `_post` before the route runs, so the load count is one

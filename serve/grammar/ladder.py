@@ -1,8 +1,6 @@
 """The compile ladder: what to do when the grammar compiler refuses a client's JSON schema.
 
-The spec is `tmp/impl-plan/ladder-design.md`; the messages and the offset arithmetic are measured in
-`tmp/research/ladder-probe.md`, and the classes they belong to are tabulated in
-`tmp/research/llg-error-taxonomy.md`.  This module is data in and data out: it never loads the library, opens
+This module is data in and data out: it never loads the library, opens
 a file, imports `matcher`, or logs.  The caller hands it a compiler as `compile_text(payload) -> str | None`
 that returns `None` when the text compiles and the library's message when it does not, so the whole loop can be
 tested without a `.so`, a pack or a server.
@@ -115,6 +113,7 @@ class Step:
     cls: str
     pointer: str | None
     note: str
+    scope: str = "response"
 
 
 @dataclass(frozen=True)
@@ -154,12 +153,12 @@ _INVALID_PHRASES = (" must be ", "expected ")
 # `minLength (4294967296) exceeds the supported range` is the same limit, spelled in the present tense.
 _RESOURCE_PHRASES = ("schema too large", "exceeded", "exceeds", "too many")
 
-# Envelope B's one repairable message (probe §9): serde_json's nesting limit, which reports an exact column and
+# Envelope B's one repairable message: serde_json's nesting limit, which reports an exact column and
 # so can be collapsed at the offending node.  Every other parse failure is our own serialization going wrong and
 # stays terminal.
 _RECURSION_LIMIT = "recursion limit exceeded"
 
-# Unsupported messages from `tmp/research/llg-error-taxonomy.md` §1.1 that the design's table does not prefix.
+# Additional unsupported messages recognized by the classifier.
 _EXTRA_UNSUPPORTED = (
     "oneOf constraints are not supported",
     "circular references with sibling keys are not supported",

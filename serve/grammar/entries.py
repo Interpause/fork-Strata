@@ -85,7 +85,11 @@ def resolve_entry(tail: str, tools: list[dict[str, Any]] | None = None,
         raise UnresolvedTail("the prompt ends in no state the grammar has an entry for")
 
     if tools:
-        return f"entry_{phase}_tools_required" if required else f"entry_{phase}_tools"
+        if required:
+            return f"entry_{phase}_tools_required"
+        if schema is not None:
+            return f"entry_{phase}_json_tools"
+        return f"entry_{phase}_tools"
     if required:
         raise UnresolvedTail("tool_choice requires a call but the request declared no tools",
                              reason="required_without_tools")

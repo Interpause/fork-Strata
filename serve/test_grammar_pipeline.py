@@ -73,6 +73,12 @@ class Shapes(unittest.TestCase):
                                  f"entry_{phase}_tools")
                 self.assertEqual(self.p.for_request(*request(tail, tools=[WEATHER], required=True)).entry,
                                  f"entry_{phase}_tools_required")
+                self.assertEqual(self.p.for_request(*request(tail, tools=[WEATHER], schema=SCHEMA)).entry,
+                                 f"entry_{phase}_json_tools")
+                # A required call has no tool-free final-answer branch, so the schema cannot add a competing path.
+                self.assertEqual(self.p.for_request(*request(tail, tools=[WEATHER], schema=SCHEMA,
+                                                             required=True)).entry,
+                                 f"entry_{phase}_tools_required")
                 self.assertEqual(self.p.for_request(*request(tail, schema=SCHEMA)).entry, f"entry_{phase}_json")
 
     def test_a_prompt_that_ends_nowhere_is_an_error(self):
@@ -314,6 +320,18 @@ class Ladder(unittest.TestCase):
         self.assertEqual((g.repairs[0].rung, g.repairs[0].cls), (2, "unsupported"))
         self.assertIn("search", g.repairs[0].note)
         self.assertIn("'q'", g.repairs[0].note)
+        self.assertIsNone(self.v.compile_error(g.text))
+
+    def test_tool_parameter_and_response_schema_repairs_both_run_with_combined_entry(self):
+        p = pl.Pipeline(Stub(), compiler=self.v)
+        g = p.for_entry("entry_answer_json_tools", tools=[BAD_TOOL], schema=LOOKAHEAD)
+        self.assertEqual(g.entry, "entry_answer_json_tools")
+        self.assertEqual(g.tools[0]["function"]["parameters"]["properties"]["q"], {"type": "string"})
+        self.assertIn('param_t0_search_0: "<parameter=q>\\n" raw_param_end', g.text)
+        self.assertNotIn('"pattern"', g.text)
+        self.assertEqual([(step.rung, step.cls) for step in g.repairs],
+                         [(2, "unsupported"), (2, "unsupported")])
+        self.assertIn("parameter 'q'", g.repairs[0].note)
         self.assertIsNone(self.v.compile_error(g.text))
 
     def test_a_repaired_pattern_string_decodes_through_the_structure_parser(self):
