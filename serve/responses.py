@@ -475,7 +475,7 @@ class Assembler:
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
-        self.json_text = []                          # structured output: the answer, held until it is checked
+        self.json_text = []                          # structured output: a validation copy of streamed JSON bytes
         self.called = False                          # a tool call was made: this turn is not the final answer
         reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
         self.response = {
@@ -567,10 +567,8 @@ class Assembler:
         elif kind == "content":
             if not ev.text:
                 return out
-            if self.json_mode:                       # sent once it is checked (finish)
-                out += self.close()
+            if self.json_mode:
                 self.json_text.append(ev.text)
-                return out
             if self.item is None or self.item["type"] != "message":
                 out += self.close()
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
@@ -609,27 +607,12 @@ class Assembler:
             out += self.close()
         return out
 
-    def _release(self, text: str) -> list[dict]:
-        """A held structured answer (or the words written beside a tool call) as one message item."""
-        if not text.strip():
-            return []
-        out = self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
-                          "content": []})
-        self.item["content"][0]["text"] = text
-        out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                              content_index=0, delta=text, logprobs=[]))
-        return out + self.close()
-
     def _call_started(self) -> list[dict]:
-        """The first tool call of a JSON-format turn: this turn is not the final answer, so what the model wrote
-        before the call goes out as it is, ahead of the call, and the schema is checked on the turn that ends in
-        text (#782)."""
-        out = []
+        """Start a tool item after any preceding text has already been streamed."""
         if self.json_mode and not self.called:
-            out = self._release("".join(self.json_text))
             self.json_text = []
         self.called = True
-        return out
+        return []
 
     def _call_item(self, ev: Event) -> dict:
         namespace, name, kind = self.names.get(ev.call.name, (None, ev.call.name, "function"))
@@ -644,26 +627,22 @@ class Assembler:
         return item
 
     def finish(self, done: dict, validate=None, notice=None) -> list[dict]:
-        """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
-        `validate(text, finish)` checks a structured answer and returns its text (or raises).
-        `notice`: a dict `validate` fills when it delivers an answer that misses the schema as sent; it is written
-        onto the response, so a client that only reads the finished object learns what the server already logged
-        (D-071)."""
+        """Close the open item and emit a completed, incomplete, or failed terminal response.
+
+        `validate(text, finish)` checks a complete structured answer. `notice` carries the grammar's repair steps
+        and, for a relaxed schema mismatch, the pointer and violation (D-071)."""
         finish = done.get("finish")
         length = finish == "length"
         cancelled = finish == "cancel"
         # a call still open was cut off (its tool_call never came, #211): incomplete, whatever the finish
         unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
-        out = self.close("incomplete" if length or cancelled or unfinished else "completed")
-        # A cancelled schema turn has no complete answer to validate or release. Keep the
-        # partial work marked incomplete and let the response status carry the outcome.
-        if self.json_mode and not cancelled:
+        if self.json_mode and not length and not cancelled and not self.called:
             text = "".join(self.json_text)
-            self.json_text = []
-            if self.called:
-                out += self._release(text)           # beside a tool call: as written (#782)
-            else:
-                out += self._release(validate(text, done.get("finish")))
+            validate(text, finish)
+        out = self.close("incomplete" if length or cancelled or unfinished else "completed")
+        # JSON deltas are already in their message item. A length stop keeps the exact prefix there
+        # and closes the item as incomplete; only a complete stop reaches validation above.
+        self.json_text = []
         if notice:                                   # D-071: one key, only when the schema was honoured relaxed
             self.response["strata_schema_relaxed"] = dict(notice)
         n = done.get("completion_tokens", 0)

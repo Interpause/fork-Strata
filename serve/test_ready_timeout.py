@@ -63,7 +63,7 @@ class ReadyTimeout(unittest.TestCase):
         # The scripted engine prints no INFO line (so it claims no grammar) and answers with a bare token: this
         # module is about the READY timeout, not the reply, so the entry the one reader (`StructureParser`) decodes
         # with is supplied directly.
-        svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
+        svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", (), None)
         return svc
 
     def post(self, base):

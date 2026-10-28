@@ -70,6 +70,68 @@ LOOKAHEAD_FORMAT = {"type": "json_schema", "json_schema": {"name": "look", "sche
 RELAXED_LINE = "was relaxed to compile"
 
 
+class StructuredStreamUnit(unittest.TestCase):
+    def test_structured_stream_forwards_json_before_the_source_finishes_and_preserves_bytes(self):
+        exact = ' { "a" : 1 }\n'
+
+        class Validator:
+            finished_at_validation = None
+
+            def iter_errors(self, value):
+                self.finished_at_validation = source.finished
+                return iter(())
+
+        def chunk(delta, finish=None):
+            return {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+        class Source:
+            def __init__(self):
+                self.finished = False
+
+            def __iter__(self):
+                yield chunk({"role": "assistant", "content": ""})
+                yield chunk({"content": exact[:5]})
+                self.finished = True
+                yield chunk({"content": exact[5:]})
+                yield chunk({}, "stop")
+
+            def close(self):
+                pass
+
+        source = Source()
+        validator = Validator()
+        stream = server_module.structured_chunks(source, validator)
+        next(stream)                                  # role
+        first_json = next(stream)
+        self.assertEqual(first_json["choices"][0]["delta"]["content"], exact[:5])
+        self.assertFalse(source.finished)
+        sent = [first_json]
+        sent.extend(stream)
+        text = "".join(c["choices"][0]["delta"].get("content", "") for c in sent)
+        self.assertEqual(text, exact)
+        self.assertTrue(validator.finished_at_validation)
+
+    def test_schema_stream_without_a_terminal_chunk_fails_instead_of_ending_normally(self):
+        chunk = {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m",
+                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
+
+        class Source:
+            def __iter__(self):
+                yield chunk
+
+            def close(self):
+                pass
+
+        class Validator:
+            def iter_errors(self, value):
+                return iter(())
+
+        with self.assertRaisesRegex(ValueError, "without a completion"):
+            list(server_module.structured_chunks(Source(), Validator()))
+
+
 class Structured(unittest.TestCase):
     def request(self, path, body=None, headers=None):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
@@ -302,7 +364,7 @@ class Structured(unittest.TestCase):
         self.assertIn("reasoning_content", raw)
         self.assertIn("data: [DONE]", raw)
 
-    def test_invalid_generation_is_an_error_and_never_streams_content(self):
+    def test_invalid_generation_is_an_error_after_streaming_its_content(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             for script in ("## Film Plan - Photobooth", '{"title":"Only a title"}',
@@ -314,7 +376,7 @@ class Structured(unittest.TestCase):
                     self.assertEqual(reply["error"]["code"], "structured_output_failed")
                     _, raw = self.chat(script, stream=True)
                     self.assertIn('"structured_output_failed"', raw)
-                    self.assertNotIn('"delta"', raw)
+                    self.assertIn('"delta"', raw)      # schema-constrained bytes are forwarded as generated
                     self.assertIn("data: [DONE]", raw)
         # D-068's negative half: STORY_SCHEMA compiles as written, so a reply that misses it is still a 502 and no
         # relaxed warning is printed - the warning is for a mismatch the ladder itself made possible.
@@ -323,6 +385,10 @@ class Structured(unittest.TestCase):
     def test_object_mode_strict_json_and_truncation(self):
         fmt = {"type": "json_object"}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
+        raw_json = ' { "answer" : 4 }\n'
+        code, reply = self.chat(raw_json, response_format=fmt)
+        self.assertEqual(code, 200)
+        self.assertEqual(reply["choices"][0]["message"]["content"], raw_json)
         for script in ('[]', '{"x":NaN}', '{"x":1,"x":2}', '{"x":1e999}', 'no json at all', '{"x":'):
             self.assertEqual(self.chat(script, response_format=fmt)[0], 502)
         # A schema reply is one `%json` value produced under the grammar, so the text that arrives *is* the JSON:
@@ -330,7 +396,16 @@ class Structured(unittest.TestCase):
         # (D-068, which deleted the fence-and-brace text reader).
         for script in ('```json\n{}\n```', 'Here it is: {"answer":4} - done'):
             self.assertEqual(self.chat(script, response_format=fmt)[0], 502, script)
-        self.assertEqual(self.chat('{"answer":4}', response_format=fmt, max_tokens=5)[0], 502)
+        code, reply = self.chat('{"answer":4}', response_format=fmt, max_tokens=5)
+        self.assertEqual(code, 200)
+        self.assertEqual(reply["choices"][0]["finish_reason"], "length")
+        prefix = reply["choices"][0]["message"]["content"]
+        self.assertTrue(prefix)
+        code, raw = self.chat('{"answer":4}', response_format=fmt, max_tokens=5, stream=True)
+        self.assertEqual(code, 200)
+        chunks = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "length")
+        self.assertEqual("".join(c["choices"][0]["delta"].get("content", "") for c in chunks), prefix)
         # Plain text callers retain normal streaming, without a JSON validation gate.
         self.assertEqual(self.chat("Prose.", response_format={"type": "text"})[0], 200)
 
@@ -358,6 +433,11 @@ class Structured(unittest.TestCase):
         notice = reply["choices"][0]["message"]["strata_schema_relaxed"]
         self.assertEqual(notice["at"], "/q")
         self.assertIn("^x(?=y)", notice["error"])
+        expected_repairs = [
+            {"rung": step.rung, "cls": step.cls, "pointer": step.pointer, "note": step.note}
+            for step in repairs
+        ]
+        self.assertEqual(notice["repairs"], expected_repairs)
         # The same notice reaches a streaming client, on the chunk that carries finish_reason - there is no other
         # chunk a client is already reading at the end of a reply.
         _, raw = self.chat('{"q":"xz"}', response_format=LOOKAHEAD_FORMAT, stream=True)
@@ -395,6 +475,46 @@ class Structured(unittest.TestCase):
         completed = [e for e in events if e.get("type") == "response.completed"]
         self.assertEqual(len(completed), 1, raw)
         self.assertEqual(completed[0]["response"]["strata_schema_relaxed"], reply["strata_schema_relaxed"])
+
+        self.engine = self.svc.engine = MockEngine(self.tok, '{"q":"xy"}', max_context=16384)
+        code, conforming = self.responses(text={"format": {"type": "json_schema", "name": "look", "strict": True,
+                                                            "schema": LOOKAHEAD_SCHEMA}})
+        self.assertEqual(code, 200, conforming)
+        self.assertEqual(conforming["strata_schema_relaxed"]["repairs"], reply["strata_schema_relaxed"]["repairs"])
+        self.assertNotIn("at", conforming["strata_schema_relaxed"])
+        self.assertNotIn("error", conforming["strata_schema_relaxed"])
+
+    def test_a_conforming_reply_still_reports_the_repairs_that_widened_its_schema(self):
+        if self.svc.pipeline is None or self.svc.pipeline.compiler is None:
+            self.skipTest("needs libllguidance for the compile ladder")
+        code, reply = self.chat('{"q":"xy"}', response_format=LOOKAHEAD_FORMAT)
+        self.assertEqual(code, 200, reply)
+        notice = reply["choices"][0]["message"]["strata_schema_relaxed"]
+        repairs = self.svc.pipeline.for_entry("entry_answer_json", None, LOOKAHEAD_SCHEMA).repairs
+        self.assertEqual(notice["repairs"], [
+            {"rung": step.rung, "cls": step.cls, "pointer": step.pointer, "note": step.note}
+            for step in repairs
+        ])
+        self.assertNotIn("at", notice)
+        self.assertNotIn("error", notice)
+
+    def test_responses_tool_schema_repairs_are_reported(self):
+        if self.svc.pipeline is None or self.svc.pipeline.compiler is None:
+            self.skipTest("needs libllguidance for the compile ladder")
+        script = ("<tool_call>\n<function=capture>\n<parameter=q>\nxy\n</parameter>\n"
+                  "</function>\n</tool_call>")
+        self.engine = self.svc.engine = MockEngine(self.tok, script, max_context=16384)
+        tools = [{"type": "function", "name": "capture", "parameters": LOOKAHEAD_SCHEMA}]
+        code, reply = self.responses(tools=tools)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(reply["status"], "completed")
+        self.assertEqual(reply["output"][0]["type"], "function_call")
+        normalized, _, _ = server_module.responses_api.request_tools({"tools": tools})
+        repairs = self.svc.pipeline.for_entry("entry_answer_tools", normalized, None).repairs
+        self.assertEqual(reply["strata_schema_relaxed"]["repairs"], [
+            {"rung": step.rung, "cls": step.cls, "pointer": step.pointer, "note": step.note}
+            for step in repairs
+        ])
 
     def test_rejected_schema_warms_the_model_and_does_not_retry(self):
         # D-069: the refusal comes after the load, so the next request finds the model warm; what must not happen

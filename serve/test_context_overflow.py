@@ -27,7 +27,7 @@ class ContextOverflow(unittest.TestCase):
         # `post()` patches `encode_prompt` to an arbitrary number of `x` ids: the prompt this module is about is a
         # size, not a rendered template, so no grammar entry resolves and none is wanted - the entry the one reader
         # (`StructureParser`) decodes with is supplied directly.  The 400 cases never reach `_run`.
-        cls.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
+        cls.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", (), None)
         cls.httpd = serve(cls.svc, port=0)
         cls.port = cls.httpd.server_address[1]
 

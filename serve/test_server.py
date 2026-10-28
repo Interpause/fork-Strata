@@ -21,12 +21,13 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import (ChatTemplate, Event, literal_tags, mark_think_literals,  # noqa: E402
+from serve.frontend import (ChatTemplate, Event, ToolCall, literal_tags, mark_think_literals,  # noqa: E402
                             unmark_think_literals)
+from serve.grammar.ladder import Step  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
-                          prompt_tokens_seen, anthropic_events, openai_chunks,
+                          prompt_tokens_seen, _append_grammar_repairs, anthropic_collect, anthropic_events, openai_chunks,
                           request_stats, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
@@ -37,11 +38,23 @@ ANSWER = "xy" * 1000                             # longer than the old 1024 fall
 
 # `_run` has one reader (`StructureParser`) and `begin_grammar` never returns None, so a test whose ids are not a
 # template tail supplies the entry itself.  The file name is never read: the mock engine makes no grammar of its own.
-FAKE_ANSWER_GRAMMAR = ("strata-test.lark", "entry_answer", False)
-FAKE_THINK_GRAMMAR = ("strata-test.lark", "entry_think", False)
+FAKE_ANSWER_GRAMMAR = ("strata-test.lark", "entry_answer", (), None)
+FAKE_THINK_GRAMMAR = ("strata-test.lark", "entry_think", (), None)
 
 
 class CompletionCancellation(unittest.TestCase):
+    def test_grammar_repairs_accumulate_uniquely_across_rounds(self):
+        state = {}
+        first = Step(2, "unsupported", "/properties/q/pattern", "dropped pattern")
+        second = Step(3, "unsupported", "/properties/n/minimum", "dropped minimum")
+        _append_grammar_repairs(state, [first])
+        _append_grammar_repairs(state, [first, second])
+        self.assertTrue(state["relaxed"])
+        self.assertEqual(state["repairs"], [
+            {"rung": 2, "cls": "unsupported", "pointer": "/properties/q/pattern", "note": "dropped pattern"},
+            {"rung": 3, "cls": "unsupported", "pointer": "/properties/n/minimum", "note": "dropped minimum"},
+        ])
+
     def services(self):
         sequence = iter([("event", Event("content", "partial")),
                          ("done", {"finish": "cancel", "completion_tokens": 1, "prompt_tokens": 2})])
@@ -81,6 +94,24 @@ class CompletionCancellation(unittest.TestCase):
         names = [name for name, _ in events if name is not None]
         self.assertNotIn("message_delta", names)
         self.assertNotIn("message_stop", names)
+
+    def test_anthropic_tool_grammar_repairs_reach_stream_and_collected_message(self):
+        repairs = [{"rung": 2, "cls": "unsupported", "pointer": "/properties/q/pattern", "note": "dropped"}]
+
+        class Svc:
+            def model_for(self, req):
+                return "m"
+
+            def run(self, *args, **kwargs):
+                return iter([("event", Event("tool_call", call=ToolCall("capture", {"q": "xy"}))),
+                             ("done", {"finish": "stop", "completion_tokens": 2, "prompt_tokens": 3})])
+
+        state = {"repairs": repairs}
+        events = list(anthropic_events(Svc(), {}, [1, 2, 3], False, [{"name": "capture"}], 10,
+                                       threading.Event(), grammar_state=state))
+        delta = next(e for name, e in events if name == "message_delta")
+        self.assertEqual(delta["strata_schema_relaxed"], {"repairs": repairs})
+        self.assertEqual(anthropic_collect(events)["strata_schema_relaxed"], {"repairs": repairs})
 
 
 class RecordingEngine(MockEngine):
@@ -3337,14 +3368,13 @@ class UsageAndStatus(unittest.TestCase):
         The decoder that decides a structured answer's shape is the grammar the schema is spliced into, and D-030
         leaves no unconstrained path, so `method` and `constrained_decoding` now say what the code does.  The
         assertion is here rather than in `test_v1_status` because it pins new fields, not old ones.  `stream_buffered`
-        stays true: a declared schema's stream is held so the finished answer can be validated whole, and a reply
-        that misses a schema the ladder had to relax is delivered with a `strata_schema_relaxed` notice (D-068,
-        D-071) rather than being forwarded unvalidated.
+        is false: schema-constrained JSON is forwarded as generated and validated at the terminal chunk. A reply
+        that misses a schema the ladder had to relax carries a `strata_schema_relaxed` notice (D-068, D-071).
         """
         s = json.loads(self.request("/v1/status")[1])
         self.assertEqual(s["structured_output"],
                          {"formats": ["json_object", "json_schema"], "method": "grammar",
-                          "constrained_decoding": True, "stream_buffered": True})
+                          "constrained_decoding": True, "stream_buffered": False})
 
     def test_no_clock(self):
         """An engine without a clock (MockEngine): no timings, nothing cached."""

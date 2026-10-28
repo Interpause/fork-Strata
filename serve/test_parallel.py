@@ -328,7 +328,7 @@ class ParallelService(unittest.TestCase):
         # The fake engine below is byte-level: its reply is its own bytes (`ok, done.` then the byte tokenizer's
         # end id), not the tokens a grammar constrains, and what this module is about is the slots.  The entry the
         # one reader (`StructureParser`) decodes with is supplied directly.
-        self.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", False)
+        self.svc.begin_grammar = lambda *a, **k: ("strata-test.lark", "entry_answer", (), None)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import responses  # noqa: E402
-from serve.frontend import ChatTemplate  # noqa: E402
+from serve.frontend import ChatTemplate, Event, ToolCall  # noqa: E402
 from serve.responses import (ENCRYPTED_PREFIX, ResponsesError, collect, input_messages, prompt_made,  # noqa: E402
                              prompt_tools, request_tools, template_kwargs, text_format, thread_title_events)
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
@@ -32,16 +32,19 @@ TOOLS = [{"type": "function", "name": "exec_command", "description": "Runs a com
 
 # ------------------------------------------------------------------------------------------------ parsing
 class Parsing(unittest.TestCase):
-    def test_cancelled_schema_output_is_incomplete_without_validation_or_release(self):
+    def test_cancelled_schema_output_keeps_streamed_prefix_without_releasing_or_validating_again(self):
         asm = responses.Assembler({}, "m", 3, {}, False, json_mode=True)
-        asm.json_text = ['{"partial":']
+        partial = '{"partial":'
+        emitted = asm.feed(Event("content", partial))
+        self.assertEqual([e["delta"] for e in emitted if e["type"] == "response.output_text.delta"], [partial])
         events = asm.finish({"finish": "cancel", "completion_tokens": 2})
         final = events[-1]
         self.assertEqual(final["type"], "response.failed")
         self.assertEqual(final["response"]["status"], "failed")
         self.assertEqual(final["response"]["error"]["code"], "server_error")
         self.assertIsNone(final["response"]["incomplete_details"])
-        self.assertEqual(final["response"]["output"], [])
+        self.assertEqual(final["response"]["output"][0]["content"][0]["text"], partial)
+        self.assertEqual(final["response"]["output"][0]["status"], "incomplete")
         self.assertNotIn("response.completed", [e["type"] for e in events])
 
     def test_cancelled_open_message_is_closed_as_incomplete(self):
@@ -64,6 +67,28 @@ class Parsing(unittest.TestCase):
         self.assertEqual(events[-1]["response"]["status"], "incomplete")
         self.assertIsNone(events[-1]["response"]["incomplete_details"])
         self.assertEqual(events[-1]["response"]["output"][0]["status"], "incomplete")
+
+    def test_schema_length_preserves_partial_text_and_marks_its_item_incomplete(self):
+        partial = ' { "n" :'
+        asm = responses.Assembler({}, "m", 3, {}, False, json_mode=True)
+        emitted = asm.feed(Event("content", partial))
+        self.assertEqual([e["delta"] for e in emitted if e["type"] == "response.output_text.delta"], [partial])
+        events = asm.finish({"finish": "length", "completion_tokens": 5},
+                            validate=lambda *_: self.fail("a truncated JSON prefix must not be validated"))
+        final = events[-1]
+        self.assertEqual(final["type"], "response.incomplete")
+        self.assertEqual(final["response"]["incomplete_details"], {"reason": "max_output_tokens"})
+        self.assertEqual(final["response"]["output"][0]["status"], "incomplete")
+        self.assertEqual(final["response"]["output"][0]["content"][0]["text"], partial)
+        item_done = [e for e in events if e["type"] == "response.output_item.done"]
+        self.assertEqual(item_done[-1]["item"]["status"], "incomplete")
+
+    def test_json_tool_turn_does_not_reemit_pre_tool_content(self):
+        asm = responses.Assembler({}, "m", 3, {}, False, json_mode=True)
+        content = asm.feed(Event("content", '{"draft":1}'))
+        tool = asm.feed(Event("tool_start", call=ToolCall("f", {}, "c1")))
+        deltas = [e["delta"] for e in content + tool if e["type"] == "response.output_text.delta"]
+        self.assertEqual(deltas, ['{"draft":1}'])
 
     def test_a_string_input_is_one_user_message(self):
         self.assertEqual(input_messages({"input": "hi", "instructions": "Be brief."}),
@@ -502,9 +527,10 @@ class OverHttp(Server):
                "schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}
         code, r = self.post({"model": "m", "input": "a number", "text": {"format": fmt}})
         self.assertEqual(code, 200, r)
-        self.assertEqual(r["output"][-1]["content"][0]["text"], "{\"n\":3}")
+        self.assertEqual(r["output"][-1]["content"][0]["text"], "{\"n\": 3}")
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": fmt}, "stream": True})
-        self.assertEqual([e["delta"] for e in events if e["type"] == "response.output_text.delta"], ["{\"n\":3}"])
+        self.assertEqual("".join(e["delta"] for e in events if e["type"] == "response.output_text.delta"),
+                         "{\"n\": 3}")
         self.assertEqual(events[-1]["type"], "response.completed")
         # an answer that fails the schema: jsonschema is a dependency, so the reply check always runs
         bad = {**fmt, "schema": {**fmt["schema"], "properties": {"n": {"type": "string"}}}}
@@ -513,6 +539,7 @@ class OverHttp(Server):
         code, events = self.post({"model": "m", "input": "a number", "text": {"format": bad}, "stream": True})
         self.assertEqual(events[-1]["type"], "response.failed")
         self.assertEqual(events[-1]["response"]["error"]["code"], "structured_output_failed")
+        self.assertTrue([e for e in events if e["type"] == "response.output_text.delta"])
 
     def test_monitor_and_status(self):
         self.svc.api_monitor = True
@@ -703,9 +730,9 @@ class CodexCompactionOverHttp(Server):
         self.parser_tools = []
         run = self.svc.run
 
-        def recorded(ids, thinking, tools, *rest):
+        def recorded(ids, thinking, tools, *rest, **kwargs):
             self.parser_tools.append(tools)
-            return run(ids, thinking, tools, *rest)
+            return run(ids, thinking, tools, *rest, **kwargs)
         self.svc.run = recorded
 
     def compaction(self, meta, output="before", between=None, **extra):

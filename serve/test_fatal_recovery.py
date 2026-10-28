@@ -48,7 +48,7 @@ class FatalRecovery(unittest.TestCase):
         # The scripted engine prints no INFO line, and the requests here are bare ids answered with one token: this
         # module is about a native ERR killing the process, not about the reply, so the entry the one reader
         # (`StructureParser`) decodes with is supplied directly.
-        svc.begin_grammar=lambda *a,**k:("strata-test.lark","entry_answer",False)
+        svc.begin_grammar=lambda *a,**k:("strata-test.lark","entry_answer",(),None)
         return svc
     def wait_dead(self,e):
         end=time.monotonic()+2

@@ -27,6 +27,7 @@ import argparse
 import atexit
 import contextlib
 import collections
+from dataclasses import asdict
 import base64
 import hashlib
 import hmac
@@ -3391,6 +3392,16 @@ def fence_ban_ids(tokenizer) -> tuple[int, ...]:
     return tuple(sorted(ids))
 
 
+def _append_grammar_repairs(state, repairs):
+    """Keep the distinct repair steps seen across generation rounds and grammar continuations."""
+    recorded = state.setdefault("repairs", [])
+    for step in repairs:
+        item = asdict(step)
+        if item not in recorded:
+            recorded.append(item)
+    state["relaxed"] = bool(recorded)
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -4152,11 +4163,10 @@ class Service:
             # engine compiles (`serve/grammar/build.py`), so the reply is a mask-shaped value rather than text that is
             # checked afterwards.  `constrained_decoding` is true of every request this server serves, because D-030
             # leaves no unconstrained path - a server without a grammar refuses the request instead of falling back.
-            # `stream_buffered` stays true for a declared schema: `structured_chunks` holds the stream so the finished
-            # answer can be validated whole, and a reply that misses a schema the ladder had to relax is delivered
-            # with a `strata_schema_relaxed` notice rather than forwarded unvalidated (D-068, D-071).
+            # Schema streams are forwarded as generated and validated at the terminal chunk. A reply that misses a
+            # schema the ladder had to relax is delivered with a `strata_schema_relaxed` notice (D-068, D-071).
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",
-                                  "constrained_decoding": True, "stream_buffered": True},
+                                  "constrained_decoding": True, "stream_buffered": False},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -4471,7 +4481,7 @@ class Service:
             Path(path).unlink(missing_ok=True)
 
     def begin_grammar(self, ids, tools, required, sampling):
-        """-> (the file the engine reads, the entry rule it was built for, whether the ladder relaxed the schema).
+        """-> (the file the engine reads, the entry rule, its repair steps, and effective decode tools).
         Never None: it raises otherwise.
 
         The grammar follows from the prompt's own tail, so it is built here rather than in prepare(): the file is
@@ -4481,9 +4491,9 @@ class Service:
         reasoning tail.  Nothing is written into the prompt for it: with a grammar the entry already offers the call,
         and a token prefix inside a name (`<function=get`) is a tail no entry resolves (D-044).
 
-        The third element is whether `Grammar.repairs` is non-empty, i.e. whether the ladder had to relax something to
-        make the text compile (D-068).  The reply's conformance check reads it: a relaxed grammar may legitimately
-        accept an answer the original schema rejects, so that mismatch is a warning rather than a 502.
+        The third element is `Grammar.repairs`: the exact steps the ladder applied to make the text compile (D-068).
+        The reply's conformance check reads whether it is non-empty, and the response carries the steps so clients
+        know which constraints were widened.
 
         Nothing is compiled here: the engine compiles the text once per request and no matcher comes back, so a path is
         all there is to return (D-038).
@@ -4530,7 +4540,7 @@ class Service:
         except ValueError as e:
             raise grammar_pipeline.GrammarUnavailable(
                 f"the grammar file name is unusable: {e}", status=500) from None
-        return str(path), grammar.entry, bool(grammar.repairs), grammar.tools
+        return str(path), grammar.entry, grammar.repairs, grammar.tools
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -4591,8 +4601,8 @@ class Service:
              ) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` is `frontend.forced_choice`'s value, read only by grammar_tools and begin_grammar.
-        `grammar_state`: a dict the caller owns, filled before the first yield with whether the ladder had to relax
-        this request's schema to make it compile ("relaxed"), which the reply's conformance check reads (D-068)."""
+        `grammar_state`: a dict the caller owns, filled before the first yield with whether the ladder relaxed a
+        schema and the exact repair steps, which validation and response metadata read (D-068)."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -4657,12 +4667,12 @@ class Service:
         gfiles = []                                     # the request's grammar files, dropped in the finally
         try:
             grammar = self.begin_grammar(ids, gtools, force, sampling)
-            gfile, gentry, relaxed, decode_tools = grammar  # never None: begin_grammar raises instead (D-030)
+            gfile, gentry, repairs, decode_tools = grammar  # never None: begin_grammar raises instead (D-030)
             if grammar_state is not None:
                 # Set before the first yield: a caller that drains the generator only sees it if it is there when
                 # the reply is checked (D-068).  The dict belongs to the caller, so concurrent --batch requests never
                 # share one.
-                grammar_state["relaxed"] = relaxed
+                _append_grammar_repairs(grammar_state, repairs)
             gfiles.append(gfile)                        # D-045: a continuation pass holds a grammar of its own
             sampling = {**(sampling or {}), "strata_grammar": gfile}
             # D-067: with the grammar, the ids a code fence hides.  A tokenizer that resolves none sends none.
@@ -4927,7 +4937,7 @@ class Service:
                                 # pass explains a mismatch with the schema as sent.  (The same shape usually repairs
                                 # the same way - the cache is by shape - but the flag must not depend on that.)
                                 if grammar_state is not None and cont[2]:
-                                    grammar_state["relaxed"] = True
+                                    _append_grammar_repairs(grammar_state, cont[2])
                         print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                               flush=True)
                         for t in extra:
@@ -5344,6 +5354,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            repairs = (grammar_state or {}).get("repairs")
+            if repairs:
+                last["strata_schema_relaxed"] = {"repairs": repairs}
             yield last
 
 
@@ -5398,41 +5411,48 @@ def openai_collect(chunks) -> dict:
     return out
 
 
-def structured_chunks(chunks, validator, relaxed=None):
-    """Buffer structured streams so a client never receives unvalidated content.
+def structured_chunks(chunks, validator, relaxed=None, cancelled=None):
+    """Forward schema-constrained JSON as generated and validate its full text at the terminal chunk.
 
     `relaxed`: passed to `validated_json`, so a reply that misses a schema the ladder had to relax is delivered with
     one warning instead of a 502 (D-068) - and, on the last chunk of the stream, a `strata_schema_relaxed` notice
-    naming the pointer and the violation, which `openai_collect` then carries into the non-streamed reply's message
-    (D-071).  A stream whose answer did fit the schema, or whose schema needed no repair, carries neither."""
+    with the actual repair steps and, on a mismatch, its pointer and violation; `openai_collect` carries it into the
+    non-streamed reply's message (D-071). Only the final chunk is held for validation; content chunks retain their
+    original bytes and are sent before generation finishes."""
     buffered = []
     notice = {}
-    heartbeat = time.monotonic()
+    terminal = None
     try:
         for chunk in chunks:
             progress = chunk is not None and "prompt_progress" in chunk
             if chunk is not None and not progress:
-                buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
-            if chunk is None or progress or time.monotonic() - heartbeat >= 1:
-                heartbeat = time.monotonic()
-                yield chunk if progress else None
+                buffered.append(chunk)
+                finish = chunk["choices"][0].get("finish_reason")
+                if finish is not None:
+                    terminal = chunk
+                    continue
+            yield chunk
+        if terminal is None:
+            if cancelled is None or not cancelled():
+                raise ValueError("response generation ended without a completion")
+            return
         result = openai_collect(buffered)
         choice = result["choices"][0]
-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"], relaxed=relaxed,
-                                 notice=notice)
-        yield buffered[0]
-        delta = {"content": content}
-        if choice["message"].get("reasoning_content"):
-            delta["reasoning_content"] = choice["message"]["reasoning_content"]
-        yield {**buffered[0], "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-        last = buffered[-1]                 # the chunk that carries the finish_reason: the notice rides beside it
-        yield {**last, "strata_schema_relaxed": dict(notice)} if notice else last
+        existing = choice["message"].get("strata_schema_relaxed")
+        if existing:
+            notice.update(existing)
+        if choice["finish_reason"] != "length":
+            validated_json(choice["message"]["content"], validator, choice["finish_reason"], relaxed=relaxed,
+                           notice=notice)
+        if notice:
+            terminal = {**terminal, "strata_schema_relaxed": dict(notice)}
+        yield terminal
     finally:
         chunks.close()
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, grammar_state=None):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -5443,7 +5463,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, grammar_state=grammar_state):
         if kind == "ping":
             yield None
             continue
@@ -5501,10 +5521,14 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             # prompt token is always read, and Claude Code takes an input_tokens of 0 as "not given" and keeps
             # message_start's whole prompt beside cache_read_input_tokens: the prompt counted twice (#1013)
             reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
-                                                                       "stop_sequence": x.get("stop_sequence")},
-                                    "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
+            delta = {"type": "message_delta", "delta": {"stop_reason": stop,
+                                                            "stop_sequence": x.get("stop_sequence")},
+                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
+                               "output_tokens": x["completion_tokens"]}}
+            repairs = (grammar_state or {}).get("repairs")
+            if repairs:
+                delta["strata_schema_relaxed"] = {"repairs": repairs}
+            yield "message_delta", delta
             yield "message_stop", {"type": "message_stop"}
 
 
@@ -5536,6 +5560,8 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+            if e.get("strata_schema_relaxed"):
+                msg["strata_schema_relaxed"] = e["strata_schema_relaxed"]
     if msg is None or msg.get("stop_reason") is None:
         raise ValueError("response generation ended without a completion")
     msg["content"] = blocks
@@ -6437,7 +6463,8 @@ def make_handler(svc: Service):
                                    grammar_state=grammar_state)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator,
-                                           relaxed=lambda: grammar_state.get("relaxed", False))
+                                           relaxed=lambda: grammar_state.get("relaxed", False),
+                                           cancelled=lambda: cancel.is_set())
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
@@ -6526,6 +6553,8 @@ def make_handler(svc: Service):
                     elif kind == "done":
                         done = x
                 if done is not None:
+                    if grammar_state.get("repairs"):
+                        notice["repairs"] = grammar_state["repairs"]
                     yield from asm.finish(done, check, notice=notice)
             items = self._capture(events(), "responses")
             if not req.get("stream"):
@@ -6685,7 +6714,9 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            grammar_state = {}
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force,
+                                      grammar_state=grammar_state)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))

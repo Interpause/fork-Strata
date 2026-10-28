@@ -290,7 +290,7 @@ def prepare_format(response_format, messages):
 
 
 def validated_json(text, validator, finish, relaxed=None, notice=None):
-    """The reply's canonical JSON, or `StructuredOutputError`.
+    """The reply's original JSON text, or `StructuredOutputError`.
 
     `text` is parsed as it arrived: a schema reply is one `%json` value produced under the grammar, so the text that
     arrives *is* the JSON - there is no fence to strip and no first brace to find (D-068).  `relaxed` is an optional
@@ -317,7 +317,7 @@ def validated_json(text, validator, finish, relaxed=None, notice=None):
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
     try:
         value = json.loads(text, object_pairs_hook=pairs)
-        canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))  # check it can be represented
     except (ValueError, TypeError) as exc:
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
     try:
@@ -331,6 +331,6 @@ def validated_json(text, validator, finish, relaxed=None, notice=None):
                   "was relaxed to compile, so the answer is delivered as generated", flush=True)
             if notice is not None:
                 notice.update(at=path, error=error.message)
-            return canonical
+            return text
         raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
-    return canonical
+    return text
