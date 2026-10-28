@@ -947,7 +947,7 @@ __device__ int sampled_probs_warp(const float* sel_logit, int k, const SamplerPa
 /// block lists, the chain's distribution q over them, ONE draw from q with the drafter's own Philox stream
 /// (counter = the verifying row's position | kSpecCtrDraft - not the verifier's uniform), and q itself - the
 /// (token id, probability) list - into `qrow` (kSpecQStride int32: ids, -1 terminated, then float bits).  The draft's
-/// id goes to *out_id and the ring, its probability under q to *out_prob (`--spec-min-p` gates on it).
+/// id goes to *out_id and the ring, and q's top probability to *out_prob (`--spec-min-p` gates on it).
 __global__ void __launch_bounds__(32)
 spec_draft_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kpart,
                         const SamplerParams* __restrict__ dp, const int* __restrict__ step_rec,

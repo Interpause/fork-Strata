@@ -10775,7 +10775,7 @@ int main(int argc, char** argv) {
         // the path a reply is read from, so the tokenizer is *found* rather than named: the pack keeps it beside
         // its weights (`<pack>/tokenizer`), and `--grammar-tokenizer DIR` only overrides that.  A run that cannot
         // load one refuses to serve - an unconstrained reply is not a fallback, so there is nothing to fall back to
-        // (D-030, docs/DETAILS.md and tmp/impl-plan/contracts/c3-engine-step.md).
+        // (see the structured-output contract in docs/DETAILS.md).
         strata::grammar::Session grammar_session;
         std::string grammar_dir = o.grammar_tokenizer;
         if (grammar_dir.empty() && !o.pack.empty()) {
@@ -11378,7 +11378,7 @@ int main(int argc, char** argv) {
                     // Row 1 is the state advanced by the draft, because a draft row only counts when the target
                     // itself picked that token (`outb[0] == tok[1]`): `draft[0]` is then the token row 0 emitted.
                     // A draft the grammar refuses is not an error: the drafter is unconstrained.
-                    // it just cannot be kept, so the row only needs a mask when the draft is legal.
+                    // It just cannot be kept, so the row only needs a mask when the draft is legal.
                     draft_ok[a] = true;
                     if (bs[(size_t) b].match.valid()) {
                         strata::grammar::Match d = bs[(size_t) b].match.clone();
@@ -12192,8 +12192,8 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;
             bool req_bias_present = false;
-            // grammar=<file>: the Lark text the server spliced for this request (contract C1 in
-            // tmp/impl-plan/contracts/).  The engine compiles its own matcher from it; a request that asks for a
+            // grammar=<file>: the Lark text the server spliced for this request.
+            // The engine compiles its own matcher from it; a request that asks for a
             // grammar the engine cannot compile is refused rather than decoded unconstrained.
             std::string req_grammar;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
@@ -14980,7 +14980,7 @@ int main(int argc, char** argv) {
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) id) != o.eos_ids.end();
             };
             auto grammar_mask_row = [&](strata::grammar::Match& match,
-                                        const strata::grammar::FenceTracker& fence, float* bias) -> bool {
+                                        const strata::grammar::FenceTracker& fence, float* bias, bool retry_row) -> bool {
                 uint32_t words = 0;
                 const uint32_t* bits = match.mask(words);
                 if (bits == nullptr || words == 0) {
@@ -14990,9 +14990,11 @@ int main(int argc, char** argv) {
                 // The fence's ids are a separate list from `gbanned` because a fence opens and closes many times in
                 // one reply: both are rebuilt per step, and `gbanned` only ever holds this step's own refusal.
                 const bool fence_on = !req_fence.empty() && fence.open();
-                const std::vector<int32_t>* bans = &gbanned;
+                const std::vector<int32_t> no_bans;
+                const std::vector<int32_t>& retry_bans = retry_row ? gbanned : no_bans;
+                const std::vector<int32_t>* bans = &retry_bans;
                 if (fence_on) {
-                    gfence_bans.assign(gbanned.begin(), gbanned.end());
+                    gfence_bans.assign(retry_bans.begin(), retry_bans.end());
                     gfence_bans.insert(gfence_bans.end(), req_fence.begin(), req_fence.end());
                     bans = &gfence_bans;
                 }
@@ -15002,7 +15004,7 @@ int main(int argc, char** argv) {
                     // fence bans emptied is asked for once more without them.  It cannot loop - the retry carries no
                     // fence ids - and should never fire: the measured mask keeps 248,112 ids with them suppressed.
                     std::fprintf(stderr, "strata: a fence ban left no id drawable; the step was drawn without it\n");
-                    gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, gbanned, bias, n_vocab);
+                    gstop = !strata::grammar::mask_to_bias(bits, words, req_bias, retry_bans, bias, n_vocab);
                 }
                 // a fully masked row is not a sampler input: every logit at -inf makes the greedy kernel emit token 0
                 return true;
@@ -15014,7 +15016,7 @@ int main(int argc, char** argv) {
                 gterminal = -1;
                 for (int t = 0; t < T; ++t) {
                     float* row = gbias.data() + (size_t) t * (size_t) n_vocab;
-                    if (!grammar_mask_row(match, fence, row)) return false;
+                    if (!grammar_mask_row(match, fence, row, t == 0)) return false;
                     if (gstop) {
                         if (t == 0) return true;
                         // The preceding draft is legal, but there is nothing to sample after it. This dummy row
@@ -15230,6 +15232,12 @@ int main(int argc, char** argv) {
                         if (!accepted_match.consume((uint32_t) y)) {
                             // Retain the existing one-step retry for a row-zero library inconsistency. Later-row
                             // inconsistencies fail closed: banning a token at a different prefix is not a valid retry.
+                            // A one-row verifier may have committed its recurrent state in-place already.
+                            // It cannot safely rerun this window without restoring that state.
+                            if (T == 1) {
+                                std::printf("ERR grammar: refused token %d; one-row verifier state cannot safely retry\n", y);
+                                return 1;
+                            }
                             if (i != 0 || ++gretry > 1) {
                                 std::printf("ERR grammar: refused token %d (%s)\n", y, accepted_match.error().c_str());
                                 return 1;

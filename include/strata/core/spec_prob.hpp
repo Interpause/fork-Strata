@@ -39,16 +39,9 @@
 
 namespace strata::core {
 
-/// --spec-min-p gates a further draft on the drawn token's probability under q (as the coupled drafter does).
-/// STRATA_SPEC_PROB_GATE=top gates on q's top probability instead: measured on the RTX 3060 it drafts longer windows
-/// whose later guesses are kept less often, and decodes slower.
-inline bool spec_gate_pick() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_SPEC_PROB_GATE");
-        return e == nullptr || std::strcmp(e, "top") != 0;
-    }();
-    return on;
-}
+// The probability used by --spec-min-p for a probabilistic draft must depend only on q, not the sampled id.
+// MtpDrafter therefore reports q's top probability to every window-length gate.
+inline constexpr bool spec_gate_pick() { return false; }
 
 /// STRATA_SPEC_PROB_DT=x: the drafter's chain runs at x * the request's temperature (default 1).  Any q is valid for
 /// rejection sampling; the acceptance sum min(p, q) is what it changes.

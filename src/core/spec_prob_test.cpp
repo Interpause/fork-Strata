@@ -421,6 +421,33 @@ int main() {
         std::printf("  %-4s p == q: every draft is accepted (%lld rejected)\n", rej == 0 ? "ok" : "FAIL", rej);
     }
 
+    // A gate based on the sampled id changes the proposal distribution conditional on entering the window.
+    // q=(.9,.1), p=(.5,.5), threshold .5: the old gate yields (.55,.45), while a q-only gate preserves p.
+    {
+        const List P{{0, 1}, {0.5, 0.5}, {0.5f, 0.5f}};
+        const List Q{{0, 1}, {0.9, 0.1}, {0.9f, 0.1f}};
+        const SpecP sp{P.id.data(), P.p.data(), 2};
+        const SpecQ sq{Q.id.data(), Q.q.data(), 2};
+        for (int sampled_gate = 0; sampled_gate < 2; ++sampled_gate) {
+            std::vector<double> count(2, 0.0), expected{0.5, 0.5};
+            for (int i = 0; i < N; ++i) {
+                const int d = draw(Q, uni(g));
+                const bool use_pick = sampled_gate || spec_gate_pick();
+                const bool extend = use_pick ? Q.p[(size_t) d] >= 0.5 : Q.p[0] >= 0.5;
+                const int y = extend ? spec_verify_row(sp, d, sq, uni(g), uni(g)).token : draw(P, uni(g));
+                ++count[(size_t) y];
+            }
+            report(sampled_gate ? "sampled-id gate (biased control)" : "q-top gate (unbiased)",
+                   chi_square(count, expected, N), sampled_gate != 0);
+            if (sampled_gate) {
+                ++g_cases;
+                const double rate = count[0] / N;
+                const bool ok = std::fabs(rate - 0.55) < 0.003;
+                if (!ok) ++g_fail;
+                std::printf("  %-4s sampled-id gate rate %.5f (expected 0.55)\n", ok ? "ok" : "FAIL", rate);
+            }
+        }
+    }
     std::printf("spec_prob_test: %d cases, %d failed\n", g_cases, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
